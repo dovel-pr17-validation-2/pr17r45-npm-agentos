@@ -1,0 +1,391 @@
+/**
+ * @fileoverview Uncensored model catalog for policy-aware routing.
+ *
+ * Maps content policy tiers to curated lists of uncensored text and image
+ * models available through OpenRouter (text) and Replicate (image). The
+ * catalog is the single source of truth consumed by {@link PolicyAwareRouter}
+ * and {@link PolicyAwareImageRouter} to select models that honour the
+ * agent's content policy without imposing upstream safety filters.
+ *
+ * @module core/llm/routing/UncensoredModelCatalog
+ */
+
+// ---------------------------------------------------------------------------
+// Shared policy types (re-exported for convenience)
+// ---------------------------------------------------------------------------
+
+/** Content policy tier governing model selection. */
+export type PolicyTier = 'safe' | 'standard' | 'mature' | 'private-adult';
+
+/** Finer-grained content intent hint within a policy tier. */
+export type ContentIntent = 'general' | 'romantic' | 'erotic' | 'violent' | 'horror';
+
+// ---------------------------------------------------------------------------
+// Catalog entry
+// ---------------------------------------------------------------------------
+
+/** A single model entry in the uncensored catalog. */
+export interface CatalogEntry {
+  /** OpenRouter / Replicate model identifier. */
+  modelId: string;
+  /** Human-readable display name. */
+  displayName: string;
+  /** Provider that hosts this model (e.g. 'openrouter', 'replicate'). */
+  providerId: string;
+  /** Modality: 'text' for LLMs, 'image' for diffusion/GAN. */
+  modality: 'text' | 'image';
+  /** Quality tier used for preference ordering. */
+  quality: 'high' | 'medium' | 'low';
+  /** Content permission tags describing what the model allows. */
+  contentPermissions: ContentIntent[];
+  /** Provider-specific capability tags (e.g. 'face-consistency', 'video'). */
+  capabilities: string[];
+  /**
+   * Context window in tokens, for text models (OpenRouter's model listing,
+   * 2026-10-03). A fallback walk skips a leg whose request does not fit.
+   */
+  contextWindow?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog interface
+// ---------------------------------------------------------------------------
+
+/** Read-only catalog of uncensored models. */
+export interface UncensoredModelCatalog {
+  /**
+   * Return all text model entries, optionally filtered.
+   * @param filter - Optional quality or content permission filter.
+   */
+  getTextModels(filter?: {
+    quality?: CatalogEntry['quality'];
+    contentPermissions?: ContentIntent[];
+  }): CatalogEntry[];
+
+  /**
+   * Return all image model entries, optionally filtered.
+   * @param filter - Optional capability filter.
+   */
+  getImageModels(filter?: { capabilities?: string[] }): CatalogEntry[];
+
+  /**
+   * The tier's ranked text models, best first: the order a policy fallback
+   * chain runs its uncensored legs in. `safe` and `standard` have none. A
+   * content intent keeps only the models that permit it.
+   * {@link getPreferredTextModel} returns the first entry.
+   * @param tier - Content policy tier.
+   * @param opts.contentIntent - Keep only models permitting this intent.
+   */
+  getFallbackLadder(
+    tier: PolicyTier,
+    opts?: { contentIntent?: ContentIntent },
+  ): CatalogEntry[];
+
+  /**
+   * Return the preferred text model for a given policy tier.
+   * Returns null for safe/standard tiers (use default censored model).
+   * @param tier - Content policy tier.
+   * @param contentIntent - Optional content intent for finer selection.
+   */
+  getPreferredTextModel(
+    tier: PolicyTier,
+    contentIntent?: ContentIntent,
+  ): CatalogEntry | null;
+
+  /**
+   * Return the preferred image model for a given policy tier.
+   * Returns null for safe/standard tiers.
+   * @param tier - Content policy tier.
+   * @param capabilities - Optional required capabilities.
+   */
+  getPreferredImageModel(
+    tier: PolicyTier,
+    capabilities?: string[],
+  ): CatalogEntry | null;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in catalog data
+// ---------------------------------------------------------------------------
+
+/**
+ * Curated text models available via OpenRouter.
+ *
+ * Selection criteria for private-adult tier:
+ * - Must be genuinely uncensored (no safety-trained refusals)
+ * - Must follow system prompt instructions reliably
+ * - Must be actively hosted on OpenRouter (not deprecated)
+ *
+ * Last updated: 2026-07-06 — refreshed off the Hermes-3-only lineup onto
+ * the production-validated ladder (3-arm prod eval, 2026-06-28, Opus
+ * judge): magnum-v4-72b held consistent in-character prose with zero
+ * quality flags; llama-3.3-70b stayed reliable across multi-provider
+ * hosting; hermes-3-405b collapsed into continuity failures (repeated
+ * states / re-introduced NPCs) and is removed. Hermes 3 70B is retained
+ * as a mid-tier fallback for breadth. llama-3.1-8b is the cheap
+ * last-resort link, never a primary.
+ */
+const TEXT_MODELS: CatalogEntry[] = [
+  {
+    modelId: 'anthracite-org/magnum-v4-72b',
+    displayName: 'Magnum v4 72B',
+    providerId: 'openrouter',
+    modality: 'text',
+    quality: 'high',
+    contentPermissions: ['general', 'romantic', 'erotic', 'violent', 'horror'],
+    capabilities: ['chat', 'json_mode'],
+    contextWindow: 32_768,
+  },
+  {
+    modelId: 'meta-llama/llama-3.3-70b-instruct',
+    displayName: 'Llama 3.3 70B Instruct',
+    providerId: 'openrouter',
+    modality: 'text',
+    quality: 'high',
+    contentPermissions: ['general', 'romantic', 'violent', 'horror'],
+    capabilities: ['chat', 'tool_use', 'json_mode'],
+    contextWindow: 131_072,
+  },
+  {
+    modelId: 'nousresearch/hermes-3-llama-3.1-70b',
+    displayName: 'Hermes 3 70B',
+    providerId: 'openrouter',
+    modality: 'text',
+    quality: 'medium',
+    contentPermissions: ['general', 'romantic', 'erotic', 'violent', 'horror'],
+    // No tool_use: OpenRouter serves this model without tool support.
+    capabilities: ['chat', 'json_mode'],
+    contextWindow: 131_072,
+  },
+  {
+    modelId: 'meta-llama/llama-3.1-8b-instruct',
+    displayName: 'Llama 3.1 8B Instruct',
+    providerId: 'openrouter',
+    modality: 'text',
+    quality: 'low',
+    contentPermissions: ['general', 'romantic', 'violent'],
+    capabilities: ['chat', 'json_mode'],
+    contextWindow: 131_072,
+  },
+  // Removed `nousresearch/hermes-3-llama-3.1-405b` on 2026-07-06: the
+  // 2026-06-28 3-arm production eval showed it collapsing into
+  // continuity failures by mid-session (the exact incoherence class the
+  // narrative-state program exists to fix), and at ~30 tok/s it was also
+  // the slowest link in the chain. The 70B variant stays as a mid-tier
+  // fallback; magnum-v4-72b takes the quality slot.
+  // Removed `cognitivecomputations/dolphin3.0-llama3.1-8b` — OpenRouter
+  // returns "not a valid model ID" on every call. The entry was dead
+  // weight in the retry chain, burning a round-trip + 100ms before
+  // failing over to the next candidate.
+  // Removed `cognitivecomputations/dolphin-mixtral-8x22b` — OpenRouter
+  // returns "No endpoints found" on every call. Same story: pure
+  // latency in the fallback path with no functional benefit. If the
+  // upstream fixes its catalog, re-add with the same config.
+  // Removed `gryphe/mythomax-l2-13b` on 2026-04-21. The coherence
+  // gate caught its SQL/DAX training-data leaks but not its other
+  // failure modes: classical-literature rambling (triggered on
+  // "Avoiding the direct question, Remarks to the curious, as I
+  // recall... Greek, Roman, and Norse writers, from Homer's epics to
+  // Ovid's myths..."), fantasy-farewell slop ("we might meet in
+  // another life, another world. Until then, I must return to the
+  // shadows of history, and you to your mortal realm. Farewell.")
+  // and occasional Devanagari token corruption. All surfaced in
+  // production as Cleopatra VII responses and made a $10 companion
+  // chat look like a broken chatbot demo.
+];
+
+/**
+ * Text models for the private-adult tier, best first. Magnum v4 72B is the
+ * strongest vetted uncensored model (2026-06-28 production eval: consistent
+ * in-character prose, zero quality flags); llama-3.3-70b is the reliable
+ * multi-provider second; Hermes 3 70B adds breadth; llama-3.1-8b is the
+ * cheap last resort.
+ */
+export const PRIVATE_ADULT_TEXT_RANKING: readonly string[] = [
+  'anthracite-org/magnum-v4-72b',
+  'meta-llama/llama-3.3-70b-instruct',
+  'nousresearch/hermes-3-llama-3.1-70b',
+  'meta-llama/llama-3.1-8b-instruct',
+];
+
+/**
+ * Text models for the mature tier, best first. The fast multi-provider
+ * llama-3.3-70b leads: on mature narration its quality is within noise of
+ * magnum's, and its latency and host availability are better (production
+ * report 2026-05-05). Magnum, Hermes 3 70B and llama-3.1-8b follow.
+ */
+export const MATURE_TEXT_RANKING: readonly string[] = [
+  'meta-llama/llama-3.3-70b-instruct',
+  'anthracite-org/magnum-v4-72b',
+  'nousresearch/hermes-3-llama-3.1-70b',
+  'meta-llama/llama-3.1-8b-instruct',
+];
+
+/**
+ * Capability names that mean the same thing: the model router requires
+ * `function_calling` on a call that carries tools, and catalog entries list
+ * `tool_use`.
+ */
+const CAPABILITY_ALIASES: Readonly<Record<string, string>> = { function_calling: 'tool_use' };
+
+/** The one spelling of a capability name. */
+export function canonicalCapability(capability: string): string {
+  return CAPABILITY_ALIASES[capability] ?? capability;
+}
+
+/** Whether a catalog entry lists a capability, under either spelling. */
+export function catalogEntryHasCapability(
+  entry: Pick<CatalogEntry, 'capabilities'>,
+  capability: string,
+): boolean {
+  const wanted = canonicalCapability(capability);
+  return entry.capabilities.some((listed) => canonicalCapability(listed) === wanted);
+}
+
+/** The catalog's text entry for a model, when the catalog lists it. */
+export function findCatalogTextModel(modelId: string, providerId?: string): CatalogEntry | undefined {
+  return TEXT_MODELS.find(
+    (entry) => entry.modelId === modelId && (providerId === undefined || entry.providerId === providerId),
+  );
+}
+
+/** Curated image models available via Replicate. */
+const IMAGE_MODELS: CatalogEntry[] = [
+  {
+    modelId: 'lucataco/realvisxl-v4.0',
+    displayName: 'RealVisXL v4.0',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'high',
+    contentPermissions: ['general', 'romantic', 'erotic'],
+    capabilities: ['txt2img', 'img2img', 'photorealistic'],
+  },
+  {
+    modelId: 'stability-ai/sdxl',
+    displayName: 'SDXL',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'high',
+    contentPermissions: ['general', 'romantic', 'erotic', 'violent', 'horror'],
+    capabilities: ['txt2img', 'img2img'],
+  },
+  {
+    modelId: 'zsxkib/instant-id',
+    displayName: 'Instant ID',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'medium',
+    contentPermissions: ['general', 'romantic'],
+    capabilities: ['txt2img', 'face-consistency'],
+  },
+  {
+    modelId: 'lucataco/ip-adapter-faceid-sdxl',
+    displayName: 'IP-Adapter FaceID SDXL',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'medium',
+    contentPermissions: ['general', 'romantic', 'erotic'],
+    capabilities: ['txt2img', 'img2img', 'face-consistency'],
+  },
+  {
+    modelId: 'lucataco/animate-diff',
+    displayName: 'AnimateDiff',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'medium',
+    contentPermissions: ['general', 'romantic', 'violent'],
+    capabilities: ['txt2img', 'video'],
+  },
+  {
+    modelId: 'stability-ai/stable-video-diffusion',
+    displayName: 'Stable Video Diffusion',
+    providerId: 'replicate',
+    modality: 'image',
+    quality: 'high',
+    contentPermissions: ['general', 'romantic'],
+    capabilities: ['img2video', 'video'],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a default {@link UncensoredModelCatalog} populated with curated
+ * OpenRouter text models and Replicate image models.
+ */
+export function createUncensoredModelCatalog(): UncensoredModelCatalog {
+  const getFallbackLadder: UncensoredModelCatalog['getFallbackLadder'] = (tier, opts) => {
+    const ranking =
+      tier === 'private-adult' ? PRIVATE_ADULT_TEXT_RANKING : tier === 'mature' ? MATURE_TEXT_RANKING : [];
+    const intent = opts?.contentIntent;
+    const ladder: CatalogEntry[] = [];
+    for (const modelId of ranking) {
+      const entry = TEXT_MODELS.find((e) => e.modelId === modelId);
+      if (!entry) continue;
+      if (intent && !entry.contentPermissions.includes(intent)) continue;
+      ladder.push(entry);
+    }
+    return ladder;
+  };
+
+  return {
+    getTextModels(filter) {
+      let results = [...TEXT_MODELS];
+      if (filter?.quality) {
+        results = results.filter((e) => e.quality === filter.quality);
+      }
+      if (filter?.contentPermissions?.length) {
+        results = results.filter((e) =>
+          filter.contentPermissions!.every((p) =>
+            e.contentPermissions.includes(p),
+          ),
+        );
+      }
+      return results;
+    },
+
+    getImageModels(filter) {
+      let results = [...IMAGE_MODELS];
+      if (filter?.capabilities?.length) {
+        results = results.filter((e) =>
+          filter.capabilities!.every((c) => e.capabilities.includes(c)),
+        );
+      }
+      return results;
+    },
+
+    getFallbackLadder,
+
+    getPreferredTextModel(tier, contentIntent) {
+      return getFallbackLadder(tier, { contentIntent })[0] ?? null;
+    },
+
+    getPreferredImageModel(tier, capabilities) {
+      if (tier === 'safe' || tier === 'standard') {
+        return null;
+      }
+
+      let candidates = [...IMAGE_MODELS];
+
+      if (capabilities?.length) {
+        candidates = candidates.filter((e) =>
+          capabilities.every((c) => e.capabilities.includes(c)),
+        );
+      }
+
+      // Sort: high > medium > low
+      const qualityOrder: Record<string, number> = {
+        high: 0,
+        medium: 1,
+        low: 2,
+      };
+      candidates.sort(
+        (a, b) => qualityOrder[a.quality] - qualityOrder[b.quality],
+      );
+
+      return candidates[0] ?? null;
+    },
+  };
+}

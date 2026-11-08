@@ -1,0 +1,2472 @@
+// File: backend/agentos/core/llm/providers/implementations/GeminiProvider.ts
+
+/**
+ * @fileoverview Implements the IProvider interface for Google's Gemini API.
+ *
+ * This provider integrates with the Gemini REST API directly (no SDK dependency),
+ * handling the structural differences between the Gemini API and the OpenAI-style
+ * conventions used by IProvider:
+ *
+ * Key API differences from OpenAI:
+ * - Auth: API key in the `x-goog-api-key` header, never in the URL.
+ * - Roles: Gemini uses `user` / `model` (not `assistant`).
+ * - System instruction: Separate `systemInstruction` field, not a role.
+ * - Tool calling: Uses `functionDeclarations` under `tools[]`, response uses `functionCall`.
+ * - Streaming: SSE via `streamGenerateContent?alt=sse` endpoint.
+ * - Finish reasons: `STOP`, `MAX_TOKENS`, `SAFETY`, `RECITATION` and Gemini's other uppercase enum strings.
+ * - Response shape: `candidates[0].content.parts[0].text` (not `choices[0].message.content`).
+ * - Usage: `usageMetadata.promptTokenCount` / `candidatesTokenCount` / `totalTokenCount`.
+ *
+ * @module backend/agentos/core/llm/providers/implementations/GeminiProvider
+ * @implements {IProvider}
+ */
+
+import {
+  IProvider,
+  ChatMessage,
+  ModelCompletionOptions,
+  ModelCompletionResponse,
+  ModelCompletionChoice,
+  ModelInfo,
+  ModelUsage,
+  ProviderEmbeddingOptions,
+  ProviderEmbeddingResponse,
+} from '../IProvider';
+import { stripParamsForGemini } from '../openrouter-only-params';
+import { redactUrlSecrets } from '../url-secrets';
+import { GeminiProviderError } from '../errors/GeminiProviderError';
+import { ApiKeyPool, keyPoolStrategyFromEnv, type ApiKeyPoolConfig, type ProbeResult } from '../../../providers/ApiKeyPool.js';
+import { classifyKeyFailure, retryAfterMs, statusOfKinds, type KeyFailureKind } from '../../../providers/quotaErrors.js';
+import {
+  failedKeyProbeAnswer,
+  readKeyProbeAnswer,
+  startKeyProbeDeadline,
+  type KeyProbeAnswer,
+  type KeyProbeOptions,
+} from '../../../providers/keyProbe.js';
+import { computeRetryBackoffMs, resolveAttemptCount, waitForRetry, type AttemptTally } from './retry-backoff.js';
+import { sanitizeGeminiResponseSchema } from './geminiResponseSchema.js';
+import { operationIdHeaders, resolveOperationIdHeader } from './operation-id.js';
+import { createContentSafeConsole } from '../../../logging/contentSafeConsole.js';
+
+/** This module's fixed diagnostic origin; no runtime name enters telemetry. */
+const console = createContentSafeConsole('gemini_provider');
+
+/** What a key-scoped stream connection failure carries on its details, for the stream's hop loop. */
+interface StreamKeyFailureDetails {
+  keyFailure?: KeyFailureKind;
+  keyUsable?: number;
+  keyCount?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for the GeminiProvider.
+ *
+ * @example
+ * const config: GeminiProviderConfig = {
+ *   apiKey: process.env.GEMINI_API_KEY!,
+ *   defaultModelId: 'gemini-2.5-flash',
+ * };
+ */
+export interface GeminiProviderConfig {
+  /**
+   * Google Gemini API key.
+   * Typically sourced from the `GEMINI_API_KEY` environment variable.
+   * Sent in the `x-goog-api-key` header, never in the request URL, so it
+   * stays out of proxy and access logs.
+   */
+  apiKey: string;
+  /**
+   * The key pool behind a comma-separated `apiKey`: `ordered` prefers the
+   * earliest usable key (a cost order), `round-robin` spreads load (the
+   * default; `AGENTOS_KEY_POOL_STRATEGY=ordered` changes it when this is
+   * absent); `store` and `id` persist the keys' standing across restarts.
+   */
+  keyPool?: Pick<ApiKeyPoolConfig, 'strategy' | 'cooldownMs' | 'recheckMs' | 'maxRecheckMs' | 'maxRetryAfterMs' | 'loadTimeoutMs' | 'storeTimeoutMs' | 'store' | 'id'>;
+  /**
+   * Base URL for the Gemini API.
+   * @default "https://generativelanguage.googleapis.com/v1beta"
+   */
+  baseURL?: string;
+  /**
+   * Default model ID when none is specified per-request.
+   * @default "gemini-2.5-flash"
+   */
+  defaultModelId?: string;
+  /**
+   * Maximum retry attempts for transient failures.
+   * @default 3
+   */
+  maxRetries?: number;
+  /**
+   * Request timeout in milliseconds.
+   * @default 60000
+   */
+  requestTimeout?: number;
+  /**
+   * The header an embeddings call's `operationId` goes in, on every batch and retry of the call. When this is unset
+   * the provider reads `AGENTOS_OPERATION_ID_HEADER` at each call; with neither, no header is sent. Gemini sends the
+   * header on embeddings only, and only for a call that names an `operationId`. A name that is not an HTTP header
+   * name, or one a provider sets itself (`x-goog-api-key`, `Content-Type`, ...), is refused with a `RangeError` by
+   * `initialize()` and by such a call, before anything is sent.
+   */
+  operationIdHeader?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini API request/response types
+// ---------------------------------------------------------------------------
+
+/**
+ * A single part within a Gemini content message.
+ * Can be text, a function call (from model), or a function response (from user).
+ */
+interface GeminiPart {
+  /** Text content. */
+  text?: string;
+  /** Function call from the model — contains the function name and parsed arguments. */
+  functionCall?: { name: string; args: Record<string, unknown> };
+  /** Function response — sent by the caller after executing a tool call. */
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  /** True on a thought-summary part, which Gemini returns only with `includeThoughts`. */
+  thought?: boolean;
+  /**
+   * Opaque signature Gemini attaches to the first function call of a step.
+   * Gemini 3 requires it back, verbatim, on the replayed call.
+   */
+  thoughtSignature?: string;
+  /** An image (or other media) sent inline: its MIME type and base64 bytes. */
+  inlineData?: { mimeType: string; data: string };
+  /** An image Gemini fetches itself: its https URL and, when known, its MIME type. */
+  fileData?: { fileUri: string; mimeType?: string };
+}
+
+/**
+ * The most inline data one request carries, counted as Gemini counts it: in
+ * base64 characters. Gemini raised the payload for inline data from 20 MB to
+ * 100 MB, "base64 encoded, with varying limits based on data types"
+ * (https://blog.google/innovation-and-ai/technology/developers-tools/gemini-api-new-file-limits/,
+ * 2026-01-12; https://ai.google.dev/gemini-api/docs/file-input-methods). A
+ * type's own lower limit is Gemini's to apply: its 400 comes back to the caller.
+ */
+const MAX_INLINE_BASE64_CHARS = 100 * 1024 * 1024;
+
+/**
+ * The image types Gemini reads, by file extension, from the `Blob.mimeType`
+ * list of the v1beta API reference
+ * (https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta).
+ */
+const IMAGE_TYPE_BY_EXTENSION: Readonly<Record<string, string>> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  heic: 'image/heic',
+  heif: 'image/heif',
+  gif: 'image/gif',
+  avif: 'image/avif',
+};
+
+/**
+ * Finish reasons that mean Google's filters stopped the answer (the v1beta
+ * `Candidate.finishReason` enum). A response that ends on one of them with no
+ * content is a content-policy decline, as is any prompt Gemini blocked
+ * (`PromptFeedback.blockReason`), which gets no candidates.
+ */
+const CONTENT_FILTER_FINISH_REASONS: ReadonlySet<string> = new Set([
+  'SAFETY',
+  'RECITATION',
+  'BLOCKLIST',
+  'PROHIBITED_CONTENT',
+  'SPII',
+  'IMAGE_SAFETY',
+  'IMAGE_PROHIBITED_CONTENT',
+  'IMAGE_RECITATION',
+]);
+
+/** The value of an ASCII hex digit, or -1. */
+function hexValue(byte: number): number {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+  if (byte >= 0x41 && byte <= 0x46) return byte - 0x37;
+  if (byte >= 0x61 && byte <= 0x66) return byte - 0x57;
+  return -1;
+}
+
+/** The bytes of a percent-encoded payload: `%XX` is one byte, any other character its UTF-8 bytes. */
+function percentDecodeBytes(payload: string): Buffer {
+  const text = Buffer.from(payload, 'utf8');
+  const out = Buffer.allocUnsafe(text.length);
+  let length = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const high = text[i] === 0x25 && i + 2 < text.length ? hexValue(text[i + 1]) : -1;
+    const low = high >= 0 ? hexValue(text[i + 2]) : -1;
+    if (low >= 0) {
+      out[length] = high * 16 + low;
+      i += 2;
+    } else {
+      out[length] = text[i];
+    }
+    length += 1;
+  }
+  return out.subarray(0, length);
+}
+
+/**
+ * A request this provider refuses before sending it: the caller's input is at
+ * fault, so it carries HTTP status 400, which the provider health registry and
+ * the fallback chain read as a bad request rather than as Gemini failing.
+ */
+function refusedImage(message: string, code: string): GeminiProviderError {
+  return new GeminiProviderError(message, code, 400);
+}
+
+/**
+ * Whether `text` is base64 Gemini reads: the standard or URL-safe alphabet,
+ * with at most two `=` of padding at the end, and not one character past a
+ * multiple of four, a length WHATWG's forgiving-base64 decode refuses
+ * (https://infra.spec.whatwg.org/#forgiving-base64-decode).
+ */
+function isBase64(text: string): boolean {
+  const body = text.length % 4 === 0 ? text.replace(/={1,2}$/, '') : text;
+  return body.length % 4 !== 1 && /^[A-Za-z0-9+/_-]*$/.test(body);
+}
+
+/**
+ * An `image_url` as a Gemini part.
+ *
+ * - An https URL becomes `fileData`, which Gemini fetches itself: it takes
+ *   "any publicly accessible URL (like a PDF or image on the web)" and
+ *   pre-signed cloud storage URLs, up to 15 MB a file
+ *   (https://ai.google.dev/gemini-api/docs/file-input-methods). The MIME type
+ *   is named when the path ends in an image extension; Gemini's `fileData`
+ *   takes it as optional. This provider fetches nothing itself, since that
+ *   would reach whatever network the process runs in.
+ * - A data URL becomes `inlineData`, read as WHATWG Fetch reads one
+ *   (https://fetch.spec.whatwg.org/#data-url-processor): tabs and line breaks
+ *   are dropped, a `#` fragment is not part of the data, the text before the
+ *   first comma is the media type and marks
+ *   base64 when it ends in `;base64` (spaces allowed around it), and the rest
+ *   is percent-decoded, then read as base64 when so marked. Each step is linear
+ *   in the URL's length, so a URL a caller forwards cannot stall the process.
+ *
+ * @throws GeminiProviderError (HTTP status 400) for any other URL, a data URL
+ *   with no comma or no media type, base64 that is not valid, and an image of
+ *   no bytes.
+ */
+function imagePartOf(url: string): GeminiPart {
+  if (/^https:\/\//i.test(url)) {
+    let extension = '';
+    try {
+      extension = /\.([a-z0-9]+)$/i.exec(new URL(url).pathname)?.[1]?.toLowerCase() ?? '';
+    } catch {
+      throw refusedImage('This image_url is not a valid URL.', 'INVALID_IMAGE_URL');
+    }
+    const mimeType = IMAGE_TYPE_BY_EXTENSION[extension];
+    return { fileData: { fileUri: url, ...(mimeType ? { mimeType } : {}) } };
+  }
+  if (/^http:\/\//i.test(url)) {
+    throw refusedImage(
+      'Gemini fetches an image URL over HTTPS only: pass this image as an https URL or a data URL.',
+      'IMAGE_URL_NOT_SUPPORTED',
+    );
+  }
+  const whole = url.replace(/[\t\n\r]/g, '');
+  // The URL parser takes everything from the first '#' as the fragment, which
+  // the data URL processor leaves out.
+  const hash = whole.indexOf('#');
+  const text = hash === -1 ? whole : whole.slice(0, hash);
+  const comma = text.indexOf(',');
+  if (!/^data:/i.test(text) || comma === -1) {
+    throw refusedImage('Gemini takes an image as an https URL or a data URL; this image_url is neither.', 'INVALID_IMAGE_URL');
+  }
+  const header = text.slice(5, comma);
+  const mimeType = header.split(';', 1)[0].trim().toLowerCase();
+  if (!mimeType) {
+    throw refusedImage('This data URL names no media type, which Gemini needs for inline data.', 'INVALID_IMAGE_URL');
+  }
+  const payload = text.slice(comma + 1);
+  let data: string;
+  if (/; *base64 *$/i.test(header)) {
+    // Percent-decoded first, as WHATWG decodes it, then the ASCII whitespace
+    // forgiving-base64 skips is dropped.
+    data = (payload.includes('%') ? percentDecodeBytes(payload).toString('latin1') : payload).replace(/[\t\n\f\r ]+/g, '');
+    if (!isBase64(data)) {
+      throw refusedImage('The base64 in this data URL is not valid.', 'INVALID_IMAGE_URL');
+    }
+  } else {
+    data = percentDecodeBytes(payload).toString('base64');
+  }
+  if (!data) {
+    throw refusedImage('This data URL holds no image data.', 'INVALID_IMAGE_URL');
+  }
+  return { inlineData: { mimeType, data } };
+}
+
+/** A single message in the Gemini contents array. */
+interface GeminiContent {
+  /** Either `user` or `model`. Gemini does not have an `assistant` or `system` role. */
+  role: 'user' | 'model';
+  /** Message parts (text, function calls, etc.). */
+  parts: GeminiPart[];
+}
+
+/** System instruction — a top-level field separate from the contents array. */
+interface GeminiSystemInstruction {
+  parts: Array<{ text: string }>;
+}
+
+/**
+ * Most requests `models/{model}:batchEmbedContents` accepts in one call. The
+ * API returns HTTP 400 "at most 100 requests can be in one batch" above this
+ * (probed 2026-09-29 on gemini-embedding-001).
+ */
+const GEMINI_EMBED_BATCH_LIMIT = 100;
+
+/** Response body of `models/{model}:batchEmbedContents`. */
+interface GeminiBatchEmbedResponse {
+  embeddings: Array<{ values: number[] }>;
+  /** The call's prompt tokens: gemini-embedding-2 reports them, gemini-embedding-001 omits them. */
+  usageMetadata?: { promptTokenCount?: number };
+}
+
+/**
+ * Placeholder signature Google documents for replaying a function call whose
+ * real signature is unavailable, such as a call made by another provider in a
+ * fallback chain. Gemini 3 returns HTTP 400 for a replayed call with no
+ * signature and accepts this value, and Gemini 2.5 accepts it too (probed
+ * 2026-09-29).
+ */
+const GEMINI_SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
+/** Generation configuration parameters. */
+interface GeminiGenerationConfig {
+  temperature?: number;
+  maxOutputTokens?: number;
+  topP?: number;
+  topK?: number;
+  stopSequences?: string[];
+  responseMimeType?: string;
+  responseSchema?: Record<string, unknown>;
+  thinkingConfig?: GeminiThinkingConfig;
+}
+
+/**
+ * Thinking controls. The 3.x generation takes a `thinkingLevel`; the 2.5
+ * family takes a `thinkingBudget` and rejects a level. They nest under
+ * `generationConfig`; at the payload root Gemini rejects them.
+ */
+interface GeminiThinkingConfig {
+  /**
+   * Gemini 3 thinking depth, such as `'low'` or `'high'`. Gemini 2.5 rejects
+   * this field with HTTP 400 "Thinking level is not supported for this model"
+   * (probed 2026-09-29).
+   */
+  thinkingLevel?: string;
+  /**
+   * Thinking token budget. `-1` hands Gemini dynamic control and a positive
+   * value caps the budget. `0` disables thinking where the model allows it:
+   * Gemini 2.5 Flash accepts it, and Gemini 3.1 Pro rejects it with HTTP 400
+   * "This model only works in thinking mode" (probed 2026-09-29).
+   */
+  thinkingBudget?: number;
+  /**
+   * Return thought summaries. They arrive as parts marked `thought: true`,
+   * which GeminiProvider keeps out of the answer text.
+   */
+  includeThoughts?: boolean;
+}
+
+type GeminiThinkingLevel = 'low' | 'medium' | 'high';
+
+/**
+ * Thinking levels each model accepts, keyed by exact model id and limited to
+ * what was verified against the live API (2026-09-30). The set differs per
+ * model, not per family: the 3.x image models take `minimal` | `high`, the
+ * 2.5 family rejects any level with 400 INVALID_ARGUMENT, and an alias can
+ * move to a model with a different set. A model missing here never receives
+ * a level, which is always accepted.
+ */
+const GEMINI_THINKING_LEVELS: Readonly<Record<string, ReadonlySet<GeminiThinkingLevel>>> = {
+  'gemini-3.1-pro-preview': new Set<GeminiThinkingLevel>(['low', 'medium', 'high']),
+};
+
+/**
+ * The thinking level to send for the provider-neutral `effort` on `modelId`,
+ * or `undefined` when the API default should stand: no effort, an effort
+ * with no Gemini equivalent, or a model that does not take that level.
+ */
+function geminiThinkingLevelFor(
+  modelId: string,
+  effort: string | undefined,
+): GeminiThinkingLevel | undefined {
+  const level: GeminiThinkingLevel | undefined =
+    effort === 'low' || effort === 'medium'
+      ? effort
+      : effort === 'high' || effort === 'xhigh' || effort === 'max'
+        ? 'high'
+        : undefined;
+  if (!level) return undefined;
+  return GEMINI_THINKING_LEVELS[modelId]?.has(level) ? level : undefined;
+}
+
+/**
+ * Pinned model ids and the alias that keeps serving their tier once Google
+ * retires them. Preview ids are retired without a redirect (the retired id
+ * answers HTTP 404); when a request for a key here fails that way, the
+ * provider retries it once on the alias.
+ */
+const GEMINI_RETIRED_MODEL_ALIAS: Readonly<Record<string, string>> = {
+  'gemini-3.1-pro-preview': 'gemini-pro-latest',
+};
+
+/** Pinned ids already reported as retired, so the warning prints once each. */
+const warnedRetiredGeminiModels = new Set<string>();
+
+/**
+ * Long-context price tier: above `abovePromptTokens` prompt tokens the whole
+ * request bills at these per-1M rates instead of the catalog's.
+ */
+const GEMINI_LONG_CONTEXT_PRICING: Readonly<
+  Record<string, { abovePromptTokens: number; input: number; output: number }>
+> = {
+  'gemini-3.1-pro-preview': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
+  'gemini-pro-latest': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
+  'gemini-2.5-pro': { abovePromptTokens: 200_000, input: 2.50, output: 15.00 },
+};
+
+/** A single function declaration for tool calling. */
+interface GeminiFunctionDeclaration {
+  name: string;
+  description: string;
+  parameters?: Record<string, unknown>;
+}
+
+/** Tool definition wrapper containing function declarations. */
+interface GeminiToolDef {
+  functionDeclarations: GeminiFunctionDeclaration[];
+}
+
+/** Token usage metadata from Gemini responses. */
+interface GeminiUsageMetadata {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  totalTokenCount?: number;
+  /**
+   * Tokens the model spent thinking. Separate from `candidatesTokenCount`,
+   * included in `totalTokenCount`, and billed at the output rate.
+   */
+  thoughtsTokenCount?: number;
+  /**
+   * Prompt tokens served from Gemini's cache (implicit caching is default-on
+   * for 2.5+ models; explicit cachedContents count here too). A subset of
+   * `promptTokenCount`, never additional to it.
+   */
+  cachedContentTokenCount?: number;
+}
+
+/** A single candidate in the Gemini response. */
+interface GeminiCandidate {
+  content?: {
+    role: 'model';
+    parts: GeminiPart[];
+  };
+  finishReason?: string;
+  safetyRatings?: Array<{ category: string; probability: string }>;
+}
+
+/** Full response from the Gemini generateContent endpoint. */
+interface GeminiResponse {
+  candidates?: GeminiCandidate[];
+  /** Set when Gemini blocked the prompt itself: then no candidates are returned. */
+  promptFeedback?: { blockReason?: string };
+  usageMetadata?: GeminiUsageMetadata;
+  error?: {
+    code: number;
+    message: string;
+    status: string;
+  };
+}
+
+/** Gemini API error envelope returned on non-2xx responses. */
+interface GeminiAPIError {
+  error: {
+    code: number;
+    message: string;
+    status: string;
+    details?: unknown[];
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Known model catalog
+// ---------------------------------------------------------------------------
+
+/**
+ * Static catalog of well-known Gemini models and their metadata.
+ *
+ * Ids and token limits come from a live GET /v1beta/models probe and rates from
+ * ai.google.dev/gemini-api/docs/pricing, both on 2026-09-29. `getModelInfo` is
+ * an exact-id lookup over this array, so a model missing here resolves to
+ * undefined and its calls carry no context limit and no price.
+ *
+ * Tiers advance independently. Flash has reached 3.8 while Pro is at
+ * 3.1-preview, the only Pro id served. `gemini-3-pro-preview` appears in
+ * Google's doc index and is absent from the live listing.
+ *
+ * Rates are the standard tier. Prompts over 200K tokens on 3.1 Pro and 2.5
+ * Pro bill at the tier in GEMINI_LONG_CONTEXT_PRICING, and Gemini 3.6 / 3.7 /
+ * 3.8 Flash list at promotional rates through 2026-12-31 and meter at the
+ * post-promotion rate.
+ */
+const GEMINI_MODELS: ModelInfo[] = [
+  // --- Pro ---
+  {
+    modelId: 'gemini-3.1-pro-preview',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.1 Pro Preview',
+    description: 'Top pro-tier Gemini model. Always thinks; thinking tokens bill as output.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    // Prompts up to 200k tokens; see GEMINI_LONG_CONTEXT_PRICING above that.
+    pricePer1MTokensInput: 2.00,
+    pricePer1MTokensOutput: 12.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Flash. 3.6, 3.7 and 3.8 list at $0.75 / $3.75 through 2026-12-31 and
+  // $1.50 / $7.50 from 2027-01-01. They meter at $1.50 / $7.50 because the
+  // promotion has a published end date: cost rollups stay conservative until
+  // then and stay right after it. ---
+  {
+    modelId: 'gemini-3.8-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.8 Flash',
+    description: 'Newest Flash model. Fast and low-cost, with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.7-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.7 Flash',
+    description: 'Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.6-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.6 Flash',
+    description: 'Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.5-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.5 Flash',
+    description: 'Flash model with reasoning and multimodal input, at standard pricing.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 9.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3-flash-preview',
+    providerId: 'gemini',
+    displayName: 'Gemini 3 Flash Preview',
+    description: 'First Gemini 3 Flash preview.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.50,
+    pricePer1MTokensOutput: 3.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Flash-Lite ---
+  {
+    modelId: 'gemini-3.5-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.5 Flash-Lite',
+    description: 'Lowest-cost Gemini 3.5 tier, for high-volume and latency-sensitive work.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.1-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.1 Flash-Lite',
+    description: 'Lowest-cost Gemini 3.1 tier. Google lists a shutdown date of 2027-05-07.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.25,
+    pricePer1MTokensOutput: 1.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Floating aliases. Google can repoint these without changing the id, so
+  // a price here can go stale unnoticed. They are listed because an unlisted id
+  // resolves to undefined and meters at zero. generateContent reported these
+  // targets on 2026-09-29 (response modelVersion): pro-latest to 3.1 Pro,
+  // flash-latest to 3.8 Flash, flash-lite-latest to 3.5 Flash-Lite. ---
+  {
+    modelId: 'gemini-pro-latest',
+    providerId: 'gemini',
+    displayName: 'Gemini Pro (latest alias)',
+    description: 'Alias of the current pro-tier model (gemini-3.1-pro-preview as of 2026-09-30).',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    // Priced as the model the alias resolves to today.
+    pricePer1MTokensInput: 2.00,
+    pricePer1MTokensOutput: 12.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-flash-latest',
+    providerId: 'gemini',
+    displayName: 'Gemini Flash (latest)',
+    description: 'Floating alias for the current Gemini Flash tier.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-flash-lite-latest',
+    providerId: 'gemini',
+    displayName: 'Gemini Flash-Lite (latest)',
+    description: 'Floating alias for the current Gemini Flash-Lite tier.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Gemini 2.5 ---
+  {
+    modelId: 'gemini-2.5-pro',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.5 Pro',
+    description: 'Previous-generation Pro model.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.25,
+    pricePer1MTokensOutput: 10.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-2.5-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.5 Flash',
+    description: 'Previous-generation Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-2.5-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.5 Flash-Lite',
+    description: 'Cheapest Gemini model served.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.10,
+    pricePer1MTokensOutput: 0.40,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Embeddings. Both ids accept embedContent and batchEmbedContents and
+  // return 3072-dimension vectors (probed 2026-09-29). Google's pricing page
+  // lists gemini-embedding-2 at $0.20 per 1M text tokens and carries no price
+  // for gemini-embedding-001, so that row leaves its price unset: an unset
+  // price reads as unknown to a caller, where 0 would read as free. ---
+  {
+    modelId: 'gemini-embedding-2',
+    providerId: 'gemini',
+    displayName: 'Gemini Embedding 2',
+    description: 'Multimodal embedding model mapping text, images, video, audio and PDFs into one vector space.',
+    capabilities: ['embeddings'],
+    contextWindowSize: 8192,
+    inputTokenLimit: 8192,
+    embeddingDimension: 3072,
+    pricePer1MTokensInput: 0.20,
+    pricePer1MTokensTotal: 0.20,
+    supportsStreaming: false,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-embedding-001',
+    providerId: 'gemini',
+    displayName: 'Gemini Embedding 001',
+    description: 'Text embedding model. An index built with it needs it for queries too, since vectors from different embedding models are not comparable.',
+    capabilities: ['embeddings'],
+    contextWindowSize: 2048,
+    inputTokenLimit: 2048,
+    embeddingDimension: 3072,
+    supportsStreaming: false,
+    status: 'active',
+  },
+
+  // --- Retired by Google. generateContent returns HTTP 404 for both ids
+  // ("This model models/gemini-2.0-flash is no longer available" for 2.0
+  // Flash), probed 2026-09-29 with a gemini-2.5-flash-lite control returning
+  // 200. The rows stay as `deprecated` so getModelInfo still answers for a
+  // caller holding either id. ---
+  {
+    modelId: 'gemini-2.0-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.0 Flash (retired)',
+    description: 'Retired by Google and no longer served. Google names gemini-3.8-flash as its replacement.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 8192,
+    pricePer1MTokensInput: 0.10,
+    pricePer1MTokensOutput: 0.40,
+    supportsStreaming: true,
+    status: 'deprecated',
+  },
+  {
+    modelId: 'gemini-1.5-pro',
+    providerId: 'gemini',
+    displayName: 'Gemini 1.5 Pro (retired)',
+    description: 'Retired by Google and no longer served. Use gemini-3.1-pro-preview.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 2097152,
+    outputTokenLimit: 8192,
+    pricePer1MTokensInput: 1.25,
+    pricePer1MTokensOutput: 5.00,
+    supportsStreaming: true,
+    status: 'deprecated',
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Provider implementation
+// ---------------------------------------------------------------------------
+
+/** The Gemini API base, the `baseURL` a provider without one sends to. */
+export const GEMINI_DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+
+/** The model a billing probe and `checkHealth()` send their one-token request to when the provider has no default model. */
+export const GEMINI_BILLING_PROBE_MODEL = 'gemini-2.5-flash';
+
+/**
+ * @class GeminiProvider
+ * @implements {IProvider}
+ *
+ * Provides native integration with Google's Gemini REST API.
+ *
+ * Handles the structural differences between Gemini's API and the OpenAI-style
+ * conventions used by IProvider: role mapping (`assistant` -> `model`), system
+ * instruction extraction, tool schema translation, and finish reason normalization.
+ *
+ * @example
+ * const provider = new GeminiProvider();
+ * await provider.initialize({ apiKey: 'AIzaSy...' });
+ * const response = await provider.generateCompletion(
+ *   'gemini-2.5-flash',
+ *   [{ role: 'user', content: 'Hello!' }],
+ *   { maxTokens: 1024 },
+ * );
+ */
+export class GeminiProvider implements IProvider {
+  /** @inheritdoc */
+  public readonly providerId: string = 'gemini';
+  /** @inheritdoc */
+  public isInitialized: boolean = false;
+  /** @inheritdoc */
+  public defaultModelId?: string;
+
+  private config!: GeminiProviderConfig;
+  private keyPool: ApiKeyPool | null = null;
+
+  constructor() {}
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
+
+  /**
+   * Initialize the Gemini provider with the given configuration.
+   *
+   * Validates that an API key is present. Does NOT make a network call on
+   * startup — Gemini does not have a lightweight health/models endpoint
+   * that works without model-scoped paths.
+   *
+   * @param {GeminiProviderConfig} config - Provider configuration.
+   * @returns {Promise<void>}
+   * @throws {GeminiProviderError} If the API key is missing.
+   */
+  public async initialize(config: GeminiProviderConfig): Promise<void> {
+    if (!config.apiKey) {
+      throw new GeminiProviderError(
+        'API key is required for GeminiProvider initialization. Set GEMINI_API_KEY.',
+        'INIT_FAILED_MISSING_API_KEY',
+      );
+    }
+    // A refused operation id header name is the host's error, refused before anything changes. Only a configured name
+    // is checked here: the variable is read by the embeddings call that names an id.
+    if (config.operationIdHeader?.trim()) resolveOperationIdHeader(config.operationIdHeader);
+    // The new pool is built before anything of the old state is touched: its construction makes no request, so a
+    // timing it refuses (a RangeError) leaves this provider as it was, its pool and its recheck timer included.
+    const keyPool = new ApiKeyPool(config.apiKey, {
+      ...(config.keyPool ?? {}),
+      ...(config.keyPool?.strategy ? {} : keyPoolStrategyFromEnv('gemini')),
+      probe: (key, kind) => this.probeKey(key, kind),
+    });
+    // A re-initialize replaces the configuration and the pool: the old pool first stops its timer, finishes its
+    // probes (which read this provider's configuration) and writes their results, so a late probe can neither use
+    // the new configuration nor overwrite what the new pool loads from the store.
+    await this.keyPool?.close();
+
+    this.config = {
+      baseURL: GEMINI_DEFAULT_BASE_URL,
+      maxRetries: 3,
+      requestTimeout: 60000,
+      defaultModelId: 'gemini-2.5-flash',
+      ...config,
+    };
+    this.keyPool = keyPool;
+    await this.keyPool.ready();
+    this.defaultModelId = this.config.defaultModelId;
+    this.isInitialized = true;
+    // Failed keys are probed on the pool's own clock once the provider is up, so a provider the health
+    // breaker holds still gets its keys back; the timer never keeps the process alive.
+    if ((this.keyPool?.size ?? 0) > 1) this.keyPool?.startRechecks();
+
+    console.log(
+      `GeminiProvider initialized. Default model: ${this.defaultModelId || 'Not set'}.`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Chat completions (non-streaming)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generates a non-streaming chat completion via Gemini's generateContent endpoint.
+   *
+   * Extracts system messages and places them in the `systemInstruction` field,
+   * maps `assistant` role to `model`, converts tool definitions to Gemini's
+   * `functionDeclarations` format, and normalizes the response back to
+   * IProvider conventions.
+   *
+   * @param {string} modelId - The Gemini model to use (e.g., "gemini-2.5-flash").
+   * @param {ChatMessage[]} messages - Conversation messages. System-role messages are
+   *   extracted and sent as the `systemInstruction` field.
+   * @param {ModelCompletionOptions} options - Completion options.
+   * @returns {Promise<ModelCompletionResponse>} A normalized completion response.
+   * @throws {GeminiProviderError} On authentication, validation, or network errors.
+   *
+   * @example
+   * const resp = await provider.generateCompletion('gemini-2.5-flash', [
+   *   { role: 'system', content: 'You are a helpful assistant.' },
+   *   { role: 'user', content: 'Explain quantum computing in one sentence.' },
+   * ], { maxTokens: 256 });
+   * console.log(resp.choices[0].message.content);
+   */
+  public async generateCompletion(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions,
+  ): Promise<ModelCompletionResponse> {
+    this.ensureInitialized();
+
+    const payload = this.buildRequestPayload(modelId, messages, options);
+    // Gemini uses model-scoped endpoints: /models/{model}:generateContent
+    const endpoint = `/models/${modelId}:generateContent`;
+    // The call's count bounds the pinned request and an alias request together.
+    const attempts = resolveAttemptCount(options.maxAttempts, this.config.maxRetries!);
+    const tally: AttemptTally = { sent: 0 };
+    let apiResponse: GeminiResponse;
+    try {
+      apiResponse = await this.makeApiRequest<GeminiResponse>(endpoint, payload, options.requestTimeout, options.abortSignal, options.maxAttempts, tally);
+    } catch (error: unknown) {
+      // A retired pinned id: serve the call from its alias, whose response
+      // reports the alias as the model that answered, on the attempts the
+      // pinned request left; with none left the 404 ends the call.
+      const remaining = attempts - tally.sent;
+      const alias = remaining > 0 ? this.retiredModelAlias(modelId, error) : undefined;
+      if (!alias) throw error;
+      return this.generateCompletion(alias, messages, { ...options, maxAttempts: remaining });
+    }
+
+    return this.mapResponseToCompletion(apiResponse, modelId);
+  }
+
+  /**
+   * The alias to retry on when a request for `modelId` failed because the id
+   * is gone: HTTP 404 on an id listed in {@link GEMINI_RETIRED_MODEL_ALIAS}.
+   * `undefined` for every other error and every other id, which propagate.
+   * Warns once per retired id.
+   */
+  private retiredModelAlias(modelId: string, error: unknown): string | undefined {
+    if (!(error instanceof GeminiProviderError) || error.httpStatus !== 404) return undefined;
+    const alias = GEMINI_RETIRED_MODEL_ALIAS[modelId];
+    if (!alias) return undefined;
+    if (!warnedRetiredGeminiModels.has(modelId)) {
+      warnedRetiredGeminiModels.add(modelId);
+      console.warn(
+        `[GeminiProvider] ${modelId} answered 404 (retired, or not available to this key); ` +
+          `serving ${alias} instead. Update the pin.`,
+      );
+    }
+    return alias;
+  }
+
+  // -------------------------------------------------------------------------
+  // Chat completions (streaming)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generates a streaming chat completion via Gemini's streamGenerateContent endpoint.
+   *
+   * Gemini streaming uses SSE with `alt=sse` query parameter. Each SSE data line
+   * contains a JSON object with `candidates[].content.parts[].text` for text deltas
+   * and `candidates[].content.parts[].functionCall` for tool invocations.
+   *
+   * Normalizes all events into the IProvider streaming contract with
+   * `responseTextDelta`, `toolCallsDeltas`, and `isFinal`.
+   *
+   * @param {string} modelId - The Gemini model to use.
+   * @param {ChatMessage[]} messages - Conversation messages.
+   * @param {ModelCompletionOptions} options - Completion options.
+   * @returns {AsyncGenerator<ModelCompletionResponse>} Incremental response chunks.
+   * @throws {GeminiProviderError} On connection or stream errors.
+   * @throws {RangeError} When `options.maxAttempts` is not a whole number of 1
+   *   or more; nothing is sent.
+   */
+  public async *generateCompletionStream(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions,
+  ): AsyncGenerator<ModelCompletionResponse, void, undefined> {
+    this.ensureInitialized();
+    // The stream sends one request (key hops aside) and retries nothing; the
+    // call's count (or the configured one) bounds it and a retired id's alias
+    // request together, and a count that is not a whole number of 1 or more is
+    // refused before anything is sent.
+    const attempts = resolveAttemptCount(options.maxAttempts, this.config.maxRetries ?? 3);
+
+    const payload = this.buildRequestPayload(modelId, messages, options);
+    const responseId = `gemini-${modelId}-${Date.now()}`;
+
+    // Handle pre-aborted signals
+    const abortSignal = options.abortSignal;
+    if (abortSignal?.aborted) {
+      yield this.buildAbortChunk(modelId);
+      return;
+    }
+
+    // Streaming endpoint uses ?alt=sse and the API key query param
+    const endpoint = `/models/${modelId}:streamGenerateContent`;
+    // A key-scoped connection failure, before any event has reached the
+    // caller, moves to the next usable key at once (at most one hop per key);
+    // after content has streamed an error surfaces as before and the key stays
+    // marked for the next request.
+    let keyHops = 0;
+    let stream: ReadableStream<Uint8Array> | undefined;
+    while (stream === undefined) {
+      try {
+        stream = await this.makeStreamRequest(endpoint, payload, options.requestTimeout, abortSignal);
+      } catch (error: unknown) {
+        // An abort while the draw waited on the pool's probes surfaces as the abort chunk, not a throw.
+        if (abortSignal?.aborted) {
+          yield this.buildAbortChunk(modelId);
+          return;
+        }
+        if (error instanceof GeminiProviderError) {
+          const keyDetails = error.details as StreamKeyFailureDetails | undefined;
+          if (keyDetails?.keyFailure && (keyDetails.keyCount ?? 1) > 1) {
+            if ((keyDetails.keyUsable ?? 0) > 0 && ++keyHops < (keyDetails.keyCount ?? 1)) continue;
+            if ((keyDetails.keyUsable ?? 0) === 0 && keyDetails.keyFailure !== 'quota') {
+              throw this.allKeysFailedError(error.message, error.httpStatus, error.geminiErrorStatus);
+            }
+          }
+        }
+        // A retired pinned id fails here, before any chunk: serve the whole
+        // stream from its alias (its chunks carry the alias as modelId). The
+        // pinned request spent one of the call's attempts; with none left
+        // the 404 ends the stream.
+        const remaining = attempts - 1;
+        const alias = remaining > 0 ? this.retiredModelAlias(modelId, error) : undefined;
+        if (!alias) throw error;
+        yield* this.generateCompletionStream(alias, messages, { ...options, maxAttempts: remaining });
+        return;
+      }
+    }
+
+    // Accumulators for building the complete response
+    let accumulatedContent = '';
+    let accumulatedReasoning = '';
+    let lastFinishReason: string | null = null;
+    let promptBlockReason: string | undefined;
+    let lastUsage: GeminiUsageMetadata | undefined;
+    /** Map from part index -> tool call accumulator */
+    const toolCallAccum: Map<
+      number,
+      { name: string; args: Record<string, unknown>; thoughtSignature?: string }
+    > = new Map();
+    let toolCallIndex = 0;
+
+    const abortHandler = () => { /* consumer checks abortSignal each iteration */ };
+    abortSignal?.addEventListener('abort', abortHandler, { once: true });
+
+    try {
+      for await (const rawData of this.parseSseStream(stream)) {
+        // The abort chunk is the stream's last: an event already buffered behind it yields no success chunk.
+        if (abortSignal?.aborted) {
+          yield this.buildAbortChunk(modelId);
+          return;
+        }
+
+        let chunk: GeminiResponse;
+        try {
+          chunk = JSON.parse(rawData) as GeminiResponse;
+        } catch {
+          // Malformed JSON — skip
+          console.warn('GeminiProvider: Could not parse SSE event JSON:', {
+            eventBytes: new TextEncoder().encode(rawData).byteLength,
+            error: 'Invalid stream JSON.',
+          });
+          continue;
+        }
+
+        // Handle API-level errors in the stream
+        if (chunk.error) {
+          yield {
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            modelId,
+            choices: [],
+            error: {
+              message: chunk.error.message,
+              type: chunk.error.status,
+              code: chunk.error.code,
+            },
+            isFinal: true,
+          };
+          return;
+        }
+
+        // Track usage from every chunk — the last one will have final totals
+        if (chunk.usageMetadata) {
+          lastUsage = chunk.usageMetadata;
+        }
+        if (chunk.promptFeedback?.blockReason) {
+          promptBlockReason = chunk.promptFeedback.blockReason;
+        }
+
+        const candidate = chunk.candidates?.[0];
+        if (!candidate) continue;
+
+        if (candidate.finishReason) {
+          lastFinishReason = candidate.finishReason;
+        }
+
+        const parts = candidate.content?.parts ?? [];
+        for (const part of parts) {
+          // An abort between two parts of one event ends the stream here, not at the next event.
+          if (abortSignal?.aborted) {
+            yield this.buildAbortChunk(modelId);
+            return;
+          }
+          // A thought summary is the model's reasoning: it streams as
+          // reasoning text, apart from the answer.
+          if (part.thought) {
+            if (typeof part.text === 'string' && part.text) {
+              accumulatedReasoning += part.text;
+              yield {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                modelId,
+                choices: [{ index: 0, message: { role: 'assistant', content: null }, finishReason: null }],
+                reasoningTextDelta: part.text,
+              };
+            }
+            continue;
+          }
+          if (part.text !== undefined) {
+            // Text delta
+            accumulatedContent += part.text;
+            yield {
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              modelId,
+              choices: [{
+                index: 0,
+                message: { role: 'assistant', content: part.text },
+                finishReason: null,
+              }],
+              responseTextDelta: part.text,
+            };
+          } else if (part.functionCall) {
+            // Tool call — Gemini delivers function calls as complete objects,
+            // not incremental deltas. We emit them as a single delta per call.
+            const idx = toolCallIndex++;
+            toolCallAccum.set(idx, {
+              name: part.functionCall.name,
+              args: part.functionCall.args,
+              thoughtSignature: part.thoughtSignature,
+            });
+
+            yield {
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              modelId,
+              choices: [{
+                index: 0,
+                message: { role: 'assistant', content: null },
+                finishReason: null,
+              }],
+              toolCallsDeltas: [{
+                index: idx,
+                id: `call_gemini_${Date.now()}_${idx}`,
+                type: 'function',
+                function: {
+                  name: part.functionCall.name,
+                  // Gemini delivers complete args, so emit them as a single delta
+                  arguments_delta: JSON.stringify(part.functionCall.args),
+                },
+                ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
+              }],
+            };
+          }
+        }
+      }
+
+      // An abort after the last event ends the stream with the abort chunk, not the success chunk.
+      if (abortSignal?.aborted) {
+        yield this.buildAbortChunk(modelId);
+        return;
+      }
+
+      // Emit final chunk with usage and finish reason
+      const toolCalls = this.assembleToolCalls(toolCallAccum);
+      const hasToolCalls = toolCalls.length > 0;
+      const usage = this.mapUsage(lastUsage, modelId);
+
+      // Surface a content-policy block (a blocked prompt, or a filter's finish
+      // reason with no content) as a thrown content_filter error, as the
+      // non-streaming path does, so the policy-aware fallback can engage
+      // instead of silently yielding an empty success chunk. The catch below
+      // re-throws content_filter so it propagates.
+      if (!accumulatedContent && !hasToolCalls) {
+        const blocked = this.contentFilterBlock(promptBlockReason, lastFinishReason, lastUsage ? usage : undefined);
+        if (blocked) throw blocked;
+      }
+
+      yield {
+        id: responseId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        modelId,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: accumulatedContent || null,
+            ...(hasToolCalls && { tool_calls: toolCalls }),
+            ...(accumulatedReasoning && { reasoningText: accumulatedReasoning }),
+          },
+          finishReason: this.mapFinishReason(lastFinishReason),
+        }],
+        usage,
+        isFinal: true,
+      };
+
+    } catch (streamError: unknown) {
+      // A content-policy block must PROPAGATE (not become a generic error
+      // chunk) so the caller / fallback chain can act on code 'content_filter'.
+      if (streamError instanceof GeminiProviderError && streamError.code === 'content_filter') {
+        throw streamError;
+      }
+      // The caller's signal rides on the fetch, so an abort mid-stream ends the body's read at once: the stream
+      // ends with the abort chunk, not an error chunk.
+      if (abortSignal?.aborted) {
+        yield this.buildAbortChunk(modelId);
+        return;
+      }
+      const message = streamError instanceof Error
+        ? streamError.message
+        : 'Gemini stream processing error';
+      console.error(`GeminiProvider stream error for model ${modelId}:`, message);
+      yield {
+        id: responseId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        modelId,
+        choices: [],
+        isFinal: true,
+        error: { message, type: 'STREAM_PROCESSING_ERROR' },
+      };
+    } finally {
+      abortSignal?.removeEventListener('abort', abortHandler);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Embeddings
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generates embeddings using Gemini's embedding models.
+   *
+   * Sends the texts through `models/{model}:batchEmbedContents` in chunks of
+   * at most {@link GEMINI_EMBED_BATCH_LIMIT}, one request per chunk, and
+   * returns the vectors in input order. gemini-embedding-001 and
+   * gemini-embedding-2 both accept batchEmbedContents (probed 2026-09-29),
+   * although neither lists it in `supportedGenerationMethods`.
+   * `options.dimensions` is sent as `outputDimensionality`, which both models
+   * honor (768 and 1536 probed 2026-09-29); without it they return 3072.
+   * Usage sums each call's `usageMetadata.promptTokenCount`, which
+   * gemini-embedding-2 reports and gemini-embedding-001 omits, so the older
+   * model's calls count zero tokens (probed 2026-09-30). When a later batch
+   * fails, the thrown error carries the earlier batches' usage as
+   * `partialUsage`, since those calls were billed. An `operationId` the call
+   * names goes in the header `operationIdHeader` names, else the one
+   * `AGENTOS_OPERATION_ID_HEADER` names, on every batch and every retry of it;
+   * with no id named, or no header named, the requests carry none.
+   *
+   * @param {string} modelId - Embedding model (e.g., "gemini-embedding-001").
+   * @param {string[]} texts - Input texts to embed.
+   * @param {ProviderEmbeddingOptions} [options] - Optional embedding parameters; `abortSignal`
+   *   cancels the batch in flight, and no later batch is sent.
+   * @returns {Promise<ProviderEmbeddingResponse>} Embedding vectors.
+   * @throws {GeminiProviderError} On API errors; `REQUEST_ABORTED` when the caller's signal ends
+   *   the call.
+   * @throws {RangeError} When the call names an `operationId` and the header's name is refused
+   *   (not an HTTP header name, or one a provider sets itself, such as `x-goog-api-key`); nothing is sent.
+   */
+  public async generateEmbeddings(
+    modelId: string,
+    texts: string[],
+    options?: ProviderEmbeddingOptions,
+  ): Promise<ProviderEmbeddingResponse> {
+    this.ensureInitialized();
+    // One header for the whole call, made before its first batch: every batch and retry sends the same id.
+    const operationHeaders = options?.operationId ? operationIdHeaders(this.config.operationIdHeader, options.operationId) : {};
+
+    const endpoint = `/models/${modelId}:batchEmbedContents`;
+    const pricePer1M = GEMINI_MODELS.find(m => m.modelId === modelId)?.pricePer1MTokensInput;
+    const usageFor = (tokens: number): ProviderEmbeddingResponse['usage'] => ({
+      prompt_tokens: tokens,
+      total_tokens: tokens,
+      ...(pricePer1M !== undefined && tokens > 0 ? { costUSD: (tokens / 1_000_000) * pricePer1M } : {}),
+    });
+    const vectors: number[][] = [];
+    let promptTokens = 0;
+    for (let start = 0; start < texts.length; start += GEMINI_EMBED_BATCH_LIMIT) {
+      const requests = texts.slice(start, start + GEMINI_EMBED_BATCH_LIMIT).map(text => ({
+        model: `models/${modelId}`,
+        content: { parts: [{ text }] },
+        ...(options?.dimensions ? { outputDimensionality: options.dimensions } : {}),
+      }));
+      let apiResponse: GeminiBatchEmbedResponse;
+      try {
+        // The caller's signal cancels the batch in flight; no later batch is sent.
+        apiResponse = await this.makeApiRequest<GeminiBatchEmbedResponse>(
+          endpoint,
+          { requests },
+          undefined,
+          options?.abortSignal,
+          undefined,
+          undefined,
+          operationHeaders,
+        );
+      } catch (error: unknown) {
+        // The batches before this one were billed; keep their usage on the
+        // error so the caller can still record it.
+        if (start > 0 && error instanceof GeminiProviderError) {
+          error.partialUsage = usageFor(promptTokens);
+        }
+        throw error;
+      }
+      for (const emb of apiResponse.embeddings) vectors.push(emb.values);
+      promptTokens += apiResponse.usageMetadata?.promptTokenCount ?? 0;
+    }
+
+    return {
+      object: 'list',
+      data: vectors.map((embedding, index) => ({
+        object: 'embedding' as const,
+        embedding,
+        index,
+      })),
+      model: modelId,
+      usage: usageFor(promptTokens),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Introspection
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns a static catalog of known Gemini models.
+   *
+   * Uses a hardcoded catalog kept up-to-date with major releases, since
+   * the Gemini models list endpoint requires iterating over all models.
+   *
+   * @param {{ capability?: string }} [filter] - Optional capability filter.
+   * @returns {Promise<ModelInfo[]>} Array of known Gemini models.
+   */
+  public async listAvailableModels(
+    filter?: { capability?: string },
+  ): Promise<ModelInfo[]> {
+    this.ensureInitialized();
+    if (filter?.capability) {
+      return GEMINI_MODELS.filter(m => m.capabilities.includes(filter.capability!));
+    }
+    return [...GEMINI_MODELS];
+  }
+
+  /**
+   * Retrieves metadata for a specific Gemini model from the static catalog.
+   *
+   * @param {string} modelId - Model identifier (e.g., "gemini-2.5-flash").
+   * @returns {Promise<ModelInfo | undefined>} Model info or undefined if not found.
+   */
+  public async getModelInfo(modelId: string): Promise<ModelInfo | undefined> {
+    this.ensureInitialized();
+    return GEMINI_MODELS.find(m => m.modelId === modelId);
+  }
+
+  /**
+   * Performs a lightweight health check by sending a minimal generateContent request.
+   *
+   * @returns {Promise<{ isHealthy: boolean; details?: unknown }>} Health status.
+   */
+  public async checkHealth(): Promise<{ isHealthy: boolean; details?: unknown }> {
+    try {
+      const model = this.defaultModelId || GEMINI_BILLING_PROBE_MODEL;
+      await this.makeApiRequest<GeminiResponse>(
+        `/models/${model}:generateContent`,
+        {
+          contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        },
+      );
+      return { isHealthy: true };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Health check failed';
+      return { isHealthy: false, details: { message, error } };
+    }
+  }
+
+  /** @inheritdoc */
+  public async shutdown(): Promise<void> {
+    // Stops the recheck timer, waits for the probes in flight (each under the probe timeout), then writes the keys' standing.
+    await this.keyPool?.close();
+    this.isInitialized = false;
+    console.log('GeminiProvider shutdown complete.');
+  }
+
+  // =========================================================================
+  // Private helpers
+  // =========================================================================
+
+  /**
+   * Guard that throws if the provider has not been initialized.
+   *
+   * @private
+   * @throws {GeminiProviderError} If not initialized.
+   */
+  private ensureInitialized(): void {
+    if (!this.isInitialized) {
+      throw new GeminiProviderError(
+        'GeminiProvider is not initialized. Call initialize() first.',
+        'PROVIDER_NOT_INITIALIZED',
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Payload construction
+  // -------------------------------------------------------------------------
+
+  /**
+   * Builds the Gemini API request payload from IProvider inputs.
+   *
+   * The key transformations are:
+   * 1. System messages extracted to `systemInstruction` (Gemini has no system role).
+   * 2. `assistant` role mapped to `model` (Gemini's convention).
+   * 3. Tool messages mapped to `functionResponse` parts within user turns.
+   * 4. OpenAI-style tool definitions converted to `functionDeclarations`.
+   *
+   * @param {string} modelId - Target model (endpoint; also its output ceiling and thinking levels).
+   * @param {ChatMessage[]} messages - Conversation messages.
+   * @param {ModelCompletionOptions} options - Completion options.
+   * @returns {Record<string, unknown>} The request body for Gemini's API.
+   * @private
+   */
+  private buildRequestPayload(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions,
+  ): Record<string, unknown> {
+    // --- Extract system messages into systemInstruction ---
+    // Gemini treats system instructions as a separate top-level field,
+    // similar to Anthropic but with a `parts` array wrapper.
+    const systemParts: string[] = [];
+    const conversationMessages: ChatMessage[] = [];
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.filter(p => p.type === 'text').map(p => (p as { text: string }).text).join('\n')
+            : '';
+        if (text) systemParts.push(text);
+      } else {
+        conversationMessages.push(msg);
+      }
+    }
+
+    // --- Convert messages to Gemini content format ---
+    const contents = this.convertMessages(conversationMessages);
+
+    const payload: Record<string, unknown> = {
+      contents,
+    };
+
+    // Include systemInstruction only if there's system content
+    if (systemParts.length > 0) {
+      payload.systemInstruction = {
+        parts: [{ text: systemParts.join('\n\n') }],
+      } satisfies GeminiSystemInstruction;
+    }
+
+    // --- Generation config ---
+    const generationConfig: GeminiGenerationConfig = {};
+    if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
+    if (options.maxTokens !== undefined) {
+      // Never above the model's output ceiling: the API rejects the whole
+      // request, and a rescue hop's headroom
+      // (FallbackProviderEntry.maxTokensHeadroom) can lift a large budget
+      // past it. Models outside the catalog pass through unclamped.
+      const outputLimit = GEMINI_MODELS.find(m => m.modelId === modelId)?.outputTokenLimit;
+      generationConfig.maxOutputTokens =
+        typeof outputLimit === 'number' ? Math.min(options.maxTokens, outputLimit) : options.maxTokens;
+    }
+    if (options.topP !== undefined) generationConfig.topP = options.topP;
+    if (options.stopSequences?.length) generationConfig.stopSequences = options.stopSequences;
+    // JSON mode: Gemini uses responseMimeType to enforce JSON output.
+    // Schema-driven structured output: when the buildResponseFormat
+    // adapter routes a Zod schema through Gemini, it sets
+    // responseFormat: { type: 'json_object', _gemini: { responseSchema } }.
+    // Forwarding the schema to generationConfig.responseSchema enables
+    // Gemini's constrained-decoding enforcement (output is guaranteed
+    // valid JSON conforming to the schema).
+    if (options.responseFormat?.type === 'json_object') {
+      generationConfig.responseMimeType = 'application/json';
+      const geminiExtra = (options.responseFormat as { _gemini?: { responseSchema?: Record<string, unknown> } })._gemini;
+      if (geminiExtra?.responseSchema) {
+        // Gemini's responseSchema is an OpenAPI-subset proto that 400s the
+        // whole request on ANY unknown field (`Unknown name "…"`), and
+        // lowered JSON Schemas legitimately carry fields outside it —
+        // z.record lowers to `additionalProperties`, strict-mode shapes pin
+        // `additionalProperties: false` (killed a world-creation objectives
+        // pass in production, 2026-07-16). Sanitize to the accepted subset
+        // at this boundary so every caller is covered.
+        generationConfig.responseSchema = sanitizeGeminiResponseSchema(
+          geminiExtra.responseSchema,
+        );
+      }
+    }
+    // topK support via customModelParams
+    if (options.customModelParams?.topK !== undefined) {
+      generationConfig.topK = options.customModelParams.topK as number;
+    }
+    // Thinking depth. A caller-supplied thinkingConfig is forwarded as is;
+    // otherwise the provider-neutral `effort` becomes the model's thinking
+    // level when the model is known to take that level. Thinking shares the
+    // maxOutputTokens cap: room for it on a rescue hop comes from
+    // FallbackProviderEntry.maxTokensHeadroom, not from this provider. The
+    // shared `thinking` option is Anthropic's on-switch and is not translated:
+    // on a fallback hop it would turn "thinking on" into a thinking-token cap.
+    const customThinking = options.customModelParams?.thinkingConfig;
+    if (customThinking && typeof customThinking === 'object') {
+      generationConfig.thinkingConfig = customThinking as GeminiThinkingConfig;
+    } else {
+      const thinkingLevel = geminiThinkingLevelFor(modelId, options.effort);
+      if (thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel };
+    }
+
+    if (Object.keys(generationConfig).length > 0) {
+      payload.generationConfig = generationConfig;
+    }
+
+    // --- Tool definitions ---
+    const tools = this.convertToolDefs(options.tools);
+    if (tools.length > 0) {
+      payload.tools = [{ functionDeclarations: tools }];
+    }
+
+    // Pass through custom model params (excluding ones we already handle,
+    // and never OpenRouter's routing controls or another vendor's
+    // structured-output field — Gemini 400s on unknown top-level names like
+    // `provider`; see openrouter-only-params).
+    if (options.customModelParams) {
+      // thinkingConfig belongs inside generationConfig (set above); at the
+      // payload root Gemini rejects it as an unknown field.
+      const { topK, thinkingConfig, ...rest } = options.customModelParams;
+      const passthrough = stripParamsForGemini(rest);
+      if (passthrough) {
+        Object.assign(payload, passthrough);
+      }
+    }
+
+    return payload;
+  }
+
+  /**
+   * Converts an array of ChatMessages to Gemini's content format.
+   *
+   * Maps IProvider roles to Gemini roles:
+   * - `user` -> `user`
+   * - `assistant` -> `model` (Gemini uses "model" instead of "assistant")
+   * - `tool` -> `user` with `functionResponse` parts
+   *
+   * Consecutive tool results share one `user` turn, because Gemini requires
+   * the responses to a turn of parallel function calls in a single content
+   * (one functionResponse part per call). A tool result without `name`, as
+   * `generateText` records them, takes the function name of the call with the
+   * same id.
+   *
+   * @param {ChatMessage[]} messages - IProvider-format messages.
+   * @returns {GeminiContent[]} Gemini-format content array.
+   * @private
+   */
+  private convertMessages(messages: ChatMessage[]): GeminiContent[] {
+    // The inline image data so far, in base64 characters, against Gemini's per-request limit.
+    let inlineChars = 0;
+    const contents: GeminiContent[] = [];
+    const toolNameByCallId = new Map<string, string>();
+
+    for (const msg of messages) {
+      if (msg.role === 'assistant') {
+        // --- Assistant messages map to "model" role ---
+        const parts: GeminiPart[] = [];
+
+        // Add text content if present
+        if (typeof msg.content === 'string' && msg.content) {
+          parts.push({ text: msg.content });
+        }
+
+        // Convert tool_calls to functionCall parts. Each call's thought
+        // signature is replayed verbatim. A turn with no signature at all (a
+        // call made by another provider, or history that dropped it) gets the
+        // documented placeholder on its first call, which is where Gemini puts
+        // its own; without one Gemini 3 rejects the request with HTTP 400.
+        if (msg.tool_calls?.length) {
+          const turnHasSignature = msg.tool_calls.some(tc => tc.thoughtSignature);
+          msg.tool_calls.forEach((tc, i) => {
+            if (tc.id) toolNameByCallId.set(tc.id, tc.function.name);
+            let parsedArgs: Record<string, unknown>;
+            try {
+              parsedArgs = typeof tc.function.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : (tc.function.arguments as unknown as Record<string, unknown>) ?? {};
+            } catch {
+              parsedArgs = {};
+            }
+            const part: GeminiPart = {
+              functionCall: { name: tc.function.name, args: parsedArgs },
+            };
+            if (tc.thoughtSignature) {
+              part.thoughtSignature = tc.thoughtSignature;
+            } else if (!turnHasSignature && i === 0) {
+              part.thoughtSignature = GEMINI_SKIP_THOUGHT_SIGNATURE;
+            }
+            parts.push(part);
+          });
+        }
+
+        // Ensure at least one part — Gemini requires non-empty parts
+        if (parts.length === 0) {
+          parts.push({ text: '' });
+        }
+
+        contents.push({ role: 'model', parts });
+
+      } else if (msg.role === 'tool') {
+        // --- Tool result messages become user-role functionResponse ---
+        // Gemini expects tool results as functionResponse parts in a user turn.
+        let responseData: Record<string, unknown>;
+        if (typeof msg.content === 'string') {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(msg.content);
+          } catch {
+            // If the tool result isn't valid JSON, wrap it
+            parsed = msg.content;
+          }
+          // functionResponse.response is a JSON object (a protobuf Struct);
+          // Gemini rejects a string, number, array or null there with HTTP
+          // 400, so such a result is wrapped.
+          responseData = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : { result: parsed };
+        } else {
+          responseData = { result: JSON.stringify(msg.content ?? '') };
+        }
+
+        const responsePart: GeminiPart = {
+          functionResponse: {
+            name: msg.name
+              || (msg.tool_call_id ? toolNameByCallId.get(msg.tool_call_id) : undefined)
+              || 'unknown',
+            response: responseData,
+          },
+        };
+        const previous = contents[contents.length - 1];
+        if (
+          previous?.role === 'user'
+          && previous.parts.length > 0
+          && previous.parts.every(part => part.functionResponse)
+        ) {
+          previous.parts.push(responsePart);
+        } else {
+          contents.push({ role: 'user', parts: [responsePart] });
+        }
+
+      } else {
+        // --- User messages ---
+        const parts: GeminiPart[] = [];
+
+        if (typeof msg.content === 'string') {
+          parts.push({ text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          // Multimodal content: text parts as text, images as inline data.
+          for (const part of msg.content) {
+            if (part.type === 'text') {
+              parts.push({ text: (part as { text: string }).text });
+            } else if (part.type === 'image_url') {
+              const imagePart = imagePartOf((part as { image_url: { url: string } }).image_url.url);
+              inlineChars += imagePart.inlineData?.data.length ?? 0;
+              if (inlineChars > MAX_INLINE_BASE64_CHARS) {
+                throw refusedImage(
+                  `The images in this request come to more than Gemini's 100 MB of inline data per request, counted in base64; pass large images as https URLs.`,
+                  'IMAGE_TOO_LARGE',
+                );
+              }
+              parts.push(imagePart);
+            }
+          }
+        }
+
+        if (parts.length === 0) {
+          parts.push({ text: '' });
+        }
+
+        contents.push({ role: 'user', parts });
+      }
+    }
+
+    return contents;
+  }
+
+  /**
+   * Converts OpenAI-style tool definitions to Gemini's functionDeclarations format.
+   *
+   * OpenAI uses `{ type: 'function', function: { name, description, parameters } }`
+   * while Gemini uses `{ name, description, parameters }` inside a `functionDeclarations` array.
+   *
+   * @param {Array<Record<string, unknown>>} [tools] - OpenAI-formatted tool defs.
+   * @returns {GeminiFunctionDeclaration[]} Gemini-formatted function declarations.
+   * @private
+   */
+  private convertToolDefs(tools?: Array<Record<string, unknown>>): GeminiFunctionDeclaration[] {
+    if (!tools || tools.length === 0) return [];
+    return tools.map(tool => {
+      // OpenAI format: { type: 'function', function: { name, description, parameters } }
+      const fn = (tool as any)?.function;
+      if (fn?.name) {
+        return {
+          name: fn.name as string,
+          description: (fn.description ?? '') as string,
+          // Gemini uses the same "parameters" field name as OpenAI, unlike Anthropic's input_schema
+          parameters: fn.parameters,
+        };
+      }
+      // AgentOS ITool format: { name, description, inputSchema }
+      return {
+        name: (tool as any).name ?? 'unknown',
+        description: (tool as any).description ?? '',
+        parameters: (tool as any).inputSchema ?? (tool as any).parameters,
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Response mapping
+  // -------------------------------------------------------------------------
+
+  /**
+   * Maps a non-streaming Gemini response to IProvider format.
+   *
+   * Extracts text from `candidates[0].content.parts`, converts `functionCall`
+   * parts to OpenAI-style `tool_calls`, and normalizes usage metadata.
+   *
+   * @param {GeminiResponse} apiResponse - Raw Gemini API response.
+   * @param {string} modelId - The model ID used for the request.
+   * @returns {ModelCompletionResponse} Normalized completion response.
+   * @private
+   */
+  private mapResponseToCompletion(
+    apiResponse: GeminiResponse,
+    modelId: string,
+  ): ModelCompletionResponse {
+    const candidate = apiResponse.candidates?.[0];
+    const parts = candidate?.content?.parts ?? [];
+
+    // Collect text from all text parts
+    // Thought-summary parts (present only with includeThoughts) are the
+    // model's reasoning and stay out of the answer.
+    const textParts = parts
+      .filter(p => p.text !== undefined && !p.thought)
+      .map(p => p.text!);
+    const fullText = textParts.join('');
+    // They are returned apart, as the turn's reasoning summary.
+    const reasoningText = parts
+      .filter(p => p.thought && typeof p.text === 'string' && p.text)
+      .map(p => p.text!)
+      .join('');
+
+    // Collect function calls and convert to OpenAI-style tool_calls
+    const toolCalls = parts
+      .filter(p => p.functionCall)
+      .map((p, idx) => ({
+        id: `call_gemini_${Date.now()}_${idx}`,
+        type: 'function' as const,
+        function: {
+          name: p.functionCall!.name,
+          arguments: JSON.stringify(p.functionCall!.args ?? {}),
+        },
+        ...(p.thoughtSignature ? { thoughtSignature: p.thoughtSignature } : {}),
+      }));
+
+    const hasToolCalls = toolCalls.length > 0;
+    const finishReason = this.mapFinishReason(candidate?.finishReason ?? null);
+    const usage = this.mapUsage(apiResponse.usageMetadata, modelId);
+
+    // A blocked prompt returns no candidates, and a filter's finish reason
+    // (SAFETY, RECITATION, PROHIBITED_CONTENT and the rest of
+    // CONTENT_FILTER_FINISH_REASONS) returns no content. Surface either as a
+    // content-policy error (code 'content_filter', recognized by
+    // isContentPolicyRefusal) so the policy-aware fallback chain can engage an
+    // uncensored model. Returning an empty 200 here stranded the caller: the
+    // fallback could never fire, and an empty answer read as an image with no
+    // text.
+    if (!fullText && !hasToolCalls) {
+      const blocked = this.contentFilterBlock(
+        apiResponse.promptFeedback?.blockReason,
+        candidate?.finishReason ?? null,
+        apiResponse.usageMetadata ? usage : undefined,
+      );
+      if (blocked) throw blocked;
+    }
+
+    const choice: ModelCompletionChoice = {
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: fullText || null,
+        ...(hasToolCalls && { tool_calls: toolCalls }),
+        ...(reasoningText && { reasoningText }),
+      },
+      finishReason,
+    };
+
+    return {
+      id: `gemini-${modelId}-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      modelId,
+      choices: [choice],
+      usage,
+    };
+  }
+
+  /**
+   * The content-policy error for a response with no content that Google's
+   * filters stopped: a prompt block reason (any value, since a blocked prompt
+   * gets no candidates), or a finish reason in
+   * `CONTENT_FILTER_FINISH_REASONS`. `undefined` when neither applies.
+   * The message names the reason. The usage Gemini reported for the request
+   * goes on the error as `details.usage`, where the fallback chain and the
+   * completion gateway read a failed attempt's tokens.
+   */
+  private contentFilterBlock(
+    blockReason: string | undefined,
+    finishReason: string | null,
+    usage: ModelUsage | undefined,
+  ): GeminiProviderError | undefined {
+    const details = usage ? { usage } : undefined;
+    if (blockReason) {
+      return new GeminiProviderError(
+        `Gemini blocked the prompt (blockReason: ${blockReason}); no content returned.`,
+        'content_filter',
+        undefined,
+        undefined,
+        details,
+      );
+    }
+    if (this.mapFinishReason(finishReason) === 'content_filter') {
+      return new GeminiProviderError(
+        `Gemini blocked the response (finishReason: ${finishReason ?? 'unknown'}); no content returned.`,
+        'content_filter',
+        undefined,
+        undefined,
+        details,
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * Maps Gemini finish reasons to IProvider-convention finish reasons.
+   *
+   * Gemini uses uppercase enum strings:
+   * - `STOP` -> `"stop"` (natural completion)
+   * - `MAX_TOKENS` -> `"length"` (hit token limit)
+   * - `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII` and
+   *   the `IMAGE_` filter reasons (`CONTENT_FILTER_FINISH_REASONS`) ->
+   *   `"content_filter"` (stopped by Google's filters)
+   * - anything else -> its lowercase name
+   *
+   * @param {string | null} finishReason - Gemini's finish reason value.
+   * @returns {string} Normalized finish reason.
+   * @private
+   */
+  private mapFinishReason(finishReason: string | null): string {
+    if (finishReason === 'STOP') return 'stop';
+    if (finishReason === 'MAX_TOKENS') return 'length';
+    if (finishReason && CONTENT_FILTER_FINISH_REASONS.has(finishReason)) return 'content_filter';
+    return finishReason?.toLowerCase() ?? 'stop';
+  }
+
+  /**
+   * Maps Gemini usage metadata to IProvider's ModelUsage format.
+   *
+   * @param {GeminiUsageMetadata} [meta] - Gemini usage metadata.
+   * @param {string} modelId - Model ID for cost estimation.
+   * @returns {ModelUsage} Normalized usage metrics.
+   * @private
+   */
+  private mapUsage(meta: GeminiUsageMetadata | undefined, modelId: string): ModelUsage {
+    const promptTokens = meta?.promptTokenCount ?? 0;
+    // Thinking tokens are output the model generated and Google bills at the
+    // output rate ("output price, including thinking tokens"), reported apart
+    // from candidatesTokenCount. Counted here so completion tokens and cost
+    // match the bill — the same convention as OpenAI's completion_tokens,
+    // which includes reasoning tokens.
+    const completionTokens = (meta?.candidatesTokenCount ?? 0) + (meta?.thoughtsTokenCount ?? 0);
+    const totalTokens = meta?.totalTokenCount ?? (promptTokens + completionTokens);
+    // Gemini implicit caching (default-on for 2.5+) reports the cached
+    // subset of promptTokenCount in cachedContentTokenCount; normalize it
+    // into the same field the Anthropic/OpenAI/OpenRouter providers
+    // populate so cache hits meter identically everywhere. promptTokens
+    // stays inclusive of the cached subset, and an explicit 0 is preserved
+    // (an observed miss), while absent stays absent (unreported) — the same
+    // typeof gate the OpenAI/OpenRouter mappings use.
+    const cachedContentTokens = meta?.cachedContentTokenCount;
+
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      ...(typeof cachedContentTokens === 'number' && cachedContentTokens >= 0
+        ? { cacheReadInputTokens: cachedContentTokens }
+        : {}),
+      costUSD: this.estimateCost(promptTokens, completionTokens, modelId),
+    };
+  }
+
+  /**
+   * Assembles completed tool calls from the streaming accumulator.
+   *
+   * @param {Map<number, { name: string; args: Record<string, unknown> }>} accum - Accumulated tool calls.
+   * @returns {NonNullable<ChatMessage['tool_calls']>} OpenAI-style tool_calls array.
+   * @private
+   */
+  private assembleToolCalls(
+    accum: Map<number, { name: string; args: Record<string, unknown>; thoughtSignature?: string }>,
+  ): NonNullable<ChatMessage['tool_calls']> {
+    if (accum.size === 0) return [];
+    return Array.from(accum.entries()).map(([idx, tc]) => ({
+      id: `call_gemini_${Date.now()}_${idx}`,
+      type: 'function' as const,
+      function: {
+        name: tc.name,
+        arguments: JSON.stringify(tc.args ?? {}),
+      },
+      ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
+    }));
+  }
+
+  /**
+   * Estimates USD cost for a given model and token counts.
+   *
+   * Looks up pricing from the static model catalog. Returns undefined
+   * if the model is not found in the catalog.
+   *
+   * @param {number} inputTokens - Number of input tokens.
+   * @param {number} outputTokens - Number of output tokens.
+   * @param {string} modelId - Model identifier for pricing lookup.
+   * @returns {number | undefined} Estimated cost in USD.
+   * @private
+   */
+  private estimateCost(
+    inputTokens: number,
+    outputTokens: number,
+    modelId: string,
+  ): number | undefined {
+    const info = GEMINI_MODELS.find(m => m.modelId === modelId);
+    if (!info?.pricePer1MTokensInput || !info?.pricePer1MTokensOutput) return undefined;
+    // Long prompts bill the whole request at a higher tier on some models.
+    const longContext = GEMINI_LONG_CONTEXT_PRICING[modelId];
+    const isLong = longContext !== undefined && inputTokens > longContext.abovePromptTokens;
+    const inputRate = isLong ? longContext.input : info.pricePer1MTokensInput;
+    const outputRate = isLong ? longContext.output : info.pricePer1MTokensOutput;
+    return (
+      (inputTokens / 1_000_000) * inputRate +
+      (outputTokens / 1_000_000) * outputRate
+    );
+  }
+
+  /**
+   * Builds an abort chunk for early stream termination.
+   *
+   * @param {string} modelId - The model ID for the response.
+   * @returns {ModelCompletionResponse} A terminal chunk with abort error.
+   * @private
+   */
+  private buildAbortChunk(modelId: string): ModelCompletionResponse {
+    return {
+      id: `gemini-abort-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      modelId,
+      choices: [],
+      error: { message: 'Stream aborted by caller', type: 'abort' },
+      isFinal: true,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // HTTP transport
+  // -------------------------------------------------------------------------
+
+  /**
+   * The next API key to send: the pool rotates between configured keys and
+   * skips one in cooldown after a 429. Falls back to the configured key when
+   * the provider was configured without initialization (tests). When no key
+   * is usable while a probe of a failed key is in flight (its recheck came
+   * due), it waits for that probe, bounded by the pool's probe timeout, and
+   * draws again, so the first request after a recheck is served by a key that
+   * came back; the caller's signal ends that wait at once, and the request
+   * then reports the abort.
+   */
+  private async drawApiKey(abortSignal?: AbortSignal): Promise<string> {
+    return this.keyPool?.hasKeys ? this.keyPool.nextAfterProbes(abortSignal) : this.config.apiKey;
+  }
+
+  /**
+   * Probes one API key and reports what its answer showed: the verdict (`ok`, the failure kind it still shows, or
+   * `unknown`), the HTTP status, the vendor's message, the model and the Retry-After. Any kind but `billing` sends the
+   * models list; `kind: 'billing'` sends a one-token generateContent, since a list need not refuse a project that
+   * cannot pay: the request the health check sends, on `options.model`, else the default model, else
+   * `gemini-2.5-flash`, so `checkHealth()` shows when that id stops being served. The answer goes through the same
+   * classifier as a request's. It works before `initialize()`: the base URL is `options.baseURL`, else the configured
+   * one, else Gemini's own. The key pool's probe of a failed key is this method's verdict.
+   */
+  public async probeApiKey(apiKey: string, options: KeyProbeOptions = {}): Promise<KeyProbeAnswer> {
+    const deadline = startKeyProbeDeadline(options);
+    const baseURL = options.baseURL || this.config?.baseURL || GEMINI_DEFAULT_BASE_URL;
+    try {
+      if (options.kind === 'billing') {
+        const model = options.model || this.defaultModelId || GEMINI_BILLING_PROBE_MODEL;
+        const response = await fetch(`${baseURL}/models/${model}:generateContent`, {
+          method: 'POST',
+          headers: this.requestHeaders(apiKey),
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'ping' }] }], generationConfig: { maxOutputTokens: 1 } }),
+          signal: deadline.signal,
+        });
+        return await readKeyProbeAnswer(response, { model, apiKey, signal: deadline.signal });
+      }
+      return await readKeyProbeAnswer(
+        await fetch(`${baseURL}/models?pageSize=1`, { method: 'GET', headers: this.requestHeaders(apiKey), signal: deadline.signal }),
+        { apiKey, signal: deadline.signal },
+      );
+    } catch (error) {
+      return failedKeyProbeAnswer(error, deadline, { apiKey, baseURL });
+    } finally {
+      deadline.dispose();
+    }
+  }
+
+  /** Probes a key the pool took out of rotation, off the request path: the verdict of `probeApiKey()`. */
+  private async probeKey(apiKey: string, kind: KeyFailureKind | undefined): Promise<ProbeResult> {
+    return (await this.probeApiKey(apiKey, { kind })).verdict;
+  }
+
+  /** The error thrown when every key of the pool is out: no credential is sent again until one returns. */
+  private allKeysFailedError(message?: string, status?: number, errorStatus?: string): GeminiProviderError {
+    const kinds = Array.from(
+      new Set((this.keyPool?.snapshot() ?? []).map((state) => state.kind).filter((kind): kind is KeyFailureKind => kind !== undefined)),
+    );
+    const retryAfter = this.keyPool?.soonestReturnMs();
+    return new GeminiProviderError(
+      message ?? `Every Gemini API key is out of rotation (${kinds.join(', ') || 'unknown'}).`,
+      'ALL_KEYS_FAILED',
+      status ?? statusOfKinds(kinds),
+      errorStatus,
+      { kinds, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) },
+    );
+  }
+
+  /**
+   * Request headers for one call. The key travels in `x-goog-api-key`, which
+   * Gemini accepts on every endpoint this provider calls.
+   */
+  private requestHeaders(apiKey: string): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
+      'x-goog-api-key': apiKey,
+    };
+  }
+
+  /**
+   * Makes a non-streaming API request to the Gemini API with retry logic.
+   *
+   * The API key goes in the `x-goog-api-key` header. Each attempt draws a key
+   * from the pool, so a retry after a 429 uses another key when one is
+   * configured.
+   *
+   * @template T The expected response type.
+   * @param {string} endpoint - API endpoint path (e.g., "/models/gemini-2.5-flash:generateContent").
+   * @param {Record<string, unknown>} body - Request body.
+   * @param {number} [requestTimeoutOverride] - Per-call timeout in ms, over the configured default.
+   * @param {AbortSignal} [abortSignal] - Caller's signal. It aborts the fetch in flight, ends a wait
+   *   between attempts (a Retry-After or a backoff) at once, and once it has fired no further attempt
+   *   is sent.
+   * @param {number} [maxAttempts] - The call's attempt count, a first and its retries together, over
+   *   `config.maxRetries`; key hops are not counted, and no backoff is waited after the last attempt.
+   * @param {AttemptTally} [tally] - Filled with the attempts this request sent, so a caller that sends
+   *   it again on another route spends only what is left of the call's count.
+   * @param {Record<string, string>} [extraHeaders] - Headers every attempt sends beside the provider's own,
+   *   such as the call's operation id header; the provider's own win on a clash.
+   * @returns {Promise<T>} Parsed JSON response.
+   * @throws {GeminiProviderError} On authentication, validation, rate-limit, or network errors;
+   *   `REQUEST_ABORTED` when the caller's signal ends the request.
+   * @throws {RangeError} When `maxAttempts` is not a whole number of 1 or more.
+   * @private
+   */
+  private async makeApiRequest<T>(
+    endpoint: string,
+    body: Record<string, unknown>,
+    requestTimeoutOverride?: number,
+    abortSignal?: AbortSignal,
+    maxAttempts?: number,
+    tally?: AttemptTally,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<T> {
+    const url = `${this.config.baseURL}${endpoint}`;
+    const attempts = resolveAttemptCount(maxAttempts, this.config.maxRetries!);
+
+    let lastError: Error = new GeminiProviderError(
+      'Request failed after all retries.',
+      'MAX_RETRIES_REACHED',
+    );
+
+    // CR8: honor a per-call requestTimeout override (e.g. long codegen) over
+    // the provider default; only Anthropic read this before.
+    const effectiveTimeout =
+      typeof requestTimeoutOverride === 'number' && requestTimeoutOverride > 0
+        ? requestTimeoutOverride
+        : this.config.requestTimeout;
+
+    // Key hops this request has made: a key-scoped failure moves to the next
+    // usable key at once (at most one hop per key) without spending a
+    // transient attempt.
+    let keyHops = 0;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (abortSignal?.aborted) {
+        throw new GeminiProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+      }
+      const apiKey = await this.drawApiKey(abortSignal);
+      if (abortSignal?.aborted) {
+        throw new GeminiProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+      }
+      if (apiKey === '') throw this.allKeysFailedError();
+      const attemptStartedAt = Date.now();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+      // A key hop re-sends within the same attempt, so the count stays.
+      if (tally) tally.sent = attempt + 1;
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { ...extraHeaders, ...this.requestHeaders(apiKey) },
+          body: JSON.stringify(body),
+          // The caller's signal aborts this attempt's fetch as the timer does.
+          signal: abortSignal ? AbortSignal.any([controller.signal, abortSignal]) : controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({})) as Partial<GeminiAPIError>;
+          const errorMessage = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+          const errorStatus = errorData.error?.status;
+
+          // A key-scoped failure (a bad or revoked key, an unpaid account, a
+          // throttle) takes this key out of rotation and moves to the next
+          // usable key at once; the hop spends no transient attempt.
+          const keyFailure = classifyKeyFailure(response.status, JSON.stringify(errorData));
+          const serverRetryAfterMs = retryAfterMs(response.headers.get('retry-after'), undefined, this.config.keyPool?.maxRetryAfterMs);
+          if (keyFailure && this.keyPool && this.keyPool.size > 1) {
+            this.keyPool.markFailed(apiKey, keyFailure, {
+              status: response.status,
+              at: attemptStartedAt,
+              ...(serverRetryAfterMs !== null ? { retryAfterMs: serverRetryAfterMs } : {}),
+            });
+            lastError = new GeminiProviderError(errorMessage, keyFailure === 'quota' ? 'RATE_LIMIT_EXCEEDED' : 'API_CLIENT_ERROR', response.status, errorStatus, errorData);
+            if (this.keyPool.usable() > 0 && ++keyHops < this.keyPool.size) {
+              attempt -= 1;
+              continue;
+            }
+            if (this.keyPool.usable() === 0 && keyFailure !== 'quota') {
+              throw this.allKeysFailedError(errorMessage, response.status, errorStatus);
+            }
+          }
+
+          // Non-retryable client errors (auth, bad request, not found)
+          if (response.status === 400 || response.status === 401 || response.status === 403 || response.status === 404) {
+            throw new GeminiProviderError(
+              errorMessage,
+              'API_CLIENT_ERROR',
+              response.status,
+              errorStatus,
+              errorData,
+            );
+          }
+
+          // Rate limit: the key rests, then respect Retry-After
+          if (response.status === 429) {
+            lastError = new GeminiProviderError(
+              errorMessage,
+              'RATE_LIMIT_EXCEEDED',
+              429,
+              errorStatus,
+              errorData,
+            );
+            // A single key rests here; a pool of several was marked above.
+            if (!(this.keyPool && this.keyPool.size > 1)) this.keyPool?.markExhausted(apiKey);
+            // Retry-After is authoritative when present; otherwise jittered backoff. No wait after the last attempt.
+            // The caller's abort ends the wait, and the loop's check then reports it.
+            if (attempt < attempts - 1) {
+              const waitMs = serverRetryAfterMs ?? computeRetryBackoffMs(attempt);
+              await waitForRetry(waitMs, abortSignal);
+            }
+            continue;
+          }
+
+          // Retryable server errors (5xx)
+          if (response.status >= 500) {
+            lastError = new GeminiProviderError(
+              errorMessage,
+              'API_SERVER_ERROR',
+              response.status,
+              errorStatus,
+              errorData,
+            );
+            if (attempt < attempts - 1) await waitForRetry(computeRetryBackoffMs(attempt), abortSignal);
+            continue;
+          }
+
+          throw new GeminiProviderError(
+            errorMessage,
+            'API_REQUEST_FAILED',
+            response.status,
+            errorStatus,
+            errorData,
+          );
+        }
+
+        if (this.keyPool?.has(apiKey)) this.keyPool.markSuccess(apiKey, attemptStartedAt);
+        return (await response.json()) as T;
+      } catch (error: unknown) {
+        clearTimeout(timeoutId);
+        // A caller abort ends the request here; it is not a timeout to retry.
+        if (abortSignal?.aborted) {
+          throw new GeminiProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+        }
+        if (error instanceof GeminiProviderError) {
+          if (error.code === 'API_CLIENT_ERROR' || error.code === 'ALL_KEYS_FAILED') throw error;
+          lastError = error;
+        } else if (error instanceof Error && error.name === 'AbortError') {
+          lastError = new GeminiProviderError(
+            `Request timed out after ${effectiveTimeout}ms.`,
+            'REQUEST_TIMEOUT',
+          );
+        } else {
+          lastError = new GeminiProviderError(
+            error instanceof Error
+              ? redactUrlSecrets(error.message, this.config.baseURL, [apiKey])
+              : 'Network or unknown error',
+            'NETWORK_ERROR',
+          );
+        }
+
+        if (attempt === attempts - 1) break;
+        const delay = computeRetryBackoffMs(attempt);
+        console.warn(`[GeminiProvider] Retry ${attempt + 1}/${attempts - 1} in ${(delay / 1000).toFixed(1)}s`);
+        await waitForRetry(delay, abortSignal);
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Makes a streaming API request and returns the raw ReadableStream.
+   *
+   * Uses the `?alt=sse` query parameter to enable SSE streaming; the API key
+   * goes in the `x-goog-api-key` header.
+   *
+   * @param {string} endpoint - API endpoint (e.g., "/models/gemini-2.5-flash:streamGenerateContent").
+   * @param {Record<string, unknown>} body - Request body.
+   * @param {AbortSignal} [abortSignal] - The caller's signal. It ends a wait on the pool's probes and aborts the
+   *   request in flight, the returned body's reads included.
+   * @returns {Promise<ReadableStream<Uint8Array>>} The response body stream.
+   * @throws {GeminiProviderError} On connection errors; a key-scoped failure carries `keyFailure`,
+   *   `keyUsable` and `keyCount` on its details, which the stream's hop loop reads; `REQUEST_ABORTED`
+   *   when the caller's signal ended the draw or the request before the body was returned.
+   * @private
+   */
+  private async makeStreamRequest(
+    endpoint: string,
+    body: Record<string, unknown>,
+    requestTimeoutOverride?: number,
+    abortSignal?: AbortSignal,
+  ): Promise<ReadableStream<Uint8Array>> {
+    const apiKey = await this.drawApiKey(abortSignal);
+    if (abortSignal?.aborted) {
+      throw new GeminiProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+    }
+    if (apiKey === '') throw this.allKeysFailedError();
+    const startedAt = Date.now();
+    const url = `${this.config.baseURL}${endpoint}?alt=sse`;
+    const headers = this.requestHeaders(apiKey);
+
+    const controller = new AbortController();
+    // CR8: honor a per-call requestTimeout override over the provider default.
+    const effectiveTimeout =
+      typeof requestTimeoutOverride === 'number' && requestTimeoutOverride > 0
+        ? requestTimeoutOverride
+        : this.config.requestTimeout;
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        // The caller's signal aborts the request as the connection timer does, and the body's reads after the
+        // headers have arrived.
+        signal: abortSignal ? AbortSignal.any([controller.signal, abortSignal]) : controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({})) as Partial<GeminiAPIError>;
+        const errorMessage = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+        // A key-scoped failure takes the key out; the stream's hop loop reads the kind and what is left of the pool
+        // on the error's details to move to the next usable key before any event reaches the caller.
+        const streamKeyFailure = classifyKeyFailure(response.status, JSON.stringify(errorData));
+        if (streamKeyFailure) {
+          const serverRetryAfterMs = retryAfterMs(response.headers.get('retry-after'), undefined, this.config.keyPool?.maxRetryAfterMs);
+          this.keyPool?.markFailed(apiKey, streamKeyFailure, { status: response.status, at: startedAt, ...(serverRetryAfterMs !== null ? { retryAfterMs: serverRetryAfterMs } : {}) });
+        }
+        const keyDetails: StreamKeyFailureDetails = streamKeyFailure
+          ? { keyFailure: streamKeyFailure, keyUsable: this.keyPool ? this.keyPool.usable() : 1, keyCount: this.keyPool?.size ?? 1 }
+          : {};
+        throw new GeminiProviderError(
+          errorMessage,
+          'STREAM_CONNECTION_FAILED',
+          response.status,
+          errorData.error?.status,
+          { ...errorData, ...keyDetails },
+        );
+      }
+
+      if (!response.body) {
+        throw new GeminiProviderError(
+          'Expected a stream response but body was null.',
+          'STREAM_BODY_NULL',
+        );
+      }
+
+      if (this.keyPool?.has(apiKey)) this.keyPool.markSuccess(apiKey, startedAt);
+      return response.body;
+    } catch (error: unknown) {
+      clearTimeout(timeoutId);
+      if (abortSignal?.aborted) {
+        throw new GeminiProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+      }
+      if (error instanceof GeminiProviderError) throw error;
+      throw new GeminiProviderError(
+        error instanceof Error
+          ? redactUrlSecrets(error.message, this.config.baseURL, [apiKey])
+          : 'Failed to connect to Gemini stream.',
+        'STREAM_CONNECTION_FAILED',
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // SSE parsing
+  // -------------------------------------------------------------------------
+
+  /**
+   * Parses an SSE (Server-Sent Events) stream from Gemini.
+   *
+   * Gemini SSE events follow the standard format:
+   * ```
+   * data: <json_payload>
+   *
+   * data: <json_payload>
+   * ```
+   *
+   * This parser extracts the `data:` line content for each event and yields
+   * the raw JSON strings for the caller to parse and dispatch.
+   *
+   * @param {ReadableStream<Uint8Array>} stream - The raw SSE byte stream.
+   * @returns {AsyncGenerator<string>} Yields JSON string payloads.
+   * @private
+   */
+  private async *parseSseStream(
+    stream: ReadableStream<Uint8Array>,
+  ): AsyncGenerator<string, void, undefined> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete events (separated by double newlines)
+        const events = buffer.split('\n\n');
+        // Keep the last incomplete chunk in the buffer
+        buffer = events.pop() || '';
+
+        for (const event of events) {
+          const trimmed = event.trim();
+          if (!trimmed) continue;
+
+          // Extract content after "data: " prefix
+          // Events may have multi-line data (though Gemini typically uses single-line)
+          const lines = trimmed.split('\n');
+          const dataLines: string[] = [];
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              dataLines.push(line.slice(6));
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5));
+            }
+          }
+
+          if (dataLines.length > 0) {
+            const data = dataLines.join('\n').trim();
+            // Skip empty data or the [DONE] signal
+            if (data && data !== '[DONE]') {
+              yield data;
+            }
+          }
+        }
+      }
+
+      // Process any remaining buffer content
+      if (buffer.trim()) {
+        const lines = buffer.trim().split('\n');
+        const dataLines: string[] = [];
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            dataLines.push(line.slice(6));
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5));
+          }
+        }
+        if (dataLines.length > 0) {
+          const data = dataLines.join('\n').trim();
+          if (data && data !== '[DONE]') {
+            yield data;
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+}

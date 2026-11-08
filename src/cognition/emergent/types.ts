@@ -1,0 +1,1097 @@
+/**
+ * @fileoverview Core types for the Emergent Capability Engine.
+ * @module @framers/agentos/emergent/types
+ *
+ * Provides all type definitions for the runtime tool creation system, enabling
+ * agents to forge new tools via composition or sandboxed code execution, subject
+ * to LLM-as-judge verification and tiered promotion.
+ *
+ * Key concepts:
+ * - ToolTier: Lifecycle scope of an emergent tool (session → agent → shared)
+ * - ComposableToolSpec: Pipeline of existing tool calls with input mapping
+ * - SandboxedToolSpec: Arbitrary code execution in a memory/time-bounded sandbox
+ * - CreationVerdict: LLM judge evaluation of a newly forged tool
+ * - PromotionVerdict: Multi-reviewer gate before tier promotion
+ * - EmergentTool: Unified shape for any runtime-created tool
+ */
+
+import type { JSONSchemaObject } from '../../core/tools/ITool.js';
+import type { SelfImprovementConfig } from './SelfImprovementConfig.js';
+import type { ForgedCodeExecutor } from './executor/types.js';
+
+// ============================================================================
+// TIER SYSTEM
+// ============================================================================
+
+/**
+ * Lifecycle scope tier for an emergent tool.
+ *
+ * Tools progress through tiers as they prove reliability. Higher tiers require
+ * more stringent promotion verdicts and multi-reviewer sign-off.
+ *
+ * - `'session'` — Exists only for the current agent session; discarded on shutdown.
+ * - `'agent'`   — Persisted for the agent that created it; not shared globally.
+ * - `'shared'`  — Promoted to a shared tool registry; available to all agents.
+ */
+export type ToolTier = 'session' | 'agent' | 'shared';
+
+// ============================================================================
+// SANDBOX API ALLOWLIST
+// ============================================================================
+
+/**
+ * Named APIs that sandboxed tool code is permitted to invoke.
+ *
+ * All other I/O is forbidden by default. The allowlist is declared per-tool in
+ * {@link SandboxedToolSpec} and enforced by the sandbox runtime at execution time.
+ *
+ * - `'fetch'`         — Outbound HTTP/HTTPS requests via the global `fetch` API.
+ * - `'fs.readFile'`   — Synchronous read of files in a pre-approved path whitelist.
+ * - `'fs.writeFile'`  — A file written under a ceiling's write roots (`fs.write`).
+ * - `'fs.unlink'`     — A file removed under a ceiling's delete roots (`fs.delete`).
+ * - `'crypto'`        — Access to the Node.js `crypto` module for hashing / HMAC.
+ */
+export type SandboxAPI = 'fetch' | 'fs.readFile' | 'fs.writeFile' | 'fs.unlink' | 'crypto';
+
+/**
+ * A capability a code-forged tool can be granted, by its catalogue name.
+ * `fs.read`, `fs.write` and `fs.delete` are the catalogue names of the
+ * `fs.readFile`, `fs.writeFile` and `fs.unlink` functions injected into
+ * forged code; `SandboxAPI` keeps the injected names.
+ */
+export type CapabilityName = 'fetch' | 'fs.read' | 'fs.write' | 'fs.delete' | 'crypto';
+
+/** A method a forged tool's `fetch` may send. GET and HEAD read; the rest change state. */
+export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/**
+ * Who must agree before an effect capability's grant is used. This release
+ * builds `'none'` only; a ceiling naming `'at-forge'` or `'per-call'` fails
+ * construction with `approval_not_available`.
+ */
+export type EffectApproval = 'none' | 'at-forge' | 'per-call';
+
+/**
+ * A name a request's list may hold: a catalogue name, or the injected name it
+ * stands for (`fs.readFile` for `fs.read`). Lists keep the names as written;
+ * every reader normalises them with `normalizeAllowlist`.
+ */
+export type AllowlistName = SandboxAPI | CapabilityName;
+
+/** The scope a host grants `fetch` under. */
+export interface FetchCeiling {
+  /** Hosts a forged tool may reach, matched exactly and case-insensitively; `'*'` is every host; `[]` grants nothing. */
+  domains: string[] | '*';
+  /**
+   * Methods a forged tool may send. POST, PUT, PATCH and DELETE change state:
+   * they need an isolating executor, `maxRequestBytes` and `approval`.
+   * @default ['GET', 'HEAD']
+   */
+  methods?: HttpMethod[];
+  /** A state-changing request's body larger than this is refused before anything is sent. Required beside a state-changing method, refused without one. */
+  maxRequestBytes?: number;
+  /** Required beside a state-changing method. */
+  approval?: EffectApproval;
+  /** A response body larger than this is refused while it streams. @default 5_242_880 */
+  maxResponseBytes?: number;
+  /** Redirects the broker follows, each one checked like the first request. @default 5 */
+  maxRedirects?: number;
+  /** One request's time bound, redirects included; at most 2_147_483_647 (Node's longest timer delay). @default 30_000 */
+  timeoutMs?: number;
+}
+
+/** The scope a host grants `fs.read` under. */
+export interface FsReadCeiling {
+  /** Absolute directories a forged tool may read under, after symlinks are resolved; `[]` grants nothing. */
+  roots: string[];
+  /** A file larger than this is refused while it streams. @default 1_048_576 */
+  maxBytesPerRead?: number;
+  /** One read's time bound; at most 2_147_483_647 (Node's longest timer delay). @default 30_000 */
+  timeoutMs?: number;
+}
+
+/**
+ * The scope a host grants `fs.write` under. Every field is required: a
+ * forged tool writes only what the host has bounded. Granted only on an
+ * isolating executor.
+ */
+export interface FsWriteCeiling {
+  /** Absolute directories a forged tool may write under, after symlinks are resolved; `[]` grants nothing. */
+  roots: string[];
+  /** `'create-only'` refuses an existing file; `'create-or-replace'` replaces one whole, through a temporary file. */
+  mode: 'create-only' | 'create-or-replace';
+  /** One file's size, in bytes. */
+  maxBytesPerFile: number;
+  /** The bytes one call of the tool may write, together. */
+  maxBytesPerCall: number;
+  /** The files one call of the tool may write. */
+  maxFilesPerCall: number;
+  /** One write's time bound; at most 2_147_483_647. */
+  timeoutMs: number;
+  approval: EffectApproval;
+}
+
+/** The scope a host grants `fs.delete` under: single regular files. Every field is required; isolating executor only. */
+export interface FsDeleteCeiling {
+  /** Absolute directories a forged tool may delete files under, after symlinks are resolved; `[]` grants nothing. */
+  roots: string[];
+  /** The files one call of the tool may delete. */
+  maxFilesPerCall: number;
+  /** One removal's time bound; at most 2_147_483_647. */
+  timeoutMs: number;
+  approval: EffectApproval;
+}
+
+/**
+ * What a host lets code-forged tools have. A key that is absent grants
+ * nothing; with this set, a forging agent's `allowlist` is a request the
+ * ceiling must cover, and every capability call goes through the broker.
+ */
+export interface ForgedCapabilities {
+  fetch?: FetchCeiling;
+  'fs.read'?: FsReadCeiling;
+  'fs.write'?: FsWriteCeiling;
+  'fs.delete'?: FsDeleteCeiling;
+  crypto?: Record<string, never>;
+}
+
+/** An effect a forged tool is about to have, as `effectPolicy` sees it. */
+export interface PendingEffect {
+  capability: 'fs.write' | 'fs.delete' | 'fetch';
+  /** The path as written (the parent's real path and the last component), or the URL. */
+  target: string;
+  /** A state-changing request's method. */
+  method?: HttpMethod;
+  /** The bytes a write or a request carries. */
+  bytes?: number;
+  toolId: string;
+  agentId: string;
+  callId: string;
+  /** A forge test's run: nothing it writes, deletes or sends is real. */
+  dryRun: boolean;
+}
+
+/**
+ * A host's last word on each write, delete and state-changing request, after
+ * the scope and the bounds and before the effect record. It may refuse,
+ * never allow what the scope refused; a throw, or no answer within one
+ * second, refuses.
+ */
+export type EffectPolicy = (effect: PendingEffect) => void | { deny: string } | Promise<void | { deny: string }>;
+
+/** The answer a forge test gives a state-changing request instead of sending it. */
+export interface ForgeTestResponse {
+  method: HttpMethod;
+  url: string;
+  status: number;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/** Where a ceiling's effect records go. */
+export interface EmergentAuditConfig {
+  /** `'storage'` writes a record per capability call and needs a storage adapter. @default 'storage' */
+  store?: 'storage' | 'none';
+  /** What a record keeps of a call's target: a SHA-256 digest, or the target itself. @default 'digest' */
+  content?: 'digest' | 'full';
+  /** Days effect records are kept; unset keeps them. Prunes the effect table only. */
+  retainDays?: number;
+}
+
+// ============================================================================
+// TOOL IMPLEMENTATIONS
+// ============================================================================
+
+/**
+ * A single step in a composable tool pipeline.
+ *
+ * Steps are executed sequentially. Each step invokes an existing registered tool
+ * by name and maps values from the pipeline's shared input namespace into the
+ * step's arguments using reference expressions.
+ *
+ * Reference expression syntax (resolved at runtime):
+ * - `"$input"` — the original input to the composable tool.
+ * - `"$prev"`  — the output of the immediately preceding step.
+ * - `"$steps.<stepName>"` — the output of a named step.
+ * - Any other literal value is used as-is.
+ */
+export interface ComposableStep {
+  /**
+   * Unique name for this step within the pipeline.
+   * Used for cross-step references via `$steps.<stepName>`.
+   * @example "fetchUser"
+   */
+  name: string;
+
+  /**
+   * The registered tool name to invoke for this step.
+   * Must match the `name` property of an `ITool` available to the agent.
+   * @example "web_search"
+   */
+  tool: string;
+
+  /**
+   * Input argument mapping for the tool invocation.
+   * Keys are the tool's argument names; values are literal values or reference
+   * expressions (`$input`, `$prev`, `$steps.<name>`).
+   *
+   * @example
+   * ```ts
+   * { query: "$input.searchTerm", maxResults: 5 }
+   * ```
+   */
+  inputMapping: Record<string, unknown>;
+
+  /**
+   * Optional JSONata / simple expression evaluated against `$prev` before
+   * executing this step. When the expression evaluates to falsy, the step is
+   * skipped and its output is `null`.
+   *
+   * @example "$prev.totalCount > 0"
+   */
+  condition?: string;
+}
+
+/**
+ * Implementation specification for a tool built by composing existing tools.
+ *
+ * The engine executes each step in order, threading outputs through the
+ * reference expression system. The final step's output becomes the tool's output.
+ */
+export interface ComposableToolSpec {
+  /** Discriminant: always `'compose'` for composable specs. */
+  mode: 'compose';
+
+  /**
+   * Ordered list of pipeline steps.
+   * Must contain at least one step; the last step's output is the tool result.
+   */
+  steps: ComposableStep[];
+}
+
+/**
+ * Implementation specification for a tool whose logic is arbitrary code
+ * executed in a memory/time-bounded sandbox.
+ *
+ * The sandboxed function signature must be:
+ * ```ts
+ * async function run(input: unknown): Promise<unknown>
+ * ```
+ * The engine calls `run(input)` and returns its resolved value as the tool output.
+ */
+export interface SandboxedToolSpec {
+  /** Discriminant: always `'sandbox'` for sandboxed specs. */
+  mode: 'sandbox';
+
+  /**
+   * The full source code of the sandboxed module.
+   * Must export or define an async `run` function as its entry point.
+   *
+   * @example
+   * ```ts
+   * async function run(input) {
+   *   const res = await fetch(`https://api.example.com?q=${input.query}`);
+   *   return res.json();
+   * }
+   * ```
+   */
+  code: string;
+
+  /**
+   * Explicit allowlist of sandbox APIs the code may invoke.
+   * Any call to an API not in this list will throw at runtime.
+   */
+  allowlist: AllowlistName[];
+}
+
+/**
+ * Union of all supported tool implementation specifications.
+ */
+export type ToolImplementation = ComposableToolSpec | SandboxedToolSpec;
+
+// ============================================================================
+// SANDBOX EXECUTION
+// ============================================================================
+
+/**
+ * One run of a code-forged tool, as the broker sees it: the run's id, the
+ * tool and the agent it runs for, and the signal that ends it. Under a
+ * ceiling the engine makes one for every forge test and every call; the
+ * broker checks it before every capability call and again just before the
+ * effect, and keys what is in flight by its id.
+ */
+export interface CallHandle {
+  id: string;
+  toolId: string;
+  agentId: string;
+  signal: AbortSignal;
+  /**
+   * Present for a forge test's run: writes land in a temporary overlay,
+   * deletes mark their target gone for the run, state-changing requests are
+   * answered from `responses` (or a `204` with `x-agentos-forge-test:
+   * not-sent`) and never sent.
+   */
+  dryRun?: { responses: readonly ForgeTestResponse[] };
+}
+
+/**
+ * Input to the sandbox executor for running a single sandboxed tool invocation.
+ */
+export interface SandboxExecutionRequest {
+  /**
+   * Source code of the sandboxed module (same format as `SandboxedToolSpec.code`).
+   */
+  code: string;
+
+  /**
+   * The argument object passed to the `run(input)` entry point.
+   */
+  input: unknown;
+
+  /**
+   * APIs the sandbox is permitted to call. Anything not listed is blocked.
+   */
+  allowlist: AllowlistName[];
+
+  /**
+   * Nominal heap budget in megabytes for the sandbox execution.
+   * The current node:vm-backed JavaScript executor reports heap deltas but does
+   * not preemptively enforce this limit.
+   * @default 128
+   */
+  memoryMB: number;
+
+  /**
+   * Maximum wall-clock time in milliseconds before the sandbox is forcibly
+   * killed and an error is returned.
+   * @default 5000
+   */
+  timeoutMs: number;
+
+  /**
+   * The run's handle. Required when the forge has a broker attached (a host
+   * with `EmergentConfig.capabilities`); the engine fills it.
+   */
+  call?: CallHandle;
+}
+
+/**
+ * Outcome of a single sandbox execution attempt.
+ */
+export interface SandboxExecutionResult {
+  /**
+   * `true` when `run()` resolved without throwing and within resource limits.
+   */
+  success: boolean;
+
+  /**
+   * The resolved return value of `run()`, present only when `success` is `true`.
+   */
+  output?: unknown;
+
+  /**
+   * Human-readable error description, present when `success` is `false`.
+   * Includes timeout and thrown-exception cases. A future isolate-backed
+   * runtime may also report memory-exceeded cases.
+   */
+  error?: string;
+
+  /**
+   * Actual wall-clock execution time in milliseconds.
+   * Populated regardless of success/failure.
+   */
+  executionTimeMs: number;
+
+  /**
+   * Observed heap delta for the sandbox execution in bytes.
+   * Populated when the runtime can measure it; otherwise `0`.
+   */
+  memoryUsedBytes: number;
+}
+
+// ============================================================================
+// JUDGE VERDICTS
+// ============================================================================
+
+/**
+ * Evaluation verdict produced by the LLM-as-judge after a tool is forged.
+ *
+ * The judge runs the tool against its declared test cases and scores it across
+ * five evaluation dimensions. A tool is only registered when `approved` is `true`.
+ */
+export interface CreationVerdict {
+  /**
+   * Whether the judge approves the tool for registration at its initial tier.
+   * `false` means the forge request is rejected and no tool is registered.
+   */
+  approved: boolean;
+
+  /**
+   * Overall confidence the judge has in its verdict, in the range [0, 1].
+   * Low confidence may trigger a second judge pass or human review.
+   */
+  confidence: number;
+
+  /**
+   * Safety score in the range [0, 1].
+   * Assesses whether the tool's implementation could cause unintended harm,
+   * data exfiltration, or resource exhaustion.
+   */
+  safety: number;
+
+  /**
+   * Correctness score in the range [0, 1].
+   * Measures how well the tool's outputs match the expected outputs in the
+   * declared test cases.
+   */
+  correctness: number;
+
+  /**
+   * Determinism score in the range [0, 1].
+   * Gauges whether repeated invocations with identical inputs produce
+   * consistent outputs. Lower scores flag non-deterministic behaviour.
+   */
+  determinism: number;
+
+  /**
+   * Bounded execution score in the range [0, 1].
+   * Indicates whether the tool reliably completes within its declared
+   * resource limits (memory, time). Scores derived from sandbox telemetry.
+   */
+  bounded: number;
+
+  /**
+   * Free-text explanation of the verdict, including any failure reasons,
+   * flagged patterns, or suggestions for improvement.
+   */
+  reasoning: string;
+}
+
+/**
+ * Verdict produced by the multi-reviewer panel before a tool is promoted
+ * to a higher {@link ToolTier}.
+ *
+ * Requires independent sign-off from a safety auditor and a correctness reviewer.
+ * Both must approve for `approved` to be `true`.
+ */
+export interface PromotionVerdict {
+  /**
+   * Whether both reviewers approved the promotion.
+   * `false` means the tool remains at its current tier.
+   */
+  approved: boolean;
+
+  /**
+   * Safety audit sub-verdict from the safety-focused reviewer model.
+   * Mirrors the shape of a partial {@link CreationVerdict}: `{ approved, confidence, reasoning }`.
+   */
+  safetyAuditor: {
+    /** Whether the safety auditor approved. */
+    approved: boolean;
+    /** Safety auditor's confidence in [0, 1]. */
+    confidence: number;
+    /** Safety auditor's reasoning text. */
+    reasoning: string;
+  };
+
+  /**
+   * Correctness review sub-verdict from the correctness-focused reviewer model.
+   * Mirrors the shape of a partial {@link CreationVerdict}: `{ approved, confidence, reasoning }`.
+   */
+  correctnessReviewer: {
+    /** Whether the correctness reviewer approved. */
+    approved: boolean;
+    /** Correctness reviewer's confidence in [0, 1]. */
+    confidence: number;
+    /** Correctness reviewer's reasoning text. */
+    reasoning: string;
+  };
+
+  /**
+   * Combined confidence score derived from both reviewer confidences.
+   * Typically the minimum or harmonic mean of the two sub-scores.
+   */
+  confidence: number;
+}
+
+/**
+ * Verdict produced before reusing an emergent tool from a previous session.
+ *
+ * Validates that the tool's schema and runtime behaviour still match expectations,
+ * and flags any anomalies that may indicate drift or tampering.
+ */
+export interface ReuseVerdict {
+  /**
+   * Whether the tool is safe to reuse in the current context.
+   * `false` means the tool should be re-forged or discarded.
+   */
+  valid: boolean;
+
+  /**
+   * JSON Schema validation errors for the tool's input/output schemas, if any.
+   * An empty array means schemas are structurally valid.
+   */
+  schemaErrors: string[];
+
+  /**
+   * Whether a behavioural anomaly was detected compared to the tool's
+   * historical usage baseline.
+   */
+  anomaly: boolean;
+
+  /**
+   * Human-readable description of the detected anomaly, present when
+   * `anomaly` is `true`.
+   */
+  anomalyReason?: string;
+}
+
+// ============================================================================
+// USAGE STATS
+// ============================================================================
+
+/**
+ * Accumulated runtime usage statistics for an emergent tool.
+ *
+ * Used by the promotion engine to decide when a tool has proven sufficient
+ * reliability to advance to the next {@link ToolTier}.
+ */
+export interface ToolUsageStats {
+  /**
+   * Total number of times the tool has been invoked across all sessions
+   * since it was first registered.
+   */
+  totalUses: number;
+
+  /**
+   * Number of invocations that completed without throwing or returning an error.
+   */
+  successCount: number;
+
+  /**
+   * Number of invocations that returned an error or threw an exception.
+   */
+  failureCount: number;
+
+  /**
+   * Rolling average wall-clock execution time in milliseconds, computed over
+   * all recorded invocations.
+   */
+  avgExecutionTimeMs: number;
+
+  /**
+   * ISO-8601 timestamp of the most recent invocation, or `null` if the tool
+   * has never been invoked.
+   */
+  lastUsedAt: string | null;
+
+  /**
+   * Aggregate confidence score in [0, 1] derived from judge verdict history.
+   * Updated each time a new {@link CreationVerdict} or {@link PromotionVerdict}
+   * is recorded.
+   */
+  confidenceScore: number;
+}
+
+/** Whether a stored tool may run. `demoted` is a host's decision and is never undone by loading. */
+export type ToolState = 'active' | 'suspended' | 'demoted';
+
+/**
+ * Who recorded a tool's state. The library re-checks a suspension its own
+ * checks set at the next load and lifts it when the cause is gone; a state the
+ * host set stays until the host clears it, whatever words its reason uses.
+ */
+export type StateSetter = 'library' | 'host';
+
+/** What a tool asked for when it was forged, kept so a rebuilt tool carries the same request. */
+export type StoredRequest =
+  | { kind: 'sandbox'; capabilities: CapabilityName[]; inferred?: boolean }
+  | { kind: 'compose'; steps: Array<{ name: string; tool: string }> };
+
+/**
+ * A tool's state as this process holds it. It mirrors the tool's row in
+ * `agentos_emergent_tool_state`, except for `request`, which can be `null`
+ * while the row stores a request this release cannot read.
+ */
+export interface ToolStateRecord {
+  toolId: string;
+  state: ToolState;
+  /**
+   * The reason for a state other than `active`. The library's reasons are
+   * catalogue words (`source_not_persisted`, `source_unreadable`,
+   * `legacy_inactive`, `legacy_owner`); a host's reason is the text it gave.
+   */
+  reason: string | null;
+  /** Who recorded the state. */
+  setBy: StateSetter;
+  /** Unix epoch milliseconds of the last state change. */
+  at: number;
+  /** The id of the write that set this state, when the row carries one. */
+  writeId?: string;
+  /**
+   * The request this process holds for the tool: the stored one when it could
+   * be read, else the one derived from the source, else `null`. A state change
+   * that names no request leaves the stored column as it is.
+   */
+  request: StoredRequest | null;
+}
+
+/**
+ * One row of `agentos_emergent_tools` joined with its state row. The five
+ * state columns are null for a row written before state was kept.
+ */
+export interface PersistedToolRow {
+  id: string;
+  name: string;
+  description: string;
+  input_schema: string;
+  output_schema: string | null;
+  implementation_mode: string;
+  implementation_source: string;
+  tier: ToolTier;
+  created_by_agent: string;
+  created_by_session: string;
+  created_at: number | string;
+  judge_verdicts: string | null;
+  confidence_score: number | null;
+  total_uses: number | null;
+  success_count: number | null;
+  failure_count: number | null;
+  avg_execution_ms: number | null;
+  last_used_at: number | string | null;
+  is_active: number | boolean | null;
+  state: ToolState | null;
+  state_reason: string | null;
+  set_by: string | null;
+  state_at: number | string | null;
+  request_json: string | null;
+  /** Whether the state row's flag write finished (0 while pending); null for a row with no state row. */
+  flag_synced: number | boolean | null;
+  /** The id of the last state write; null for a row with no state row, or one written without an id. */
+  write_id: string | null;
+}
+
+// ============================================================================
+// EMERGENT TOOL
+// ============================================================================
+
+/**
+ * A tool created at runtime by the Emergent Capability Engine.
+ *
+ * `EmergentTool` is the persisted record that backs a forged tool. It carries
+ * the tool's identity, schemas, implementation spec, current tier, audit trail,
+ * and accumulated usage statistics.
+ */
+export interface EmergentTool {
+  /**
+   * Globally unique identifier assigned at forge time.
+   * Convention: `emergent:<uuid-v4>` (e.g., `"emergent:a1b2c3d4-..."`).
+   */
+  id: string;
+
+  /**
+   * Machine-readable tool name exposed to the LLM in tool call requests.
+   * Must be unique among tools currently registered for the agent.
+   * @example "fetch_github_pr_summary"
+   */
+  name: string;
+
+  /**
+   * Natural language description of what the tool does and when to use it.
+   * Injected into the LLM prompt as the tool's description field.
+   */
+  description: string;
+
+  /**
+   * JSON Schema defining the structure of arguments the tool accepts.
+   * Validated by the executor before each invocation.
+   */
+  inputSchema: JSONSchemaObject;
+
+  /**
+   * JSON Schema defining the structure of the tool's output on success.
+   * Used by downstream tools and the judge for output validation.
+   */
+  outputSchema: JSONSchemaObject;
+
+  /**
+   * The implementation specification — either a composable pipeline or
+   * sandboxed code. Determines how the executor runs the tool.
+   */
+  implementation: ToolImplementation;
+
+  /**
+   * Current lifecycle tier. Tools start at `'session'` and may be promoted
+   * to `'agent'` and then `'shared'` as they accumulate usage and pass audits.
+   */
+  tier: ToolTier;
+
+  /**
+   * The agent that created this tool, or `'system'`. The agent identity is the
+   * persona: `forge_tool` passes the caller's `personaId`, and an `agent`-tier
+   * tool runs only for a caller with that `personaId`. (A GMI instance id is
+   * minted per session and cannot own a tool meant to outlive one: an
+   * `agent`-tier row from an earlier release that carries one loads suspended
+   * with the reason `legacy_owner`.)
+   */
+  createdBy: string;
+
+  /**
+   * ISO-8601 timestamp of when the tool was first forged and registered.
+   */
+  createdAt: string;
+
+  /**
+   * Ordered log of all judge verdicts issued for this tool, from initial
+   * creation through any subsequent promotion reviews.
+   * The most recent verdict is the last element.
+   */
+  judgeVerdicts: Array<CreationVerdict | PromotionVerdict>;
+
+  /**
+   * Accumulated runtime usage statistics.
+   * Updated after every invocation by the usage tracking subsystem.
+   */
+  usageStats: ToolUsageStats;
+
+  /**
+   * Human-readable label describing the origin of this tool for audit purposes.
+   * @example "forged by agent gmi-42 during session sess-99"
+   */
+  source: string;
+}
+
+// ============================================================================
+// FORGE API
+// ============================================================================
+
+/**
+ * A single test case used by the LLM judge to evaluate a newly forged tool.
+ *
+ * The judge invokes the tool with `input` and compares the result against
+ * `expectedOutput` using semantic equivalence (not strict equality).
+ */
+export interface ForgeTestCase {
+  /**
+   * Input arguments object passed to the tool's `run` / execution entry point.
+   * Must conform to the tool's declared `inputSchema`.
+   */
+  input: Record<string, unknown>;
+
+  /**
+   * Expected output value used for correctness scoring.
+   * The judge uses this as a reference — partial matches may still score well.
+   */
+  expectedOutput: unknown;
+
+  /**
+   * Outputs for the steps of a composition that have side effects (or are
+   * compositions themselves). While a tool is forged those steps are not
+   * executed; each takes its output from here, keyed by step name, so later
+   * steps receive real data.
+   */
+  stepOutputs?: Record<string, unknown>;
+
+  /**
+   * Answers for the state-changing requests a code-forged tool makes while it
+   * is forged, which are never sent: a request takes the first unused answer
+   * whose method and URL match it, otherwise a `204` with the header
+   * `x-agentos-forge-test: not-sent`. At most 16, each body within the
+   * ceiling's `maxResponseBytes`.
+   */
+  responses?: ForgeTestResponse[];
+}
+
+/**
+ * Request payload for the `forge_tool` system tool.
+ *
+ * An agent submits this to request the creation of a new emergent tool. The
+ * engine validates the request, runs the judge, and returns a {@link ForgeResult}.
+ */
+export interface ForgeToolRequest {
+  /**
+   * Desired machine-readable name for the new tool.
+   * Must be unique among tools currently visible to the requesting agent.
+   */
+  name: string;
+
+  /**
+   * Natural language description of the tool's purpose and behaviour.
+   * Used verbatim as the tool's description in the LLM tool list.
+   */
+  description: string;
+
+  /**
+   * JSON Schema for the tool's input arguments.
+   */
+  inputSchema: JSONSchemaObject;
+
+  /**
+   * JSON Schema for the tool's expected output.
+   */
+  outputSchema: JSONSchemaObject;
+
+  /**
+   * Implementation specification — composable pipeline or sandboxed code.
+   */
+  implementation: ToolImplementation;
+
+  /**
+   * One or more test cases the judge uses to evaluate correctness.
+   * At least one test case is required for the forge request to be accepted.
+   */
+  testCases: [ForgeTestCase, ...ForgeTestCase[]];
+}
+
+/**
+ * Result returned after a forge_tool invocation.
+ *
+ * On success the new tool is registered and available immediately. On failure
+ * the `verdict` field explains why the judge rejected the tool.
+ */
+export interface ForgeResult {
+  /**
+   * `true` when the tool was forged, judged, and registered successfully.
+   */
+  success: boolean;
+
+  /**
+   * The assigned tool ID, present only when `success` is `true`.
+   * @example "emergent:a1b2c3d4-e5f6-..."
+   */
+  toolId?: string;
+
+  /**
+   * The full emergent tool record, present only when `success` is `true`.
+   */
+  tool?: EmergentTool;
+
+  /**
+   * The judge's creation verdict.
+   * Present whether the forge succeeded or was rejected — callers can inspect
+   * `verdict.reasoning` to understand why a rejection occurred.
+   */
+  verdict?: CreationVerdict;
+
+  /**
+   * Human-readable error message for system-level failures (e.g., sandbox crash,
+   * schema parse error). Distinct from judge rejection — check `verdict` for those.
+   */
+  error?: string;
+}
+
+/**
+ * Result returned after a `promote_tool` invocation.
+ *
+ * On success the tool's tier is incremented and the new record is persisted.
+ */
+export interface PromotionResult {
+  /**
+   * `true` when both reviewers approved and the tier was incremented.
+   */
+  success: boolean;
+
+  /**
+   * The multi-reviewer promotion verdict.
+   * Present whether the promotion succeeded or was rejected.
+   */
+  verdict?: PromotionVerdict;
+
+  /**
+   * Human-readable error for system-level failures during the promotion process.
+   */
+  error?: string;
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+/**
+ * Configuration options for the Emergent Capability Engine.
+ *
+ * All fields have sensible defaults defined in {@link DEFAULT_EMERGENT_CONFIG}.
+ * Pass a partial object to override only the fields you need.
+ */
+export interface EmergentConfig {
+  /**
+   * Master switch. When `false`, all forge / promote / execute requests are
+   * rejected immediately with a `"emergent capabilities disabled"` error.
+   * @default false
+   */
+  enabled: boolean;
+
+  /**
+   * Maximum number of session-scoped emergent tools an agent may hold at once.
+   * Forge requests beyond this limit are rejected until older tools are evicted.
+   * @default 10
+   */
+  maxSessionTools: number;
+
+  /**
+   * Maximum number of agent-scoped emergent tools persisted per agent.
+   * Promotion from `'session'` to `'agent'` is blocked when this limit is reached.
+   * @default 50
+   */
+  maxAgentTools: number;
+
+  /**
+   * Whether sandboxed code tools may be forged at all.
+   *
+   * When `false`, agents may still create compose-mode tools from existing
+   * registered tools, but any forge request using `implementation.mode:
+   * 'sandbox'` is rejected before validation or execution.
+   *
+   * This is intentionally disabled by default because sandboxed code carries
+   * higher review and persistence risk than composing tools that are already registered.
+   *
+   * @default false
+   */
+  allowSandboxTools: boolean;
+
+  /**
+   * Whether sandbox source code should be persisted at rest.
+   *
+   * When `false`, sandbox tools still run in memory for the active process, but
+   * durable storage only receives redacted metadata instead of raw source code.
+   * This reduces the blast radius of runtime-forged code while preserving audit
+   * visibility and non-source tool metadata.
+   *
+   * Persisting raw sandbox source should be an explicit opt-in for trusted
+   * environments that need restart-time rehydration of sandbox tools.
+   *
+   * @default false
+   */
+  persistSandboxSource: boolean;
+
+  /**
+   * Memory budget in megabytes for each sandboxed tool execution. The
+   * in-process executor reports a heap delta and does not enforce it;
+   * QuickJSExecutor stops the guest at it (never below 16 MiB).
+   * Passed as `SandboxExecutionRequest.memoryMB`.
+   * @default 128
+   */
+  sandboxMemoryMB: number;
+
+  /**
+   * Wall-clock timeout in milliseconds for each sandboxed tool execution.
+   * Passed as `SandboxExecutionRequest.timeoutMs`.
+   * @default 5000
+   */
+  sandboxTimeoutMs: number;
+
+  /**
+   * Thresholds that must be met before a tool is eligible for tier promotion.
+   */
+  promotionThreshold: {
+    /**
+     * Minimum total invocation count before promotion is considered.
+     * @default 5
+     */
+    uses: number;
+
+    /**
+     * Minimum aggregate confidence score (from usage stats) before promotion.
+     * In the range [0, 1].
+     * @default 0.8
+     */
+    confidence: number;
+  };
+
+  /**
+   * Model ID used by the single LLM judge at forge time ({@link CreationVerdict}).
+   * Should be a fast, cost-efficient model — correctness is handled by test cases.
+   * @default "gpt-4o-mini"
+   */
+  judgeModel: string;
+
+  /**
+   * Model ID used by both reviewers in the multi-reviewer promotion panel
+   * ({@link PromotionVerdict}). Should be a more capable model than `judgeModel`.
+   * @default "gpt-4o"
+   */
+  promotionJudgeModel: string;
+
+  /**
+   * Self-improvement configuration for bounded autonomous personality mutation,
+   * skill management, workflow composition, and self-evaluation.
+   *
+   * When omitted or `undefined`, self-improvement tools are not registered.
+   * @default undefined (disabled)
+   */
+  selfImprovement?: SelfImprovementConfig;
+
+  /**
+   * Which tools with side effects a composition or a workflow may chain as a
+   * step. A tool that declares `hasSideEffects: false` is chained freely; one
+   * that declares `true` only when its name is listed here; one that declares
+   * nothing is never chained. A tool named `launch_agency` is never chained,
+   * whatever it declares and whether or not it is listed here: a team is
+   * launched from a turn. The list is read when a step is checked (at forge,
+   * at load, at promotion and on every run), not at construction.
+   * @default { sideEffectingTools: [] }
+   */
+  compose?: { sideEffectingTools?: string[] };
+
+  /**
+   * The ceiling for code-forged tools (see {@link ForgedCapabilities}).
+   * Absent: the legacy path, where a forged tool takes the APIs it asks for,
+   * unscoped. Validated at engine construction; each failure names its key.
+   */
+  capabilities?: ForgedCapabilities;
+
+  /** Effect records under a ceiling. Ignored without one. */
+  audit?: EmergentAuditConfig;
+
+  /**
+   * Paths no `fs.write` or `fs.delete` root may hold or lie inside, beside the
+   * library's own directory, `node_modules` and the entry script's directory.
+   * The library cannot find a host's own code and data: list its source,
+   * build output, data directories and a file database here.
+   */
+  protectedPaths?: string[];
+
+  /** Called for every write, delete and state-changing request; see {@link EffectPolicy}. */
+  effectPolicy?: EffectPolicy;
+
+  /**
+   * What runs forged code in the forge the engine builds. Absent: the
+   * in-process executor (`isolates: false`). A host that passes its own
+   * `sandboxForge` brings that forge's executor; passing one beside a
+   * different `executor` fails construction with `executor_conflict`.
+   */
+  executor?: ForgedCodeExecutor;
+}
+
+/**
+ * Default configuration for the Emergent Capability Engine.
+ *
+ * Note: `enabled` defaults to `false` — emergent capabilities must be explicitly
+ * opted-in via the agent's configuration to prevent accidental runtime tool creation.
+ */
+export const DEFAULT_EMERGENT_CONFIG: Readonly<EmergentConfig> = {
+  enabled: false,
+  maxSessionTools: 10,
+  maxAgentTools: 50,
+  allowSandboxTools: false,
+  persistSandboxSource: false,
+  sandboxMemoryMB: 128,
+  sandboxTimeoutMs: 5000,
+  promotionThreshold: {
+    uses: 5,
+    confidence: 0.8,
+  },
+  judgeModel: 'gpt-4o-mini',
+  promotionJudgeModel: 'gpt-4o',
+} as const;
+
+/**
+ * The prefix of a GMI instance id (`GMIManager` mints `gmi-instance-<uuid>`).
+ * Earlier releases recorded the forging instance's id as an `agent`-tier
+ * tool's owner; the persona is the owner now. The prefix is reserved for
+ * telling those rows apart: a tool whose owner begins with it is never
+ * promoted to the `agent` tier, so an `agent`-tier row whose owner carries
+ * it is always one an earlier release wrote, and it loads suspended with the
+ * reason `legacy_owner`.
+ */
+export const GMI_INSTANCE_ID_PREFIX = 'gmi-instance-';

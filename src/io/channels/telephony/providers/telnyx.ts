@@ -1,0 +1,529 @@
+/**
+ * @fileoverview Telnyx telephony provider for AgentOS voice calls.
+ *
+ * Implements {@link IVoiceCallProvider} using the Telnyx Call Control v2 API.
+ *
+ * ## REST API contract
+ *
+ * | Operation      | Method | Endpoint                                 | Body format |
+ * |----------------|--------|------------------------------------------|-------------|
+ * | Initiate call  | POST   | `/v2/calls`                              | JSON        |
+ * | Hangup call    | POST   | `/v2/calls/{id}/actions/hangup`          | JSON        |
+ * | Play TTS       | POST   | `/v2/calls/{id}/actions/speak`           | JSON        |
+ * | Start stream   | POST   | `/v2/calls/{id}/actions/streaming_start` | JSON        |
+ *
+ * All requests use Bearer token authentication: `Authorization: Bearer {apiKey}`.
+ * Request bodies are JSON (unlike Twilio's form-encoded convention).
+ *
+ * ## Media streaming
+ *
+ * Carrier mode includes the configured media stream URL and bidirectional
+ * PCMU RTP settings when dialing. Legacy mode leaves stream startup to the
+ * host.
+ *
+ * ## Webhook verification: Ed25519
+ *
+ * Telnyx signs webhooks using Ed25519 public key cryptography:
+ *
+ * 1. Telnyx generates a signed payload: `{timestamp}|{rawBody}`.
+ * 2. The signature is computed with the account's Ed25519 private key.
+ * 3. The Telnyx portal shows the public key as base64 of its 32 raw bytes,
+ *    the form telnyx-node passes to tweetnacl. A base64 DER SPKI blob is
+ *    accepted too.
+ * 4. Headers: `Telnyx-Timestamp` (the timestamp) and
+ *    `Telnyx-Signature-Ed25519` (base64-encoded Ed25519 signature), as
+ *    telnyx-node and telnyx-python read them. The `X-` prefixed names are
+ *    read as well.
+ * 5. Verification: decode the signature from base64, construct the payload
+ *    string `{timestamp}|{body}`, and verify using `crypto.verify()` with
+ *    the key as DER SPKI. As in telnyx-node, a timestamp more than 300
+ *    seconds old is rejected.
+ *
+ * When no public key is configured, every webhook is refused in either
+ * profile, unless the provider is constructed with
+ * `allowUnverifiedWebhooks: true` for local development: it then accepts
+ * every webhook unverified and logs one warning.
+ *
+ * ## Event mapping table (hangup_cause)
+ *
+ * | Telnyx `event_type`              | `hangup_cause`            | Normalised `kind`    |
+ * |----------------------------------|---------------------------|----------------------|
+ * | `call.initiated`                 | --                        | `call-ringing`       |
+ * | `call.answered`                  | --                        | `call-answered`      |
+ * | `call.hangup`                    | `normal_clearing`         | `call-hangup-user`   |
+ * | `call.hangup`                    | `user_busy`               | `call-hangup-user`   |
+ * | `call.hangup`                    | `originator_cancel`       | `call-hangup-user`   |
+ * | `call.hangup`                    | (anything else)           | `call-completed`     |
+ * | `call.dtmf.received`             | --                        | `call-dtmf`          |
+ * | `call.machine.detection.ended`   | result=`machine`          | `call-voicemail`     |
+ * | `call.machine.detection.ended`   | result=`human`            | (no event)           |
+ *
+ * @module @framers/agentos/voice/providers/telnyx
+ */
+
+import { verify } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+
+import type {
+  IVoiceCallProvider,
+  InitiateCallInput,
+  InitiateCallResult,
+  HangupCallInput,
+  PlayTtsInput,
+} from '../IVoiceCallProvider.js';
+
+import type {
+  WebhookContext,
+  WebhookVerificationResult,
+  WebhookParseResult,
+  NormalizedCallEvent,
+} from '../types.js';
+
+import { stableCarrierEvents, callbackOccurrence } from '../CarrierEventIdentity.js';
+import type { ILogger } from '../../../../core/logging/ILogger.js';
+
+// ============================================================================
+// Config
+// ============================================================================
+
+/**
+ * Configuration for {@link TelnyxVoiceProvider}.
+ */
+export interface TelnyxVoiceProviderConfig {
+  /** Telnyx API key (starts with "KEY"). */
+  apiKey: string;
+  /** Telnyx connection/application ID for call routing. */
+  connectionId: string;
+  /**
+   * Ed25519 public key for webhook verification, base64-encoded: the 32-byte
+   * key as the Telnyx portal shows it, or a DER SPKI blob.
+   *
+   * Without it, {@link TelnyxVoiceProvider.verifyWebhook} refuses every
+   * webhook in either profile, unless the provider was constructed with
+   * {@link TelnyxVoiceProviderConfig.allowUnverifiedWebhooks} set and no key.
+   */
+  publicKey?: string;
+  /**
+   * Accepts every webhook without verifying it when no `publicKey` is set.
+   * For local development only: an unverified webhook can press keys in a
+   * call or end it. Only `true` turns it on, in either profile, and the
+   * provider then logs one warning when it is constructed. A configured
+   * `publicKey` is checked whatever this says.
+   *
+   * It is read once, when the provider is constructed: setting it, or
+   * removing `publicKey`, on this object afterwards does not open the
+   * webhook.
+   */
+  allowUnverifiedWebhooks?: boolean;
+  /**
+   * Receives the warning that
+   * {@link TelnyxVoiceProviderConfig.allowUnverifiedWebhooks} logs. When
+   * omitted, the warning goes to `createLogger('TelnyxVoiceProvider')` from
+   * `@framers/agentos/logging`, which is loaded only to write it. When its
+   * `warn` throws, the warning goes to `console.warn` instead and the
+   * provider is still constructed.
+   */
+  logger?: ILogger;
+  /**
+   * How old a webhook's `Telnyx-Timestamp` may be, in seconds, before it is
+   * rejected as a replay. Defaults to 300, telnyx-node's default; 0 turns
+   * the check off.
+   */
+  webhookToleranceSec?: number;
+  /**
+   * Optional fetch implementation override -- inject a mock in tests.
+   * Defaults to the global `fetch`.
+   */
+  fetchImpl?: typeof fetch;
+  /** Explicitly enables stable identities and documented carrier behavior; omitted keeps legacy parsing. */
+  protocol?: 'legacy' | 'carrier';
+}
+
+// ============================================================================
+// Internal types
+// ============================================================================
+
+/**
+ * Shape of Telnyx webhook payload.
+ *
+ * Telnyx wraps all webhook data in a `data` envelope containing the
+ * `event_type` discriminant and a `payload` object with call-specific fields.
+ */
+interface TelnyxWebhookPayload {
+  data: {
+    event_type: string;
+    id?: string;
+    occurred_at?: string;
+    payload: {
+      call_control_id?: string;
+      call_session_id?: string;
+      /** Reason the call was terminated (e.g., `normal_clearing`, `user_busy`). */
+      hangup_cause?: string;
+      /** DTMF digit pressed by the caller. */
+      digit?: string;
+      /** AMD result: `'machine'` or `'human'`. */
+      result?: string;
+      [key: string]: unknown;
+    };
+  };
+}
+
+// ============================================================================
+// TelnyxVoiceProvider
+// ============================================================================
+
+/** DER header of an Ed25519 SubjectPublicKeyInfo; the 32 raw key bytes follow it. */
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+/** Default webhook replay window in seconds, telnyx-node's `DEFAULT_TOLERANCE`. */
+const DEFAULT_WEBHOOK_TOLERANCE_SEC = 300;
+
+/** The refusal of a webhook when no public key is configured and unverified webhooks are not allowed. */
+const NO_PUBLIC_KEY_ERROR = 'No publicKey configured to verify Telnyx webhooks';
+
+/** The warning a provider logs once when it is constructed to accept webhooks unverified. */
+const UNVERIFIED_WEBHOOKS_WARNING =
+  'Telnyx webhooks are accepted without verification: allowUnverifiedWebhooks is set and no publicKey is configured. Use it in local development only.';
+
+/**
+ * Writes {@link UNVERIFIED_WEBHOOKS_WARNING} to the host's logger or, without
+ * one, to the library's `createLogger`. The logging module is imported here
+ * rather than at the top of the file, so the telephony entry loads pino and
+ * OpenTelemetry only when this warning is written. If the host's logger
+ * throws, or that import or the write fails, the warning goes to the console
+ * instead of being lost, and the provider is still constructed.
+ *
+ * @param logger - The logger from the provider's config, if any.
+ */
+function warnUnverifiedWebhooks(logger: ILogger | undefined): void {
+  const warnOnConsole = (): void => console.warn(`[TelnyxVoiceProvider] ${UNVERIFIED_WEBHOOKS_WARNING}`);
+  if (logger) {
+    // A host logger that throws must not stop the provider from being built.
+    try {
+      logger.warn(UNVERIFIED_WEBHOOKS_WARNING);
+    } catch {
+      warnOnConsole();
+    }
+    return;
+  }
+  void import('../../../../core/logging/loggerFactory.js')
+    .then(({ createLogger }) => createLogger('TelnyxVoiceProvider').warn(UNVERIFIED_WEBHOOKS_WARNING))
+    .catch(warnOnConsole);
+}
+
+/**
+ * The configured public key as DER SPKI. A 32-byte key (the portal's form)
+ * gets the Ed25519 SPKI header; anything else is taken as DER SPKI already.
+ *
+ * @param publicKey - The base64 public key from the config.
+ * @returns The key bytes for `crypto.verify()` with `format: 'der'`.
+ */
+function telnyxPublicKeyDer(publicKey: string): Buffer {
+  const bytes = Buffer.from(publicKey, 'base64');
+  return bytes.length === 32 ? Buffer.concat([ED25519_SPKI_PREFIX, bytes]) : bytes;
+}
+
+/**
+ * Telnyx voice call provider.
+ *
+ * Uses the Telnyx Call Control v2 API for outbound call initiation and
+ * in-call actions (hangup, speak). Webhook verification uses Ed25519 public
+ * key signing; without a public key every webhook is refused, unless the
+ * provider is constructed with `allowUnverifiedWebhooks` for local
+ * development.
+ *
+ * @example
+ * ```typescript
+ * const provider = new TelnyxVoiceProvider({
+ *   apiKey:       process.env.TELNYX_API_KEY!,
+ *   connectionId: process.env.TELNYX_CONNECTION_ID!,
+ *   publicKey:    process.env.TELNYX_PUBLIC_KEY!,  // verifies webhooks
+ * });
+ * ```
+ */
+export class TelnyxVoiceProvider implements IVoiceCallProvider {
+  /** Provider identifier, always `'telnyx'`. */
+  readonly name = 'telnyx' as const;
+
+  /** Declares whether callback ids satisfy the durable manager contract. */
+  get webhookIdentity(): 'legacy' | 'stable-v1' { return this.config.protocol === 'carrier' ? 'stable-v1' : 'legacy'; }
+
+  /** The caller's config object. It is not copied: the methods read its current values. */
+  private readonly config: TelnyxVoiceProviderConfig;
+
+  /**
+   * Whether webhooks are accepted without verification: `allowUnverifiedWebhooks`
+   * was `true` and no `publicKey` was set when the provider was constructed.
+   * It is decided once, by the check that logs the warning, so a later change
+   * to the config object cannot open the webhook without that warning.
+   */
+  private readonly acceptsUnverifiedWebhooks: boolean;
+
+  /** Base URL for the Telnyx v2 API. */
+  private readonly baseUrl: string;
+
+  /** Pre-computed `Authorization: Bearer ...` header value. */
+  private readonly authHeader: string;
+
+  /** HTTP fetch implementation (injectable for testing). */
+  private readonly fetch: typeof fetch;
+
+  /**
+   * @param config - Telnyx credentials and optional overrides. With
+   *   `allowUnverifiedWebhooks: true` and no `publicKey`, the provider logs
+   *   one warning and accepts webhooks unverified. That is decided here,
+   *   once: a later change to `config` does not open the webhook.
+   */
+  constructor(config: TelnyxVoiceProviderConfig) {
+    this.config = config;
+    this.baseUrl = 'https://api.telnyx.com/v2';
+    this.authHeader = `Bearer ${config.apiKey}`;
+    this.fetch = config.fetchImpl ?? globalThis.fetch;
+    this.acceptsUnverifiedWebhooks = config.allowUnverifiedWebhooks === true && !config.publicKey;
+    if (this.acceptsUnverifiedWebhooks) warnUnverifiedWebhooks(config.logger);
+  }
+
+  // ── Webhook ───────────────────────────────────────────────────────────────
+
+  /**
+   * Verify an incoming Telnyx webhook using Ed25519 signature verification.
+   *
+   * ## Algorithm (step by step)
+   *
+   * 1. If no public key is configured, refuse the webhook in either profile,
+   *    unless the provider was constructed with `allowUnverifiedWebhooks`
+   *    and no key, for local development: then skip verification and return
+   *    `valid: true`.
+   * 2. Extract the `Telnyx-Timestamp` and `Telnyx-Signature-Ed25519` headers
+   *    (or their `X-` prefixed forms).
+   * 3. Decode the signature from base64 into a raw byte Buffer.
+   * 4. Construct the signed payload: `"{timestamp}|{rawBody}"`.
+   * 5. Decode the public key from base64 into DER SPKI ({@link telnyxPublicKeyDer}).
+   * 6. Call `crypto.verify(null, payload, { key, format: 'der', type: 'spki' }, signature)`.
+   * 7. Reject a timestamp older than `webhookToleranceSec` (default 300).
+   * 8. Return the verification result.
+   *
+   * @param ctx - Raw webhook request context.
+   * @returns Verification result. Without a public key it is `{ valid: false }`
+   *   in either profile, or `{ valid: true }` when the provider was
+   *   constructed with `allowUnverifiedWebhooks` and no key.
+   */
+  verifyWebhook(ctx: WebhookContext): WebhookVerificationResult {
+    // Nothing can be verified without a public key: refuse the webhook in
+    // either profile, unless the host opted in for local development when it
+    // constructed the provider.
+    if (!this.config.publicKey) {
+      return this.acceptsUnverifiedWebhooks ? { valid: true } : { valid: false, error: NO_PUBLIC_KEY_ERROR };
+    }
+
+    const timestamp = ctx.headers['telnyx-timestamp'] ?? ctx.headers['x-telnyx-timestamp'];
+    const sigHeader = ctx.headers['telnyx-signature-ed25519'] ?? ctx.headers['x-telnyx-signature-ed25519'];
+
+    if (!timestamp || Array.isArray(timestamp) || !sigHeader || Array.isArray(sigHeader)) {
+      return { valid: false, error: 'Missing Telnyx signature headers' };
+    }
+
+    const signature = Buffer.from(sigHeader, 'base64');
+    // Telnyx signs the concatenation of timestamp, pipe separator, and raw body.
+    const payload = Buffer.from(`${timestamp}|${ctx.body.toString()}`);
+
+    let valid: boolean;
+    try {
+      valid = verify(
+        null, // Ed25519 does not use a separate hash algorithm parameter.
+        payload,
+        {
+          key: telnyxPublicKeyDer(this.config.publicKey),
+          format: 'der',
+          type: 'spki',
+        },
+        signature,
+      );
+    } catch {
+      // crypto.verify throws on malformed keys or invalid DER encoding.
+      return { valid: false, error: 'Verification failed' };
+    }
+    if (!valid) {
+      return { valid: false, error: 'Signature mismatch' };
+    }
+
+    // A signed timestamp older than the window is a replay. A non-numeric
+    // timestamp fails the comparison and is rejected too.
+    const toleranceSec = this.config.webhookToleranceSec ?? DEFAULT_WEBHOOK_TOLERANCE_SEC;
+    const ageSec = Math.floor(Date.now() / 1000) - Number(timestamp);
+    if (toleranceSec > 0 && !(ageSec <= toleranceSec)) {
+      return { valid: false, error: 'Timestamp outside the tolerance window' };
+    }
+    return { valid: true };
+  }
+
+  /**
+   * Parse a Telnyx webhook JSON body into normalized {@link NormalizedCallEvent}s.
+   *
+   * Telnyx sends all webhook payloads as JSON with a `data.event_type`
+   * discriminant field. The `data.payload` object contains call-specific
+   * fields like `call_control_id`, `hangup_cause`, `digit`, and `result`.
+   *
+   * ## Hangup cause mapping
+   *
+   * Telnyx's `call.hangup` event includes a `hangup_cause` field that must
+   * be inspected to determine whether the user or the system terminated
+   * the call:
+   * - `normal_clearing` / `user_busy` / `originator_cancel` -> `call-hangup-user`
+   * - All other causes (e.g., `call_rejected`, `unallocated_number`) -> `call-completed`
+   *
+   * A body without a `data` object holding a `payload` object yields no
+   * events. In carrier mode each event carries a stable id from
+   * {@link stableCarrierEvents}; a DTMF event's occurrence is the webhook's
+   * `data.id`, else its `data.occurred_at`, else the callback URL's `event_key`.
+   *
+   * @param ctx - Raw webhook request context.
+   * @returns Parsed result containing zero or more normalized events.
+   */
+  parseWebhookEvent(ctx: WebhookContext): WebhookParseResult {
+    let parsed: TelnyxWebhookPayload;
+    try {
+      parsed = JSON.parse(ctx.body.toString()) as TelnyxWebhookPayload;
+    } catch {
+      return { events: [] };
+    }
+
+    if (!parsed || typeof parsed !== 'object' || !parsed.data || typeof parsed.data !== 'object' || !parsed.data.payload || typeof parsed.data.payload !== 'object' || Array.isArray(parsed.data.payload)) return { events: [] };
+
+    const { event_type, payload } = parsed.data;
+    const providerCallId = payload.call_control_id ?? '';
+    const timestamp = Date.now();
+    const events: NormalizedCallEvent[] = [];
+
+    /** Helper: shared base fields with a unique event ID for idempotency. */
+    const base = () => ({ eventId: randomUUID(), providerCallId, timestamp });
+
+    switch (event_type) {
+      case 'call.initiated':
+        events.push({ ...base(), kind: 'call-ringing' });
+        break;
+
+      case 'call.answered':
+        events.push({ ...base(), kind: 'call-answered' });
+        break;
+
+      case 'call.hangup': {
+        // Distinguish user-initiated hangup from normal call completion
+        // by inspecting the hangup_cause field.
+        const cause = (payload.hangup_cause as string | undefined) ?? '';
+        const kind =
+          cause === 'user_busy' || cause === 'normal_clearing' || cause === 'originator_cancel'
+            ? 'call-hangup-user'
+            : 'call-completed';
+        events.push({ ...base(), kind });
+        break;
+      }
+
+      case 'call.dtmf.received': {
+        // Webhook DTMF is handled here; media-stream DTMF is handled by the corresponding carrier parser.
+        const digit = (payload.digit as string | undefined) ?? '';
+        events.push({ ...base(), kind: 'call-dtmf', digit });
+        break;
+      }
+
+      case 'call.machine.detection.ended':
+        // Only emit voicemail for machine detection; human detection is a no-op.
+        if (payload.result === 'machine') {
+          events.push({ ...base(), kind: 'call-voicemail' });
+        }
+        break;
+
+      default:
+        // Unrecognized event type -- silently ignore for forward-compatibility.
+        break;
+    }
+
+    if (this.config.protocol !== 'carrier') return { events };
+    if (typeof providerCallId !== 'string' || !providerCallId) return { events: [] };
+    const occurrence = typeof parsed.data.id === 'string' ? parsed.data.id : typeof parsed.data.occurred_at === 'string' ? parsed.data.occurred_at : callbackOccurrence(ctx.url);
+    return { events: stableCarrierEvents(events, { provider: this.name, account: this.config.connectionId, occurrence }) };
+  }
+
+  // ── Call Control ──────────────────────────────────────────────────────────
+
+  /**
+   * Initiate an outbound call via the Telnyx Call Control v2 API.
+   *
+   * POSTs to `/v2/calls` with a JSON body containing the `connection_id`,
+   * phone numbers, and webhook URL. In carrier mode a `mediaStreamUrl` is
+   * sent as `stream_url` with the inbound track and bidirectional PCMU RTP.
+   * Legacy mode neither sends nor keeps it: the host starts a stream with
+   * the `streaming_start` action after `call.answered`.
+   *
+   * @param input - Call initiation parameters (from/to numbers, webhook URL).
+   * @returns Result containing the Telnyx `call_control_id` on success.
+   * @throws Never throws; returns `{ success: false, error: '...' }` on failure.
+   */
+  async initiateCall(input: InitiateCallInput): Promise<InitiateCallResult> {
+    const url = `${this.baseUrl}/calls`;
+
+    const response = await this.fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: this.authHeader,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ connection_id: this.config.connectionId, to: input.toNumber, from: input.fromNumber, webhook_url: input.webhookUrl,
+        ...(this.config.protocol === 'carrier' && input.mediaStreamUrl ? { stream_url: input.mediaStreamUrl, stream_track: 'inbound_track', stream_bidirectional_mode: 'rtp', stream_bidirectional_codec: 'PCMU' } : {}) }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => String(response.status));
+      return { providerCallId: '', success: false, error: `Telnyx error ${response.status}: ${text}` };
+    }
+
+    const data = (await response.json()) as { data: { call_control_id: string; call_session_id: string } };
+    return { providerCallId: data.data.call_control_id, success: true };
+  }
+
+  /**
+   * Hang up an active call via the Telnyx Call Control hangup action.
+   *
+   * POSTs an empty JSON body to `/v2/calls/{call_control_id}/actions/hangup`.
+   * Telnyx will terminate the call and fire a `call.hangup` webhook.
+   *
+   * @param input - Contains the Telnyx `call_control_id` to hang up.
+   */
+  async hangupCall(input: HangupCallInput): Promise<void> {
+    const url = `${this.baseUrl}/calls/${input.providerCallId}/actions/hangup`;
+
+    await this.fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: this.authHeader,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+  }
+
+  /**
+   * Speak text into a live call using Telnyx's text-to-speech speak action.
+   *
+   * POSTs a JSON body to `/v2/calls/{id}/actions/speak` with the text
+   * `payload`, `voice` (default `'female'`), and `language` (default `'en-US'`).
+   *
+   * @param input - TTS parameters (text, optional voice, call ID).
+   */
+  async playTts(input: PlayTtsInput): Promise<void> {
+    const url = `${this.baseUrl}/calls/${input.providerCallId}/actions/speak`;
+
+    await this.fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: this.authHeader,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        payload: input.text,
+        voice: input.voice ?? 'female',
+        language: 'en-US',
+      }),
+    });
+  }
+}

@@ -1,0 +1,53 @@
+name: Links
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+# A newer push to a pull request cancels the run of the commit it replaces. Every
+# other run keys a group of its own, its run id, so it never waits behind another run
+# and nothing cancels it: a push to master, the weekly schedule and a manual run. A
+# re-run keys its own group too, so re-running an older commit's run never cancels
+# the newest one.
+concurrency:
+  group: links-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Links within this repository
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --offline --include-fragments --hidden --no-progress
+            --root-dir ${{ github.workspace }}
+            --remap "^https://github\.com/framerslab/agentos/(blob|tree)/master/ file://${{ github.workspace }}/"
+            --exclude-path CHANGELOG.md
+            './*.md' './.github/**/*.md' './docs/contributing/**/*.md' './docs/getting-started/RELEASING.md'
+      # github.com throttles a crawler on a runner with 429 and 503. Neither
+      # says anything about the link, so both count as reachable; a file or a
+      # repository that is gone still answers 404 and fails the step. Fewer
+      # requests at once and a wait between retries keep the throttling rare.
+      - name: Links to other first-party repositories
+        if: github.event_name != 'pull_request'
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress
+            --accept '100..=103,200..=299,429,503'
+            --max-concurrency 4 --max-retries 4 --retry-wait-time 5
+            --include '^https://github\.com/(framerslab|jddunn|manicinc)/[^/]+/(blob|tree)/'
+            --exclude-path CHANGELOG.md
+            './*.md' './.github/**/*.md' './.github/ISSUE_TEMPLATE/*.yml' './docs/contributing/**/*.md' './docs/getting-started/RELEASING.md'

@@ -1,0 +1,716 @@
+// File: backend/agentos/core/llm/providers/IProvider.ts
+/**
+ * @fileoverview Core provider contract and shared types for integrating Large Language / Multimodal Model services
+ * into AgentOS. Implementations wrap concrete vendor SDKs or HTTP APIs (OpenAI, Anthropic, Ollama, OpenRouter, etc.)
+ * and normalize their capabilities into a consistent surface area used by higher‑level orchestration layers
+ * (PromptEngine, GMIManager, Utility AI components).
+ *
+ * Design Goals:
+ * 1. Capability Normalization – Chat vs legacy completion, tool/function calling, streaming deltas, embeddings.
+ * 2. Deterministic Streaming Semantics – Every streamed chunk is a full `ModelCompletionResponse` fragment with:
+ *    - optional `responseTextDelta` (string diff)
+ *    - optional `toolCallsDeltas[]` capturing incremental tool argument assembly
+ *    - `isFinal` flag to indicate terminal chunk and stable usage metrics.
+ * 3. Introspection – Lightweight model catalog (`listAvailableModels`, `getModelInfo`) enabling routing & cost decisions.
+ * 4. Resilience & Diagnostics – Uniform error envelope attached to `ModelCompletionResponse.error` for both
+ *    streaming and non‑streaming calls so upstream layers can surface actionable messages.
+ * 5. Strict Initialization Lifecycle – `initialize()` must succeed before any other mutating call.
+ *
+ * Error Handling Philosophy:
+ * - Provider implementations SHOULD translate vendor‑specific errors into a stable structure:
+ *   { message, type?, code?, details? }.
+ * - Transient failures (network timeouts, rate limit backoffs) MAY be surfaced inline; upstream retry policies live above.
+ * - Streaming calls MUST emit a terminal chunk with `isFinal: true` even on error (with `error` populated) so consumers
+ *   can perform consistent teardown.
+ *
+ * Concurrency & Cancellation:
+ * - Implementations MAY support externally triggered abort via custom option (e.g. `customModelParams.abortSignal`).
+ * - If supported, aborted streams MUST still resolve the generator cleanly (no thrown error) after emitting a final
+ *   chunk with `isFinal: true` and an `error` describing the cancellation reason.
+ *
+ * Token Usage & Cost:
+ * - `usage.totalTokens` MUST be present on final responses (streaming or non‑streaming).
+ * - Interim streaming chunks SHOULD omit usage or provide partials; callers should treat usage as unstable until final.
+ * - `costUSD` is optional; if provided should reflect estimated or actual vendor pricing for the call.
+ *
+ * @module backend/agentos/core/llm/providers/IProvider
+ */
+
+/**
+ * Represents a part of a multimodal message content.
+ */
+export type MessageContentPart =
+  /** `cache_control` is an Anthropic prompt-cache breakpoint; `ttl` defaults to `'5m'`. */
+  | { type: 'text'; text: string; cache_control?: { type: 'ephemeral'; ttl?: '5m' | '1h' } }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'low' | 'high' | 'auto'; }; cache_control?: { type: 'ephemeral'; ttl?: '5m' | '1h' } }
+  // For Anthropic tool results specifically, fitting their API:
+  | { type: 'tool_result'; tool_use_id: string; content?: string | Array<Record<string, any>>; is_error?: boolean; }
+  // Fallback for other potential string types for extensibility
+  | { type: string; [key: string]: any };
+
+
+/**
+ * Generic type for message content, which can be simple text or
+ * a structured array for multimodal inputs (e.g., text and image parts).
+ */
+export type MessageContent = string | Array<MessageContentPart>;
+
+/**
+ * Represents a single message in a conversation, conforming to a structure
+ * widely adopted by chat-based LLM APIs.
+ */
+/**
+ * An Anthropic extended-thinking block, captured from a response and replayed
+ * verbatim on the next tool-loop turn. `signature` (standard) and `data`
+ * (redacted) are opaque, provider-issued tokens that MUST be replayed exactly,
+ * in order — never strip, reorder, or regenerate them, or the Messages API
+ * rejects the turn.
+ */
+export type ThinkingBlock =
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string };
+
+export interface ChatMessage {
+  /** The role of the entity sending the message. */
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  /** The content of the message. Can be simple text or structured for multimodal inputs. */
+  content: MessageContent | null;
+  /** An optional name for the message author. */
+  name?: string;
+  /** Identifier for the tool call, present in 'tool' role messages that are responses to a tool call. */
+  tool_call_id?: string;
+  /** A list of tool calls requested by the assistant. */
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: {
+      name: string;
+      arguments: string;
+    };
+    /**
+     * Gemini thought signature for this call. Gemini 3 rejects a replayed
+     * function call without one (HTTP 400), so GeminiProvider captures it from
+     * the response and sends it back on the next turn. Other providers ignore
+     * it.
+     */
+    thoughtSignature?: string;
+  }>;
+  /**
+   * Anthropic extended-thinking blocks emitted on this assistant turn.
+   * Captured from the response and replayed verbatim (signatures intact) on
+   * the next tool-loop turn — Anthropic 400s a tool turn whose prior thinking
+   * blocks aren't replayed. Present ONLY when the request enabled extended
+   * thinking; undefined on every non-thinking turn (the existing path is
+   * unchanged).
+   */
+  thinkingBlocks?: ThinkingBlock[];
+  /**
+   * The model's reasoning summary for this assistant turn, as plain text,
+   * when the provider returns one (Gemini returns thought summaries only with
+   * `customModelParams.thinkingConfig.includeThoughts`). MiniMax also uses
+   * this field for its full reasoning content and replays it in tool history.
+   * It is separate from `thinkingBlocks`, which carry
+   * Anthropic's signed blocks for replay.
+   */
+  reasoningText?: string;
+}
+
+// ... (rest of IProvider.ts remains the same as provided by user initially)
+// ... (ensure ModelCompletionOptions, ModelUsage, ModelCompletionChoice, ModelCompletionResponse, etc. are correctly defined or imported if they were part of the "..." )
+
+
+/** One attempt a call made to its provider, as {@link ModelCompletionOptions.onAttempt} reports it. */
+export interface AttemptOutcome {
+  /** The attempt's number in the call, from 1. */
+  attempt: number;
+  /** The HTTP status its last send answered (after any key hops inside it), or null when none came (a timeout, a network failure). */
+  status: number | null;
+  /** True when it answered with a success. */
+  ok: boolean;
+  /**
+   * The tokens an attempt answered with an error status reported for itself (its error body's `usage`, as the wire
+   * spells it), present only when the body reported some. A later attempt replaces that error, so a caller that settles
+   * the whole call reads them here; a success reports its usage with its result.
+   */
+  usage?: unknown;
+}
+
+/**
+ * General options for model completion requests (both chat and legacy text completion, though chat is prioritized).
+ * These options control aspects like creativity, response length, and penalties.
+ */
+export interface ModelCompletionOptions {
+  /** Identifier of the model to use for completion. */
+  modelId?: string;
+  /**
+   * Controls randomness: lower values make the output more focused and deterministic.
+   * Higher values (e.g., 0.8) make it more random.
+   */
+  temperature?: number;
+  /**
+   * Nucleus sampling: the model considers only tokens with probabilities summing up to topP.
+   * Lower values (e.g., 0.1) mean more restricted, less random output.
+   */
+  topP?: number;
+  /**
+   * The maximum number of tokens to generate in the completion.
+   */
+  maxTokens?: number;
+  /**
+   * Per-call request timeout in milliseconds. Overrides the provider's default
+   * request timeout for this single completion only. Large-output callers
+   * (e.g. structured-output generation that emits long strings) can raise the
+   * abort window without slowing the provider's default failover for chat or
+   * narration traffic. Providers that don't implement a request timeout ignore
+   * this field.
+   */
+  requestTimeout?: number;
+  /**
+   * The most attempts this call makes, a first and its retries together; the provider's configured count when left
+   * out. Within one attempt, a key-scoped failure (a rejected, unpaid or throttled key) on a pool of several keys
+   * re-sends the same request with the next usable key, at most once per key, and those sends are not counted.
+   * The OpenAI, Anthropic, Gemini and OpenRouter providers read it, wait no backoff after the last attempt, and
+   * refuse a count that is not a whole number of 1 or more with a `RangeError` before anything is sent, streamed
+   * or not; the Anthropic and Gemini streams send one request and retry nothing but key hops. A request sent
+   * again on another route after a 404 (a retired Gemini id on its alias, an OpenRouter request without its
+   * schema) draws on the same count. Other providers keep their configured retries.
+   */
+  maxAttempts?: number;
+  /**
+   * Called once per attempt, with the answer of the attempt's last send (a key hop's earlier answers are not
+   * reported), so a caller can settle the attempts it paid for.
+   */
+  onAttempt?: (outcome: AttemptOutcome) => void;
+  /**
+   * The id the call sends in its operation id header (`operationIdHeader`, `AGENTOS_OPERATION_ID_HEADER`), on every
+   * attempt and key hop, and on OpenRouter's request sent again without its schema, in place of the id the provider
+   * makes for each request. A generation helper on a budget with a spend meter passes the id the call's reservation is
+   * under, so a server in front of the provider and the meter name the call alike. Sends nothing by itself: with no
+   * header named, or on a provider that sends none, it is ignored.
+   */
+  operationId?: string;
+  /**
+   * Anthropic extended-thinking switch. `{ budgetTokens }` turns thinking on:
+   * on a thinking-capable Claude model the provider sends
+   * `thinking: { type: 'adaptive' }` (the budget number is not sent and
+   * max_tokens passes through unchanged). `false` turns it off with the shape
+   * the model takes (`between_tools` on Sonnet 5.5, `disabled` on Opus 5 and
+   * Sonnet 5, capping effort at `high` where the model requires it); Opus
+   * 5.5, Fable and Mythos always think. Omitted keeps the model's default,
+   * which is thinking on for Opus 5 and later, Sonnet 5 and later, Fable and
+   * Mythos, and off for older models. Other providers ignore the field.
+   */
+  thinking?: { budgetTokens: number } | false;
+  /**
+   * Reasoning-effort control. On effort-capable Claude models (Opus 4.5+,
+   * Sonnet 4.6, Fable/Mythos 5) the provider sends `output_config.effort`
+   * (low|medium|high|xhigh|max). Independent of `thinking` and tool_choice;
+   * dropped on unsupported models or invalid values.
+   */
+  effort?: string;
+  /**
+   * Anthropic prompt-cache diagnostics (beta `cache-diagnosis-2026-04-07`).
+   * When set, the provider sends `diagnostics: { previous_message_id }` plus
+   * the beta header, and the API compares this request against the referenced
+   * one to explain any cache miss. Pass `previousMessageId: null` on the first
+   * call of a conversation to opt in; thread the previous response's `id`
+   * (`msg_...`) on subsequent calls. The verdict comes back on
+   * {@link ModelCompletionResponse.cacheDiagnostics}. Anthropic-only —
+   * other providers ignore the field. Never affects request processing:
+   * diagnostics are best-effort observability.
+   */
+  cacheDiagnostics?: { previousMessageId: string | null };
+  /**
+   * Per-call prompt-cache control (Anthropic; other providers ignore it).
+   *
+   * - `false` — this request emits NO `cache_control` at all: the automatic
+   *   markers (request-level marker, thinking-mode block markers, the moving
+   *   message-tail) are suppressed AND caller-placed system/message/tool
+   *   markers are stripped before the wire. Hard guarantee for true
+   *   one-shots, where a cache write (1.25x at 5m, 2x at 1h) can never be
+   *   read back.
+   * - `{ ttl: '1h' }` — the automatic markers (including the moving
+   *   message-tail) carry `ttl: '1h'` instead of the 5-minute default, and
+   *   the auto path uses explicit block placement so the TTL reaches the
+   *   wire. For slow loops whose step gaps exceed 5 minutes (codegen
+   *   orchestrator/tool calls, human-paced conversation turns).
+   *   Caller-placed markers keep their own TTLs, except that a caller's
+   *   shorter system markers are raised to `'1h'` when a 1-hour tail follows
+   *   them (Anthropic rejects a longer TTL after a shorter one).
+   * - `{ tail: false }` — no breakpoint on the messages and no request-level
+   *   marker (the API places that one on the last cacheable block): the
+   *   markers the caller set go out exactly as set, TTLs included, and with
+   *   no caller marker anywhere the end of the first system message is
+   *   marked (carrying `ttl` when given), or the last text block of a
+   *   `customModelParams.system` override (on a copy); with no system
+   *   nothing is. For
+   *   calls that re-send a long stable prefix and never the same tail twice
+   *   (judges, classifiers): the prefix is still read back from the cache,
+   *   while the unique tail is not written at the write premium. Combines
+   *   with `ttl`.
+   * - `{ ttl: '5m' }` or omitted — default behavior (5-minute auto markers).
+   */
+  cache?: { ttl?: '5m' | '1h'; tail?: boolean } | false;
+  /**
+   * Per-conversation affinity key. OpenRouter forwards it as `session_id`
+   * to pin provider sticky routing: upstream prompt caches are host-scoped,
+   * so load-balanced conversations otherwise cold-miss the cache a prior
+   * turn wrote on a different host. Pass a stable id per conversation
+   * (game session id, companion conversation id). Providers without an
+   * affinity concept ignore the field.
+   */
+  sessionId?: string;
+  /**
+   * OpenAI prompt-cache shard key (spec batch-1 C2; other providers ignore
+   * it). `'auto'` derives `agentos:<first 16 hex of sha256(sessionId)>` from
+   * {@link sessionId} — omitted when no session id is available; raw ids
+   * never leave the process. An explicit string is sent verbatim after
+   * trimming (empty → omitted). `false` omits the field. Absent defaults
+   * to `'auto'` on the native OpenAI endpoint (api.openai.com) unless the
+   * call carries `cache: false`; OpenAI-compatible gateways (custom
+   * baseURL) keep the omit default — some reject unknown request fields.
+   * OpenAI recommends ≤~15 requests/min per key; sharding beyond
+   * that is caller policy.
+   */
+  promptCacheKey?: string | 'auto' | false;
+  /**
+   * Cache-key derivation source ONLY (spec batch-1 review fold): the session
+   * id used by `promptCacheKey: 'auto'` when the affinity {@link sessionId}
+   * is absent (e.g. it came from `usageLedger.sessionId` at the api layer).
+   * Never emitted on the wire itself and never used for OpenRouter
+   * `session_id` sticky routing — that stays {@link sessionId}'s job.
+   */
+  promptCacheSessionId?: string;
+  /**
+   * OpenAI prompt-cache retention request (other providers ignore it).
+   * Emitted only when the fail-closed capability table allows the
+   * model/value combination (see `openai-cache-params.ts`): `'30m'` →
+   * `prompt_cache_options.ttl` on GPT-5.6+ families; `'24h'`/`'in_memory'`
+   * → `prompt_cache_retention` on the enumerated allow-list. Unsupported
+   * combinations are omitted with a debug log, never a hard error.
+   */
+  promptCacheRetention?: 'in_memory' | '24h' | '30m';
+  /**
+   * OpenAI service tier, emitted verbatim as `service_tier` (other
+   * providers ignore it). No default. `'flex'` bills at ~batch rates but
+   * can return 429 `resource_unavailable` under load — the existing retry
+   * path retries the same tier; automatic tier fallback is deliberately
+   * not implemented.
+   */
+  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+  /**
+   * Positive values penalize new tokens based on whether they appear in the text so far,
+   * increasing the model's likelihood to talk about new topics.
+   */
+  presencePenalty?: number;
+  /**
+   * Positive values penalize new tokens based on their existing frequency in the text so far,
+   * decreasing the model's likelihood to repeat the same line verbatim.
+   */
+  frequencyPenalty?: number;
+  /** Sequences where the API will stop generating further tokens. */
+  stopSequences?: string[];
+  /** A unique identifier representing your end-user. */
+  userId?: string;
+  /** Allows overriding the default API key for a specific user or request. */
+  apiKeyOverride?: string;
+  /** For provider-specific parameters not covered by the common options. */
+  customModelParams?: Record<string, unknown>;
+  /**
+   * Optional AbortSignal for caller-driven cancellation. If aborted:
+   *  - Streaming providers MUST emit a terminal chunk with `isFinal: true` and `error.type='abort'`.
+   *  - Non-streaming calls SHOULD throw a cancellation error (or return error response if already partially processed).
+   *  - A request already sent ends at the abort, whether it waits for its answer or its headers, and a stream
+   *    whose body has stalled ends with the terminal abort chunk; the OpenAI, Anthropic, Gemini, OpenRouter,
+   *    Requesty and Ollama providers pass the signal to their HTTP client, and their non-streaming calls throw
+   *    `REQUEST_ABORTED`. A call whose signal has already aborted sends nothing, the OpenAI provider's OAuth
+   *    token read included. An abort that lands while OpenRouter or Requesty reads an error answer's body ends that
+   *    read and is reported as the abort; the answer is not classified and marks no key. Ending the request ends the
+   *    caller's wait; whether the vendor stops work and billing is
+   *    the vendor's (OpenRouter stops both only for a stream: https://openrouter.ai/docs/api-reference/streaming).
+   *  - A wait between retries (a 429's Retry-After or a backoff) ends at once and no further request is sent; the
+   *    OpenAI, Anthropic, Gemini and OpenRouter providers end it. A non-streaming call then throws `REQUEST_ABORTED`;
+   *    a stream (`generateCompletionStream`) ends with the terminal abort chunk above instead of throwing.
+   */
+  abortSignal?: AbortSignal;
+  /** Indicates if a streaming response is expected. */
+  stream?: boolean;
+  /**
+   * Schemas of tools the model can call. On Anthropic, a top-level
+   * `cache_control` (`{ type: 'ephemeral', ttl?: '5m' | '1h' }`) on an entry
+   * is sent on that tool definition as the caller's cache breakpoint.
+   */
+  tools?: Array<Record<string, unknown>>;
+  /** Controls how the model uses tools. */
+  toolChoice?: string | Record<string, unknown>;
+  /**
+   * Response-format constraint for the provider call. Shape is
+   * provider-specific; the adapter at
+   * `src/core/llm/providers/structuredOutputFormat.ts` builds the right
+   * shape per provider given a Zod schema.
+   *
+   * Examples:
+   *   - OpenAI bare JSON mode:
+   *       `{ type: 'json_object' }`
+   *   - OpenAI strict JSON Schema mode:
+   *       `{ type: 'json_schema',
+   *          json_schema: { name, strict: true, schema } }`
+   *   - Anthropic structured-output marker (AnthropicProvider sends it as
+   *     `output_config.format` on a model with the JSON output format when
+   *     the schema fits the format's limits; as a non-strict forced tool call
+   *     on a model without the format (Claude Opus 4 and Sonnet 4) and for a
+   *     schema the format cannot carry on a model that accepts a forced
+   *     choice; and as a schema block in the system prompt for such a schema
+   *     on a model that refuses a forced choice, or on the forced-tool route
+   *     when the request turns thinking on (the format route keeps the format
+   *     with thinking on). `route` is the
+   *     builder's verdict for the model it was built for; the provider decides
+   *     again for the model it sends to and says which route it took on the
+   *     response, `schemaRoute`):
+   *       `{ _agentosUseToolForStructuredOutput: true,
+   *          route: 'json_schema' | 'forced_tool' | 'none',
+   *          tool: { name, input_schema } }`
+   *   - Gemini responseSchema (routed to generationConfig
+   *     internally by GeminiProvider):
+   *       `{ type: 'json_object', _gemini: { responseSchema } }`
+   */
+  responseFormat?:
+    | { type: 'text' | 'json_object' }
+    | { type: 'json_schema'; json_schema: { name: string; strict: boolean; schema: Record<string, unknown> } }
+    | Record<string, unknown>;
+}
+
+/**
+ * The first point of divergence between this request and the one referenced
+ * by `cacheDiagnostics.previousMessageId`, as reported by Anthropic's
+ * cache-diagnostics beta. `type` is one of the API's discriminants
+ * (`model_changed` | `system_changed` | `tools_changed` | `messages_changed`
+ * | `previous_message_not_found` | `unavailable`) — kept as an open string so
+ * new discriminants pass through without a library update. The `*_changed`
+ * types also carry `cacheMissedInputTokens`, an estimate of how many input
+ * tokens fell after the divergence point (magnitude indicator, not a billing
+ * number).
+ */
+export interface CacheMissReason {
+  type: string;
+  cacheMissedInputTokens?: number;
+}
+
+/**
+ * Cache-diagnostics verdict for one call. `cacheMissReason: null` means the
+ * comparison was still running when the response serialized (inconclusive —
+ * check the next turn). A populated reason identifies the earliest divergence;
+ * fix it first, later ones may be hidden behind it.
+ */
+export interface CacheDiagnostics {
+  cacheMissReason: CacheMissReason | null;
+}
+
+/**
+ * Represents token usage information from a model call, including cost estimation.
+ */
+export interface ModelUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens: number;
+  costUSD?: number;
+  /** Tokens written to the prompt cache on this call (Anthropic: 25% surcharge at 5m TTL; OpenAI GPT-5.6+: 25% surcharge, from `cache_write_tokens`). */
+  cacheCreationInputTokens?: number;
+  /**
+   * Of {@link ModelUsage.cacheCreationInputTokens}, the tokens written with the provider's longer cache lifetime,
+   * which bill at a higher rate: Anthropic's 1-hour writes at 2x input (`usage.cache_creation.ephemeral_1h_input_tokens`),
+   * OpenAI's 12-hour writes at 2.5x input (`cache_write_tokens_details.ttl_12h_tokens`). The rest were written with the
+   * default lifetime (Anthropic's 5 minutes at 1.25x, OpenAI's 30 minutes at 1.25x). Absent when the provider did not
+   * split its writes by lifetime.
+   */
+  cacheCreationExtendedInputTokens?: number;
+  /** Tokens read from the prompt cache on this call (Anthropic: 90% discount). */
+  cacheReadInputTokens?: number;
+  /**
+   * Provider-independent total input tokens INCLUDING cached reads/writes
+   * (spec batch-1 C1). Anthropic: `input_tokens + cache_read + cache_creation`
+   * (its `input_tokens` excludes cache). OpenAI/OpenRouter: `prompt_tokens`
+   * as-is (already inclusive). Tri-state: undefined = the provider did not
+   * report enough to compute; a reported 0 is meaningful and preserved.
+   */
+  inclusiveInputTokens?: number;
+  /**
+   * True when {@link ModelUsage.completionTokens} is an estimate rather than the provider's count: the stream ended
+   * (the caller's abort) before the event that carries the output count arrived, so the provider counted the
+   * characters it had streamed instead, at four characters a token. Absent when the count is the provider's own.
+   */
+  completionTokensEstimated?: true;
+}
+
+/**
+ * Represents a single choice in a model's completion response.
+ */
+export interface ModelCompletionChoice {
+  index: number;
+  message: ChatMessage;
+  text?: string;
+  logprobs?: unknown;
+  finishReason: string | null;
+}
+
+/**
+ * Represents the full response from a model completion call (non-streaming or a single chunk of a stream).
+ */
+export interface ModelCompletionResponse {
+  /** Provider‑assigned unique identifier for the request or chunk series. */
+  id: string;
+  /** Stable object/type discriminator (e.g. 'chat.completion.chunk', 'chat.completion'). */
+  object: string;
+  /** Unix epoch seconds when the provider created this response/chunk. */
+  created: number;
+  /** Resolved model identifier actually used (may differ from requested if routing / aliasing applied). */
+  modelId: string;
+  /**
+   * Upstream host that actually served the request when the provider is an
+   * aggregator/router (e.g. OpenRouter returns `provider: 'Groq'` in the
+   * completion body). Undefined for direct providers and on aggregators
+   * that omit it. Latency telemetry: identical model + token counts can be
+   * 4s on Groq vs 10s+ on a price-biased host, so attribution needs this.
+   */
+  servingProvider?: string;
+  /**
+   * Provider-reported service tier the call actually ran at (OpenAI
+   * `service_tier` on the response body; spec batch-1 C2). Can differ from
+   * the requested tier (e.g. flex spill-over to default). Undefined on
+   * providers/responses without a tier concept.
+   */
+  serviceTier?: string;
+  /** One or more choices; for multi‑choice inference some providers return >1. */
+  choices: ModelCompletionChoice[];
+  /** Token usage & optional cost metrics (present on final chunk; may be partial/omitted on deltas). */
+  usage?: ModelUsage;
+  /**
+   * Anthropic cache-diagnostics verdict (beta). Present only when the request
+   * opted in via {@link ModelCompletionOptions.cacheDiagnostics} AND the API
+   * returned a verdict. `null` = a comparison ran and found no divergence (or
+   * this was the opt-in first turn with nothing to compare). An object with
+   * `cacheMissReason` identifies the earliest divergence — see
+   * {@link CacheDiagnostics}.
+   */
+  cacheDiagnostics?: CacheDiagnostics | null;
+  /**
+   * False on the chunks of a stream whose answering request left out the
+   * response schema the caller's `responseFormat` put in the payload, with the
+   * schema stated in the prompt instead: OpenRouter sends a strict
+   * `json_schema` request that no endpoint can serve again in `json_object`
+   * mode; Anthropic puts the schema in its own system block when neither the
+   * JSON output format nor a forced tool can carry it on the model sent to
+   * (a record schema on a model that refuses a forced choice, a forced tool
+   * that thinking would clamp). Unset when the request carried the payload the
+   * caller asked for.
+   */
+  schemaInPayload?: boolean;
+  /**
+   * On every completion and chunk of an Anthropic request that carried the
+   * structured-output marker: the route the provider sent the schema by, for
+   * the model it sent to. `json_schema` (the JSON output format: the answer is
+   * the text), `forced_tool` (the schema tool's call is the answer) or `none`
+   * (the schema rode the prompt; `schemaInPayload` is false too). It can
+   * differ from the marker's `route`, which was decided before the request's
+   * thinking, citations, passthrough `model` and `tools` were known. Unset on
+   * other requests and providers.
+   */
+  schemaRoute?: 'json_schema' | 'forced_tool' | 'none';
+  /** Unified error envelope; present ONLY if an error occurred for this request/chunk. */
+  error?: {
+    /** Human readable message suitable for UI display or logging. */
+    message: string;
+    /** Optional provider/classification type (e.g. 'rate_limit', 'invalid_request'). */
+    type?: string;
+    /** Numeric or string code for programmatic handling. */
+    code?: string | number;
+    /** Raw provider payload or structured diagnostic details. */
+    details?: unknown;
+  };
+  /** Incremental append‑only text delta for streaming; NOT cumulative. Undefined on non‑streaming final response. */
+  responseTextDelta?: string;
+  /**
+   * Incremental append-only reasoning-summary text for streaming (see
+   * `ChatMessage.reasoningText`). Never part of `responseTextDelta`.
+   */
+  reasoningTextDelta?: string;
+  /** Array of incremental tool/function call argument deltas building up tool invocation payloads. */
+  toolCallsDeltas?: Array<{
+    /** Choice index if multiple parallel choices produce tool calls. */
+    index: number;
+    /** Stable tool call id once assigned by provider (may appear after initial delta). */
+    id?: string;
+    /** Type discriminator; currently 'function' for OpenAI‑style tools. */
+    type?: 'function';
+    /** Function metadata with incremental argument assembly. */
+    function?: {
+      /** Function name (first provided delta should include). */
+      name?: string;
+      /** Partial argument JSON fragment (streamed). Concatenate & then parse when final. */
+      arguments_delta?: string;
+    };
+    /** Gemini thought signature for this call; see ChatMessage tool_calls. */
+    thoughtSignature?: string;
+  }>;
+  /** Indicates terminal chunk in a stream. MUST be true on last emission (success or error). */
+  isFinal?: boolean;
+}
+
+/**
+ * Options for embedding generation requests at the provider level.
+ */
+export interface ProviderEmbeddingOptions {
+  model?: string;
+  userId?: string;
+  apiKeyOverride?: string;
+  customModelParams?: Record<string, unknown>;
+  encodingFormat?: 'float' | 'base64';
+  dimensions?: number;
+  inputType?: 'search_document' | 'search_query' | 'classification' | 'clustering' | string;
+  /**
+   * Optional AbortSignal for caller-driven cancellation. A provider that reads it cancels the
+   * request in flight when it aborts and sends no further request; the OpenAI, OpenRouter, Requesty,
+   * Ollama and Gemini providers read it and throw `REQUEST_ABORTED`. On OpenRouter and Requesty it also
+   * rides the model-list read an embedding call makes for a model it has not listed: an aborted call
+   * sends nothing, and an abort ends that read at once.
+   */
+  abortSignal?: AbortSignal;
+  /**
+   * The id the call sends in its operation id header (`AGENTOS_OPERATION_ID_HEADER`, or the provider's
+   * `operationIdHeader`) on every request and retry of it. OpenAI and OpenRouter send it in place of the id they make
+   * for each embeddings request; Gemini sends a header only when the call names this id. `embedText()` on a budget
+   * with a spend meter passes the id the call's reservation is under. Sends nothing by itself: with no header named,
+   * or on a provider that sends none, it is ignored.
+   */
+  operationId?: string;
+}
+
+/**
+ * Represents a single vector embedding object as returned by a provider.
+ */
+export interface EmbeddingObject {
+  object: 'embedding';
+  embedding: number[];
+  index: number;
+}
+
+/**
+ * Represents the response from an embedding generation call from a provider.
+ */
+export interface ProviderEmbeddingResponse {
+  object: 'list';
+  data: EmbeddingObject[];
+  model: string;
+  usage: {
+    prompt_tokens: number;
+    total_tokens: number;
+    costUSD?: number;
+  };
+  error?: {
+    message: string;
+    type?: string;
+    code?: string | number;
+    details?: unknown;
+  };
+}
+
+/**
+ * Represents detailed information about a specific AI model available from a provider.
+ */
+export interface ModelInfo {
+  modelId: string;
+  providerId: string;
+  displayName?: string;
+  description?: string;
+  capabilities: Array<'completion' | 'chat' | 'embeddings' | 'vision_input' | 'tool_use' | 'json_mode' | string>;
+  contextWindowSize?: number;
+  inputTokenLimit?: number;
+  outputTokenLimit?: number;
+  pricePer1MTokensInput?: number;
+  pricePer1MTokensOutput?: number;
+  /**
+   * USD per 1M prompt-cache read tokens. Absent means the provider's standard
+   * ratio applies (Anthropic: 0.1 x {@link pricePer1MTokensInput}).
+   */
+  pricePer1MTokensCacheRead?: number;
+  pricePer1MTokensTotal?: number;
+  supportsStreaming?: boolean;
+  defaultTemperature?: number;
+  minSubscriptionTierLevel?: number;
+  isDefaultModel?: boolean;
+  embeddingDimension?: number;
+  lastUpdated?: string;
+  status?: 'active' | 'beta' | 'deprecated' | string;
+}
+
+/**
+ * @interface IProvider
+ * @description Defines the contract for an AI Model Provider.
+ */
+export interface IProvider {
+  /** Unique provider identifier (e.g. 'openai', 'ollama', 'openrouter'). */
+  readonly providerId: string;
+  /** Indicates successful initialization; all operational methods MUST guard against !isInitialized. */
+  readonly isInitialized: boolean;
+  /** Optional default model to fall back to when caller does not specify one. */
+  readonly defaultModelId?: string;
+
+  /**
+   * Perform one‑time (or idempotent) initialization: validate credentials, prime model catalog, set defaults.
+   * SHOULD throw on unrecoverable misconfiguration (e.g., missing API key) rather than silently degrade.
+   * Multiple calls MAY reset internal caches (implementation specific).
+   */
+  initialize(config: Record<string, any>): Promise<void>;
+
+  /**
+   * Single shot (non‑streaming) completion. Provider MUST return a fully assembled
+   * `ModelCompletionResponse` with `isFinal` either omitted or true, containing full text in `choices[].message.content`.
+   * @param modelId Target model identifier (may be validated or routed).
+   * @param messages Prior conversation messages (system+user+assistant+tool) shaped per unified ChatMessage.
+   * @param options Completion tuning & feature flags (temperature, tools, json mode, etc.).
+   * @throws Error if provider not initialized or request irrecoverably invalid.
+   */
+  generateCompletion(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions
+  ): Promise<ModelCompletionResponse>;
+
+  /**
+   * Streaming completion. Returns an async generator yielding incremental deltas.
+   * REQUIRED invariants:
+   *  - First chunk SHOULD include `id`, `modelId`, `object`, and MAY start text/tool deltas.
+   *  - `responseTextDelta` values MUST be append‑only segments (caller concatenates in order).
+   *  - Tool call reconstruction: concatenate `arguments_delta` per (index,id) then JSON parse when final.
+   *  - Exactly one chunk MUST set `isFinal: true` (last). Final chunk SHOULD include usage & any error.
+   *  - If an error occurs mid‑stream, emit a final chunk with `error` populated then end generator.
+   * @returns AsyncGenerator<ModelCompletionResponse>
+   */
+  generateCompletionStream(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions
+  ): AsyncGenerator<ModelCompletionResponse, void, undefined>;
+
+  /**
+   * Generate embeddings for a batch of input texts. Provider MAY chunk internally but MUST return consolidated
+   * response with ordering preserved (indices map to input position).
+   */
+  generateEmbeddings(
+    modelId: string,
+    texts: string[],
+    options?: ProviderEmbeddingOptions
+  ): Promise<ProviderEmbeddingResponse>;
+
+  /** List available models, optionally filtered by required capability (e.g. 'embeddings'). */
+  listAvailableModels(filter?: { capability?: 'completion' | 'chat' | 'embeddings' | string }): Promise<ModelInfo[]>;
+
+  /** Retrieve detailed metadata about a specific model; undefined if unknown or catalog not loaded. */
+  getModelInfo(modelId: string): Promise<ModelInfo | undefined>;
+
+  /** Lightweight health signal; SHOULD avoid heavy network calls. */
+  checkHealth(): Promise<{isHealthy: boolean, details?: unknown}>;
+
+  /** Graceful teardown: release sockets, abort inflight requests, flush caches. Idempotent. */
+  shutdown(): Promise<void>;
+}

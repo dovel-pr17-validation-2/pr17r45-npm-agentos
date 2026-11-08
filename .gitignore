@@ -1,0 +1,62 @@
+dist/
+/knowledge/
+db_data/
+tsconfig.tsbuildinfo
+tsconfig.build.tsbuildinfo
+**/*.js
+!eslint.config.js
+!scripts/*.js
+**/*.js.map
+**/*.d.ts.map
+
+node_modules/
+
+# Local environment files; examples stay tracked
+.env
+.env.*
+!.env*.example
+
+# Prisma generated client
+src/generated/
+
+# Generated documentation
+docs/api/
+
+# Test coverage reports
+coverage/
+
+# Files CI downloads for tests (the Moonshine test model and clip)
+.cache/
+
+# Local SQLite test artifacts (e.g. tmp-parity.sqlite from RAG vector-store
+# parity tests). These are scratch databases produced during local test
+# runs and should never be committed.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+/:memory:
+
+# Tesseract language data, which tesseract.js writes into the working directory
+# the first time an OCR worker starts (the office loader's OCR test starts one).
+*.traineddata
+
+# Internal planning content — never publish
+.superpowers/
+docs/superpowers/
+docs/specs/
+docs/plans/
+docs/internal/
+docs/audits/
+docs/STEP_*.md
+docs/PHASE_*.md
+docs/STAGE_*.md
+docs/SESSION_*.md
+docs/HANDOFF*.md
+docs/FINDINGS*.md
+docs/*-v[0-9]*-plan*.md
+docs/*-v[0-9]*-design*.md
+docs/*-plan-phase*.md
+
+# Example run output — large LLM artifacts, not part of the published surface
+examples/*/output/*.json

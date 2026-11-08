@@ -1,0 +1,132 @@
+# CLI-Based LLM Providers
+
+AgentOS can use locally installed CLI tools as LLM providers, so a user's existing subscription (Anthropic Max, a Google account) serves the calls without an API key. A ChatGPT subscription is reached through an OAuth flow rather than a CLI ([below](#openai-codex-cli--oauth-flow)).
+
+## Architecture
+
+CLI providers use the **subprocess bridge pattern** — each provider spawns the CLI binary via `execa`, pipes prompts through stdin, and parses structured JSON/NDJSON output from stdout.
+
+```
+IProvider (AgentOS interface)
+    │
+    ▼
+ClaudeCodeProvider / GeminiCLIProvider     ← message formatting, tool schema injection, response mapping
+    │
+    ▼
+ClaudeCodeCLIBridge / GeminiCLIBridge      ← extends CLISubprocessBridge (flag assembly, error classification)
+    │
+    ▼
+CLISubprocessBridge (abstract base)        ← sandbox/subprocess/ — spawn, pipe, NDJSON parse, timeout/abort
+    │
+    ▼
+execa → local CLI binary                   ← user's authenticated CLI (claude, gemini, codex)
+```
+
+### Core Subprocess Module
+
+The generalized subprocess bridge lives at `src/safety/sandbox/subprocess/`:
+
+- **[`CLISubprocessBridge`](https://github.com/framerslab/agentos/blob/master/src/safety/sandbox/subprocess/CLISubprocessBridge.ts)** — abstract base class (template method pattern). Owns process lifecycle: spawn, stdin pipe, NDJSON line splitting, timeout, abort signal, and ending the process when the consumer of `stream()` stops reading before the end. `stream()` reads stdout as the CLI writes it, whatever the consumer's pace, so the timeout measures the CLI (a caller's abort still counts until the consumer has read the stream to its end), and decodes it as one UTF-8 stream, so a character split between two reads arrives whole. Subclasses implement `buildArgs()`, `classifyError()`, `parseStreamEvent()`; `parseStreamEvent()` gets a `StreamParseContext` object of its own for each stream, for a value a CLI writes on one line that a later event needs.
+- **[`CLISubprocessError`](https://github.com/framerslab/agentos/blob/master/src/safety/sandbox/subprocess/errors.ts)** — generic error with open string codes, `guidance` (user-facing fix instructions), and `recoverable` flag. Works for any binary, not just LLM CLIs.
+- **[`CLIRegistry`](https://github.com/framerslab/agentos/blob/master/src/safety/sandbox/subprocess/CLIRegistry.ts)** — PATH scanner that discovers installed CLIs. It loads 54 bundled descriptors from the JSON files in `registry/` (LLM CLIs such as `claude`, `gemini` and `ollama`, dev tools, runtimes, package managers, cloud CLIs, databases, media and networking tools), and `register()` adds more.
+
+[CLI Error Codes](../features/CLI_ERROR_CODES.md) lists the error codes and when the two CLI providers raise each one.
+
+## Available CLI Providers
+
+| Provider ID | Binary | Auth | Default Model | Status |
+|---|---|---|---|---|
+| `claude-code-cli` | `claude` | Anthropic Max subscription | `claude-sonnet-4-6` | **Confirmed — officially supported by Anthropic** |
+| `gemini-cli` | `gemini` | Google account login | `gemini-3.5-flash` | **Use at your own risk — see ToS warning below** |
+
+## Terms of Service Compliance
+
+### claude-code-cli — CONFIRMED SAFE
+
+Anthropic **explicitly supports** programmatic use of Claude Code CLI via the `-p` (print) flag. Their [headless mode documentation](https://code.claude.com/docs/en/headless) provides examples for CI/CD pipelines, shell scripts, GitHub Actions, and subprocess invocation.
+
+Key points from Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance):
+- Calling `claude -p` from scripts and automation is the intended use case
+- The `--bare` flag is recommended for reproducible scripted calls
+- Max plan usage limits "assume ordinary, individual usage"
+- **Extracting or reusing OAuth tokens** from Claude Code in other tools is explicitly prohibited
+
+**What AgentOS does**: Spawns `claude --bare -p --output-format json` as a subprocess. Never extracts, proxies, or stores OAuth tokens. Each invocation uses the user's own locally-authenticated Claude Code installation. This is the pattern Anthropic designed and documents.
+
+### gemini-cli — USE AT YOUR OWN RISK
+
+> **WARNING**: Google's Gemini CLI Terms of Service contain language that could be interpreted as prohibiting third-party subprocess invocation when using Google account (OAuth) authentication. While Google's own [automation tutorial](https://geminicli.com/docs/cli/tutorials/automation/) promotes headless scripted use, their ToS also states:
+>
+> *"Directly accessing the services powering Gemini CLI using third-party software, tools, or services is a violation of applicable terms and policies, and such actions may be grounds for suspension or termination of your account."*
+>
+> Google has enforced this aggressively — users report account suspensions for using third-party tools with Gemini CLI OAuth. A first-offense reinstatement process exists but requires manual appeal.
+
+**Safer alternative**: Use the `gemini` provider with `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey). This uses the Gemini API directly (separate ToS) and carries no third-party usage risk. The `gemini-cli` provider is available for users who understand and accept the risk.
+
+**What AgentOS does**: Spawns `gemini -p --output-format json` as a subprocess. System prompts are injected via a temporary file + the `GEMINI_SYSTEM_MD` environment variable (Gemini CLI's official mechanism). Never extracts or stores OAuth tokens.
+
+### OpenAI Codex CLI — OAuth flow
+
+OpenAI's approach is the most permissive. The Codex CLI is Apache 2.0 licensed, and an OpenAI maintainer [confirmed](https://github.com/openai/codex/discussions/8338) that the terms are "quite permissive" toward third-party tools doing similar things.
+
+AgentOS exports an [`OpenAIOAuthFlow`](https://github.com/framerslab/agentos/blob/master/src/core/llm/auth/OpenAIOAuthFlow.ts) from `@framers/agentos/auth` that uses the Codex CLI's public OAuth client ID (`app_EMoamEEZ73f0CkXaXp7hrann`) and its browser PKCE flow on `localhost:1455`, then exchanges the `id_token` for an API key as the Codex CLI's `obtain_api_key()` does. `OpenAIProvider` takes the flow as `oauthFlow` and calls it for a token on each request ([OAuth Auth](../features/OAUTH_AUTH.md)). There is no `codex` CLI provider.
+
+## Provider Details
+
+### claude-code-cli
+
+- **Binary**: `claude` (install: `npm install -g @anthropic-ai/claude-code`)
+- **Auth**: User logs into Claude Code separately by running `claude` in terminal
+- **System prompt**: `--system-prompt` flag (direct)
+- **Tool calling**: tool schemas written into the system prompt; when tools are present, `--json-schema` constrains the reply to text or tool calls. Claude Code returns that reply in the result's `structured_output`, which the provider reads first; it parses the result text when there is none (a reply that does not parse as that shape is retried once without the schema and returned as text)
+- **Streaming**: `--output-format stream-json` with `--verbose --include-partial-messages`; the reply's text arrives as `stream_event` lines that wrap the Messages API's `content_block_delta` events, and the `result` line closes the turn. With tools, a text reply in the result's `structured_output` that the text deltas did not already carry (none came, or only text the model wrote before the reply, such as whitespace) goes out as one text delta once the CLI has exited, just before the final chunk, so `streamText()` reads it once
+- **Key flags**: `--bare` (skip plugins/hooks), `--max-turns 1` (single completion)
+- **Models**: claude-opus-5-5, claude-fable-5-1, claude-fable-5, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6 (default), claude-haiku-4-5-20251001
+- **Cost**: $0 per token (subscription)
+- **Auto-detection**: Checks if `claude` is on PATH (after API-key providers, before Ollama)
+
+### gemini-cli
+
+- **Binary**: `gemini` (install: `npm install -g @google/gemini-cli`)
+- **Auth**: User logs in via Google account by running `gemini` in terminal
+- **System prompt**: Temp file + `GEMINI_SYSTEM_MD` env var (no `--system-prompt` flag)
+- **Tool calling**: XML prompt-based with `<tool_call>` markers (no `--json-schema` support); the provider reads the tool calls from the whole reply once it has ended
+- **Streaming**: `--output-format stream-json`; the reply's text arrives as `message` events (`role: 'assistant'`, `delta: true`) and the token counts in the `result` event's `stats`. The session id comes on the `init` event that opens the stream, and the bridge gives it to the result, which carries none. An `error` event of `severity: 'warning'` does not end the stream. With tools, the reply's text streams without the `<tool_call>` blocks the provider reads as tool calls, which arrive as the final chunk's tool calls alone (a block whose body is not JSON is no tool call, and streams as text): text from a `<` that may open a block is held back until the block's closing tag shows whether it is one, and text still held when the reply ends goes out as one text delta just before the final chunk
+- **Key flags**: `-p` (headless), `-m` (model selection)
+- **Models**: gemini-3.5-flash (default), gemini-3.1-pro-preview, gemini-3.5-flash-lite, gemini-2.5-flash-lite. The CLI answers gemini-2.5-flash with gemini-3.5-flash and returns 404 for gemini-2.5-pro.
+- **Cost**: $0 per token (Google account — free tier: 60 req/min, 1000 req/day; higher with AI Pro/Ultra)
+- **Auto-detection**: Checks if `gemini` is on PATH (after `claude-code-cli`, before Ollama)
+
+## Adding a New CLI Provider
+
+To add support for a new CLI binary:
+
+1. Create `{Name}CLIBridge extends CLISubprocessBridge` — implement `buildArgs()`, `classifyError()`, `parseStreamEvent()`
+2. Create `{Name}CLIProviderError extends CLISubprocessError` — define CLI-specific error codes
+3. Create `{Name}CLIProvider implements IProvider` — message formatting, tool calling strategy, response mapping
+4. For a `CLIRegistry` scan to report the binary, add its descriptor to a JSON file in `src/safety/sandbox/subprocess/registry/` ([CLI Registry](../features/CLI_REGISTRY.md#option-1-contribute-a-descriptor)). The registry feeds no provider: auto-detection reads the PATH probe of step 5
+5. Register the provider id in [`AIModelProviderManager`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/AIModelProviderManager.ts), and add its default models and its PATH probe to `PROVIDER_DEFAULTS` and `AUTO_DETECT_ORDER` in [`provider-defaults.ts`](https://github.com/framerslab/agentos/blob/master/src/api/runtime/provider-defaults.ts)
+
+The [`CLISubprocessBridge`](https://github.com/framerslab/agentos/blob/master/src/safety/sandbox/subprocess/CLISubprocessBridge.ts) base class handles the spawn, the stdin pipe, NDJSON parsing, timeouts and health checks; subclasses implement what is specific to their CLI.
+
+## Auto-Detection Order
+
+When no provider is explicitly configured, AgentOS probes in this order:
+
+```
+1. openrouter      → OPENROUTER_API_KEY
+2. openai          → OPENAI_API_KEY
+3. anthropic       → ANTHROPIC_API_KEY
+4. gemini          → GEMINI_API_KEY
+5. groq            → GROQ_API_KEY
+6. together        → TOGETHER_API_KEY
+7. mistral         → MISTRAL_API_KEY
+8. xai             → XAI_API_KEY
+9. requesty        → REQUESTY_API_KEY
+10. minimax         → MINIMAX_API_KEY (text)
+11. claude-code-cli → `which claude` (PATH detection)
+12. gemini-cli     → `which gemini` (PATH detection)
+13. ollama         → OLLAMA_BASE_URL
+```
+
+API-key providers take priority (explicitly configured). CLI providers come next (subscription-grade models). Ollama is last (local/free). For an image, MiniMax comes after the other image providers.

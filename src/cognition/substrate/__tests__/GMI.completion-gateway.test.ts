@@ -1,0 +1,401 @@
+/**
+ * @file GMI.completion-gateway.test.ts
+ * A GMI turn through the real completion gateway (`createCompletionGateway`):
+ * its `resolve()` (a primary that cannot be set up, fallback legs that cannot
+ * start, open circuits, the router's task hint) and its `stream()` (the
+ * delivery boundary, the usage of failed attempts), the provider manager it
+ * creates and the real prompt engine. Only the provider classes are stubbed, at
+ * their module boundary (src/api/__tests__/helpers/stubProviders.ts), and the
+ * real OpenRouter provider runs over a scripted HTTP client; each case
+ * scripts its providers under keys of its own, because provider managers are
+ * cached by provider, key and base URL. GMI.gateway.test.ts covers the hop loop
+ * over a scripted gateway.
+ */
+import { Readable } from 'node:stream';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+vi.mock('../../../core/llm/providers/implementations/OpenAIProvider', async () => ({ OpenAIProvider: (await import('../../../api/__tests__/helpers/stubProviders')).stubProviderClass('openai') }));
+vi.mock('../../../core/llm/providers/implementations/AnthropicProvider', async () => ({ AnthropicProvider: (await import('../../../api/__tests__/helpers/stubProviders')).stubProviderClass('anthropic') }));
+
+/** The scripted OpenRouter HTTP client's answers to the chat requests, in order, and the bodies of the chat requests it was sent. */
+const openRouter = vi.hoisted(() => ({
+  answers: [] as Array<(request: { responseType?: string }) => unknown>,
+  bodies: [] as Array<{ messages: Array<{ role: string; content: unknown }>; response_format?: Record<string, unknown> }>,
+}));
+// The real OpenRouter provider over a scripted HTTP client (its initialize() would fetch the model list).
+vi.mock('../../../core/llm/providers/implementations/OpenRouterProvider', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../../core/llm/providers/implementations/OpenRouterProvider')>();
+  const { ApiKeyPool } = await import('../../../core/providers/ApiKeyPool');
+  class ScriptedOpenRouterProvider extends real.OpenRouterProvider {
+    override async initialize(config: { apiKey: string }): Promise<void> {
+      Object.assign(this as unknown as Record<string, unknown>, {
+        config: { apiKey: config.apiKey, baseURL: 'https://openrouter.test/api/v1', requestTimeout: 1_000, streamRequestTimeout: 5_000 },
+        keyPool: new ApiKeyPool(config.apiKey),
+        client: {
+          request: async (request: { url: string; data?: unknown; responseType?: string }) => {
+            if (request.url !== '/chat/completions') return { data: { data: [] } };
+            openRouter.bodies.push(JSON.parse(JSON.stringify(request.data)) as (typeof openRouter.bodies)[number]);
+            const answer = openRouter.answers.shift();
+            if (!answer) throw new Error('openrouter: unexpected request');
+            return { data: answer(request) };
+          },
+        },
+        isInitialized: true,
+      });
+    }
+  }
+  return { ...real, OpenRouterProvider: ScriptedOpenRouterProvider };
+});
+import { createCompletionGateway } from '../../../api/runtime/completionGateway';
+import { reply, script } from '../../../api/__tests__/helpers/stubProviders';
+import { createConversationMessage, MessageRole } from '../../../core/conversation/ConversationMessage';
+import type { IModelRouter, ModelRouteParams } from '../../../core/llm/routing/IModelRouter';
+import { globalLLMProviderHealth } from '../../../core/safety/LLMProviderHealthRegistry';
+import { providerHealthKey } from '../../../api/runtime/providerHealthKey.js';
+import { GMIErrorCode } from '../../../core/utils/errors';
+import { GMIInteractionType, GMIOutputChunkType, type GMIOutputChunk } from '../IGMI';
+import { createScriptedGmi, runTurn, textTurn } from './helpers/scriptedGmi';
+
+let n = 0;
+const key = () => `k-gmi-gateway-${++n}`;
+const of = (chunks: GMIOutputChunk[], type: GMIOutputChunkType) => chunks.filter((c) => c.type === type);
+/** The bills of failed attempts a turn reported: each marked USAGE_UPDATE as [usage, metadata]. */
+const failedBills = (chunks: GMIOutputChunk[]) =>
+  of(chunks, GMIOutputChunkType.USAGE_UPDATE).filter((c) => c.metadata?.attemptFailed === true).map((c) => [c.content, c.metadata]);
+const servedByPrimary = { attemptFailed: true, hop: 0, providerId: 'openai', modelId: 'scripted-model' };
+
+/** A router that picks nothing and records the task hint each route gave it. */
+function recordingRouter() {
+  const taskHints: string[] = [];
+  const router = {
+    routerId: 'recording',
+    initialize: async () => undefined,
+    selectModel: async (params: ModelRouteParams) => {
+      taskHints.push(params.taskHint);
+      return null;
+    },
+  } as unknown as IModelRouter;
+  return { router, taskHints };
+}
+
+const OR_MODEL = 'openai/gpt-4o-mini';
+/** OpenRouter's refusal of a request no endpoint can serve with its parameters (here, the strict json_schema). */
+const noEndpoints = (): never => {
+  throw Object.assign(new Error('Request failed with status code 404'), {
+    isAxiosError: true,
+    response: { status: 404, headers: {}, data: { error: { code: 404, message: 'No endpoints found that can handle the requested parameters.' } } },
+  });
+};
+/** A streamed OpenRouter answer with `content`: the text, the 'stop' finish, the usage line and [DONE]. */
+const streamedAnswer = (content: string) => (): NodeJS.ReadableStream => {
+  const line = (fields: Record<string, unknown>) => `data: ${JSON.stringify({ id: 'gen-1', object: 'chat.completion.chunk', created: 1, model: OR_MODEL, ...fields })}\n\n`;
+  return Readable.from([
+    line({ choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] }),
+    line({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+    line({ choices: [], usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26 } }),
+    'data: [DONE]\n\n',
+  ]);
+};
+
+beforeEach(() => {
+  globalLLMProviderHealth.reset();
+  openRouter.answers.length = 0;
+  openRouter.bodies.length = 0;
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
+describe('GMI turn through the real completion gateway', () => {
+  it("the router's task hint is the text of the user's message: the text parts of a multimodal one, not its serialised parts", async () => {
+    const k = key(); script('openai', k, { replies: [reply.text('A cat.')] });
+    const { router, taskHints } = recordingRouter();
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [], router }) });
+    await runTurn(gmi, {
+      interactionId: 't1', userId: 'user-1', sessionId: 'session-1', type: GMIInteractionType.MULTIMODAL_CONTENT,
+      content: [{ type: 'text', text: 'Describe this photo' }, { type: 'image_url', image_url: { url: `data:image/png;base64,${'QUJD'.repeat(16)}` } }],
+    });
+    expect(taskHints).toEqual(['Describe this photo']);
+  });
+
+  it("a continuation that starts a route of its own is routed on the user's message, not on the continuation's internal text", async () => {
+    const k = key(); script('openai', k, { replies: [reply.text('Found it.')] });
+    const { router, taskHints } = recordingRouter();
+    // A GMI built to continue a turn another instance started: it holds the history and no resolved hop.
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [], router }) });
+    gmi.hydrateConversationHistory([
+      createConversationMessage(MessageRole.USER, 'Look up the release date.'),
+      createConversationMessage(MessageRole.ASSISTANT, null, { tool_calls: [{ id: 'call_a', name: 'lookup', arguments: { q: 'release date' } }] }),
+    ]);
+    const output = await gmi.handleToolResults([{ toolCallId: 'call_a', toolName: 'lookup', output: { date: 'May 4' } }], 'user-1');
+    expect(output.responseText).toBe('Found it.');
+    expect(taskHints).toEqual(['Look up the release date.']);
+  });
+
+  it('a primary with no credentials ends the turn with CONFIGURATION_ERROR and the configuration error\'s message', async () => {
+    vi.stubEnv('OPENAI_API_KEY', '');
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ fallbackProviders: [] }) });
+    const { chunks } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    const error = of(chunks, GMIOutputChunkType.ERROR)[0];
+    expect(error?.errorDetails?.code).toBe(GMIErrorCode.CONFIGURATION_ERROR);
+    expect(String(error?.content)).toContain('No API key for openai');
+  });
+
+  it('a fallback leg that cannot start is skipped: the failed primary moves on to the leg after it', async () => {
+    const k = key(); const broken = key(); const healthy = key();
+    const overloaded = Object.assign(new Error('overloaded'), { httpStatus: 529 });
+    const primary = script('openai', k, { replies: [overloaded] });
+    script('anthropic', broken, { initThrows: Object.assign(new Error('invalid x-api-key'), { httpStatus: 401 }) });
+    const last = script('openai', healthy, { replies: [reply.text('From the last leg.')] });
+    // Fallback legs take their credentials from the environment.
+    vi.stubEnv('ANTHROPIC_API_KEY', broken);
+    vi.stubEnv('OPENAI_API_KEY', healthy);
+    const gateway = createCompletionGateway({
+      apiKey: k,
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-x' }, { provider: 'openai', model: 'stub-model' }],
+    });
+    const { gmi } = await createScriptedGmi({ gateway, persona: { defaultModelId: 'stub-model' } });
+    const { chunks } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.ERROR)).toEqual([]);
+    expect(of(chunks, GMIOutputChunkType.STEP_FINISHED)[0].content).toMatchObject({ text: 'From the last leg.', providerId: 'openai', hop: 2 });
+    expect([primary.seen.length, last.seen.length]).toEqual([1, 1]);
+    const skipped = gmi.getReasoningTrace().entries.find((entry) => entry.message.includes("Provider 'anthropic' (hop 1) could not start"));
+    expect(skipped).toBeDefined();
+  });
+
+  it("after the first model refuses, the turn passes over the policy chain's Claude legs to the next leg", async () => {
+    const k = key(); const claudeKey = key(); const nextKey = key();
+    const primary = script('openai', k, { replies: [Object.assign(new Error('The model declined.'), { code: 'content_filter' })] });
+    const claude = script('anthropic', claudeKey, { replies: [reply.text('From Claude.')] });
+    const next = script('openai', nextKey, { replies: [reply.text('From the next leg.')] });
+    vi.stubEnv('ANTHROPIC_API_KEY', claudeKey);
+    vi.stubEnv('OPENAI_API_KEY', nextKey);
+    const gateway = createCompletionGateway({
+      apiKey: k,
+      fallbackProviders: [
+        { provider: 'anthropic', model: 'claude-x', origin: 'policy-default' },
+        { provider: 'openai', model: 'stub-model-b', origin: 'policy-default' },
+      ],
+    });
+    const { gmi } = await createScriptedGmi({ gateway, persona: { defaultModelId: 'stub-model' } });
+    const { chunks } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.ERROR)).toEqual([]);
+    expect(of(chunks, GMIOutputChunkType.STEP_FINISHED)[0].content).toMatchObject({ text: 'From the next leg.', providerId: 'openai', hop: 2 });
+    expect([primary.seen.length, claude.seen.length, next.seen.length]).toEqual([1, 0, 1]);
+    const passedOver = gmi.getReasoningTrace().entries.find((entry) => entry.message.includes("'anthropic/claude-x' passed over: claude_after_refusal"));
+    expect(passedOver).toBeDefined();
+  });
+
+  it('a primary whose circuit is open is skipped before any prompt is built or sent to it', async () => {
+    const k = key(); const fb = key();
+    const primary = script('anthropic', k, { replies: [reply.text('Should not run.')] });
+    script('openai', fb, { replies: [reply.text('From the fallback.')] });
+    vi.stubEnv('OPENAI_API_KEY', fb);
+    // A rejected key opens its circuit at once: the circuit of this key, which
+    // the gateway's own key has apart from the provider's.
+    globalLLMProviderHealth.recordFailure(
+      // No ANTHROPIC_API_KEY here: the gateway's key is the route's own.
+      providerHealthKey({ providerId: 'anthropic', apiKey: k }, () => {
+        throw new Error('no shared key');
+      }),
+      Object.assign(new Error('invalid x-api-key'), { httpStatus: 401 }),
+    );
+    const { gmi, promptEngine } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [{ provider: 'openai', model: 'stub-model' }] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-x' },
+    });
+    const construct = vi.spyOn(promptEngine, 'constructPrompt');
+    const { chunks } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.STEP_FINISHED)[0].content).toMatchObject({ text: 'From the fallback.', providerId: 'openai', hop: 1 });
+    expect(construct.mock.calls.map((call) => call[1].providerId)).toEqual(['openai']);
+    expect(primary.seen).toHaveLength(0);
+  });
+
+  it("a turn on the gateway's own Anthropic key, with only OPENROUTER_API_KEY in the environment, goes to Anthropic and reports no fallback to OpenRouter", async () => {
+    const k = key();
+    const primary = script('anthropic', k, { replies: [reply.text('From Anthropic.')] });
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
+    vi.stubEnv('OPENROUTER_API_KEY', key());
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-x' },
+    });
+    const { chunks } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.STEP_FINISHED)[0].content).toMatchObject({ text: 'From Anthropic.', providerId: 'anthropic' });
+    expect(primary.seen).toHaveLength(1);
+    // The gateway reads the provider's shared credentials to pick the turn's health record. With no Anthropic key
+    // there that read resolves to OpenRouter, and it sends nothing.
+    expect(warn.mock.calls.map((args) => args.map(String).join(' ')).filter((line) => line.includes('OpenRouter'))).toEqual([]);
+  });
+
+  it('an attempt that fails before any content shows the GMI none of its chunks, only the bill it reported', async () => {
+    const k = key(); const fb = key();
+    const early = { promptTokens: 30, completionTokens: 0, totalTokens: 30 };
+    // A usage chunk, then the provider fails: the chunk is buffered and dropped with the attempt.
+    script('openai', k, { replies: [[{ id: 'stub', object: 'chat.completion.chunk', created: 0, modelId: 'stub-model', choices: [], usage: early }, Object.assign(new Error('overloaded'), { httpStatus: 529 })]] });
+    script('anthropic', fb, { replies: [reply.text('From the fallback.')] });
+    vi.stubEnv('ANTHROPIC_API_KEY', fb);
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [{ provider: 'anthropic', model: 'claude-x' }] }),
+      persona: { defaultModelId: 'stub-model' },
+    });
+    const { chunks, output } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    const usage = of(chunks, GMIOutputChunkType.USAGE_UPDATE);
+    // The primary's usage chunk never reached the GMI as its own USAGE_UPDATE; it arrives once, as the failed attempt's bill.
+    expect(usage.map((c) => [c.content, c.metadata?.attemptFailed === true])).toEqual([
+      [early, true],
+      [{ promptTokens: 12, completionTokens: 3, totalTokens: 15 }, false],
+    ]);
+    expect(of(chunks, GMIOutputChunkType.TEXT_DELTA).map((c) => c.content)).toEqual(['From the fallback.']);
+    expect(output.usage).toMatchObject({ promptTokens: 42, completionTokens: 3, totalTokens: 45 });
+  });
+
+  it('a step that fails after output is still counted: the usage its provider error carries is reported and added to the turn', async () => {
+    const k = key();
+    const billed = { promptTokens: 12, completionTokens: 4, totalTokens: 16 };
+    // A turn refused part-way: the provider throws, and the error reports what the request was billed.
+    script('openai', k, { replies: [reply.textThenThrow('Sure, here', Object.assign(new Error('refused'), { details: { usage: billed } }))] });
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }) });
+    const { chunks, output } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.TEXT_DELTA).map((c) => c.content)).toEqual(['Sure, here']);
+    expect(of(chunks, GMIOutputChunkType.ERROR)[0]?.errorDetails?.code).toBe(GMIErrorCode.LLM_PROVIDER_ERROR);
+    expect(of(chunks, GMIOutputChunkType.STEP_FINISHED)).toEqual([]);
+    expect(failedBills(chunks)).toEqual([[billed, servedByPrimary]]);
+    expect(output.usage).toMatchObject(billed);
+  });
+
+  it('a step that fails after output with an error that reports no usage counts what the step had reported', async () => {
+    const k = key();
+    const reported = { promptTokens: 7, completionTokens: 1, totalTokens: 8 };
+    script('openai', k, {
+      replies: [[
+        { id: 'stub', object: 'chat.completion.chunk', created: 0, modelId: 'stub-model', choices: [], responseTextDelta: 'Sure', usage: reported },
+        new Error('connection reset'),
+      ]],
+    });
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }) });
+    const { chunks, output } = await runTurn(gmi, textTurn('t1', 'Hi.'));
+    expect(of(chunks, GMIOutputChunkType.ERROR)[0]?.errorDetails?.code).toBe(GMIErrorCode.LLM_PROVIDER_ERROR);
+    expect(failedBills(chunks)).toEqual([[reported, servedByPrimary]]);
+    expect(output.usage).toMatchObject(reported);
+  });
+
+  it('a structured reply on a hop whose payload carries no schema (Claude Sonnet 5.5) has the schema instruction in its prompt once', async () => {
+    const k = key();
+    const s = script('anthropic', k, { replies: [reply.text('{"city":"Lyon"}')] });
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-5-5' },
+    });
+    // The GMI puts the structured reply's instruction in the system prompt and hands its Zod schema to the gateway.
+    const { output } = await runTurn(gmi, textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place' } } }));
+    expect(output.structuredOutput?.value).toEqual({ city: 'Lyon' });
+    const system = s.seen[0].messages
+      .filter((m) => m.role === 'system')
+      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+      .join('\n');
+    expect(system.split('The JSON MUST conform to this JSON Schema:')).toHaveLength(2);
+  });
+
+  it("a structured reply answered by a Claude Sonnet 5.5 hop on the JSON output format reports 'provider_schema'", async () => {
+    const k = key();
+    const s = script('anthropic', k, { replies: [reply.text('{"city":"Lyon"}')] });
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-5-5' },
+    });
+    const { output } = await runTurn(gmi, textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place' } } }));
+    // The marker rides with route json_schema: the payload carried the schema, and the JSON text answer is the object.
+    expect(s.seen[0].options.responseFormat).toMatchObject({ _agentosUseToolForStructuredOutput: true, route: 'json_schema' });
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon' }, meta: { valid: true, enforcement: 'provider_schema' } });
+  });
+
+  it("a structured reply answered by a Claude Sonnet 5.5 hop whose schema the JSON output format cannot carry (a record) reports 'prompt_only'", async () => {
+    const k = key();
+    const s = script('anthropic', k, { replies: [reply.text('{"city":"Lyon","scores":{"a":1}}')] });
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-5-5' },
+    });
+    const { output } = await runTurn(
+      gmi,
+      textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string(), scores: z.record(z.string(), z.number()) }), name: 'place' } } }),
+    );
+    // No forced tool and no payload: the schema reached the model in the prompt alone.
+    expect(s.seen[0].options.responseFormat).toBeUndefined();
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon', scores: { a: 1 } }, meta: { valid: true, enforcement: 'prompt_only' } });
+  });
+
+  it("a structured reply answered by a hop whose payload carries the schema (OpenAI's strict json_schema) reports 'provider_schema'", async () => {
+    const k = key();
+    const s = script('openai', k, { replies: [reply.text('{"city":"Lyon"}')] });
+    const { gmi } = await createScriptedGmi({ gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }) });
+    const { output } = await runTurn(gmi, textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place' } } }));
+    expect(s.seen[0].options.responseFormat).toMatchObject({ type: 'json_schema' });
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon' }, meta: { valid: true, enforcement: 'provider_schema' } });
+  });
+
+  it("a structured reply OpenRouter answers on its json_object retry reports 'prompt_only': the request that answered carried no schema payload", async () => {
+    // No endpoint takes the strict json_schema request (404), so OpenRouterProvider sends it again
+    // in json_object mode with the schema in the prompt alone, and that request answers.
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    openRouter.answers.push(noEndpoints, streamedAnswer('{"city":"Lyon"}'));
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: key(), fallbackProviders: [] }),
+      persona: { defaultProviderId: 'openrouter', defaultModelId: OR_MODEL },
+    });
+    const { output } = await runTurn(gmi, textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place' } } }));
+    expect(openRouter.bodies.map((body) => body.response_format?.type)).toEqual(['json_schema', 'json_object']);
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon' }, meta: { valid: true, enforcement: 'prompt_only' } });
+  });
+
+  it("a structured reply answered by a Claude Sonnet 4.6 hop with a record schema (outside the JSON output format) takes the forced tool and reports 'forced_tool'", async () => {
+    const k = key();
+    const s = script('anthropic', k, { replies: [reply.schemaTool('place', { city: 'Lyon', scores: { a: 1 } })] });
+    const { gmi, processToolCall } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-4-6' },
+    });
+    const { output } = await runTurn(
+      gmi,
+      textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string(), scores: z.record(z.string(), z.number()) }), name: 'place' } } }),
+    );
+    expect(s.seen[0].options.responseFormat).toMatchObject({ _agentosUseToolForStructuredOutput: true, route: 'forced_tool', tool: { name: 'place' } });
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon', scores: { a: 1 } }, meta: { valid: true, enforcement: 'forced_tool' } });
+    expect(processToolCall).not.toHaveBeenCalled();
+  });
+
+  it("a structured reply whose hop's provider sent the schema as a forced tool (its chunks say schemaRoute forced_tool, as a citations request does) reports 'forced_tool'", async () => {
+    const k = key();
+    const sent = reply.schemaTool('place', { city: 'Lyon' }).map((chunk) => ({ ...chunk, schemaRoute: 'forced_tool' }));
+    const s = script('anthropic', k, { replies: [sent] });
+    const { gmi, processToolCall } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-4-6' },
+    });
+    const { output } = await runTurn(gmi, textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place' } } }));
+    // The marker expected the JSON output format; the provider's chunks say what it sent.
+    expect(s.seen[0].options.responseFormat).toMatchObject({ route: 'json_schema' });
+    expect(output.structuredOutput).toMatchObject({ value: { city: 'Lyon' }, meta: { valid: true, enforcement: 'forced_tool' } });
+    expect(processToolCall).not.toHaveBeenCalled();
+  });
+
+  it('a step whose JSON-output-format answer was cut off at the output limit finishes with length and its own text, and carries no structuredOutput', async () => {
+    const k = key();
+    script('anthropic', k, { replies: [reply.cutOff('{"city":"Ly')] });
+    const { gmi } = await createScriptedGmi({
+      gateway: createCompletionGateway({ apiKey: k, fallbackProviders: [] }),
+      persona: { defaultProviderId: 'anthropic', defaultModelId: 'claude-sonnet-5-5' },
+    });
+    const { chunks, output } = await runTurn(
+      gmi,
+      textTurn('t1', 'Where?', { options: { structuredReply: { schema: z.object({ city: z.string() }), name: 'place', maxRetries: 0, onExhausted: 'return_invalid' } } }),
+    );
+    const step = of(chunks, GMIOutputChunkType.STEP_FINISHED)[0]?.content as { finishReason?: string; text?: string; structuredOutput?: unknown };
+    expect(step).toMatchObject({ finishReason: 'length', text: '{"city":"Ly' });
+    expect(step.structuredOutput).toBeUndefined();
+    expect(output.structuredOutput).toMatchObject({ meta: { valid: false } });
+  });
+});

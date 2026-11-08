@@ -1,0 +1,3842 @@
+/**
+ * @file generateText.ts
+ * Stateless, single-call text generation for the AgentOS high-level API.
+ *
+ * Parses a `provider:model` string, resolves credentials from environment
+ * variables or caller-supplied overrides, and invokes the provider's completion
+ * endpoint.  Multi-step tool calling is supported: the loop continues until the
+ * model produces a plain-text reply or `maxSteps` is exhausted.
+ *
+ * When `planning` is enabled, an upfront LLM call decomposes the user's request
+ * into numbered steps before the tool loop starts.  The plan is injected into
+ * the system prompt so the tool loop executes with awareness of the strategy.
+ */
+import { randomUUID } from 'node:crypto';
+import { resolveModelOption, resolveProvider, resolveProviderRoute, createProviderManager, knownProviderPrefixOf } from './model.js';
+import { providerHealthKey } from './runtime/providerHealthKey.js';
+import { attachGenAiAttributes, attachUsageAttributes, toTurnMetricUsage } from './observability.js';
+import { fireLlmUsageObserver, type LlmUsageAccountResolver, type LlmUsageAccountSource } from './observers.js';
+import {
+  hostPolicyToRouteParams,
+  mergeRequiredCapabilities,
+  type HostLLMPolicy,
+} from './runtime/hostPolicy.js';
+import { adaptTools, isSingleUseToolInput, toolInputNames, type AdaptableToolInput } from './runtime/toolAdapter.js';
+import { runEmulatedToolLoop, toShimMessages, type ToolMode } from './runtime/tool-emulation/index.js';
+import { APPROVAL_GRANTED, askApprovalGate, type ApprovalGateFn } from './runtime/approval-gate.js';
+import type { AgentOSUsageLedgerOptions } from './runtime/usageLedger.js';
+import { resolveDynamicToolCalls } from './runtime/dynamicToolCalling.js';
+import type { ITool, ToolExecutionContext } from '../core/tools/ITool.js';
+import { recordAgentOSTurnMetrics, withAgentOSSpan } from '../safety/evaluation/observability/otel.js';
+import { moduleLogger } from '../core/logging/loggerFactory.js';
+import { errorFields, providerName, safePath } from '../core/logging/events.js';
+import { isCallMask } from './runtime/pool/redact.js';
+import { createContentSafeConsole } from '../core/logging/contentSafeConsole.js';
+import type { AgentCallRecord, AgencyTraceEvent } from './types.js';
+import { globalLLMProviderHealth } from '../core/safety/LLMProviderHealthRegistry.js';
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '../core/llm/providers/errors/errorCodes.js';
+import { ContextWindowExceededError } from '../core/llm/providers/errors/ContextWindowExceededError.js';
+import { OPENROUTER_ONLY_PARAM_KEYS } from '../core/llm/providers/openrouter-only-params.js';
+import {
+  catalogEntryHasCapability,
+  createUncensoredModelCatalog,
+  findCatalogTextModel,
+  type PolicyTier,
+} from '../core/llm/routing/UncensoredModelCatalog.js';
+import { checkContextFit } from './runtime/contextWindowFit.js';
+import { responseFormatCarriesSchema } from './runtime/responseFormatForProvider.js';
+import {
+  asSpendBudget,
+  costOfUsageUSD,
+  holdCall,
+  withReservation,
+  type HelperCall,
+  type SpendBudget,
+  type SpendBudgetOptions,
+} from './runtime/spendBudget.js';
+import { isCallerStop, markHookStop } from './runtime/callerStop.js';
+
+/**
+ * The `fallback` component's events, to the target current when each is
+ * written: a logger or a factory set with `setLogger` or `setLoggerFactory`
+ * after this module was imported still receives every failover event.
+ */
+const fallbackLogger = moduleLogger('fallback', 'generate_text');
+/** The model router's component: a payload rebuilt for the router's pick reports its builder's failure here. */
+const routingLogger = moduleLogger('routing', 'generate_text');
+
+// A fallback skip's reason as one of the fixed words `llm.fallback_skipped` takes, never the reason's own text.
+function skipReason(reason: string): 'duplicate' | 'excluded' | 'capability' | 'refusal' | 'refill' | 'unknown' {
+  if (reason.includes('duplicate') || reason.includes('primary')) return 'duplicate';
+  if (reason.includes('exclud')) return 'excluded';
+  if (reason.includes('capabil')) return 'capability';
+  if (reason.includes('refus') || reason.includes('claude')) return 'refusal';
+  if (reason.includes('refill')) return 'refill';
+  return 'unknown';
+}
+
+/**
+ * Invoke a caller-supplied responseFormat builder, for a fallback leg or for
+ * the provider and model a model router picked, without letting a builder bug
+ * kill a call that would otherwise succeed. Failure -> one WARN on `logger` +
+ * `undefined` (the leg or the routed call proceeds schema-in-prompt only,
+ * identical to the guarded-drop outcome — but explicit).
+ *
+ * @internal
+ */
+function safeBuildLegResponseFormat(
+  builder: NonNullable<GenerateTextOptions['_responseFormatBuilder']>,
+  providerId: string,
+  modelId: string,
+  logger: typeof fallbackLogger = fallbackLogger,
+): Record<string, unknown> | undefined {
+  try {
+    return builder(providerId, modelId);
+  } catch (err) {
+    logger.warn('llm.response_format_failed', { provider: providerName(providerId), ...errorFields(err) });
+    return undefined;
+  }
+}
+
+/**
+ * Internal error type thrown when the provider-health registry reports
+ * the resolved primary provider as currently open. Carries
+ * `httpStatus: 503` so the existing `isRetryableError` check at
+ * line ~756 routes the failure into the fallback chain without any
+ * special-case handling. The synthetic message contains the
+ * remaining cooldown so the log line tells operators when the
+ * breaker will close on its own.
+ *
+ * @internal
+ */
+class LLMProviderCircuitOpenError extends Error {
+  /** Mirrors the HTTP status field on typed provider errors so
+   *  {@link isRetryableError} recognizes this as retryable. */
+  readonly httpStatus = 503;
+  constructor(providerId: string, cooldownRemainingMs: number) {
+    super(`[503] Provider '${providerId}' circuit open; cooldown ${cooldownRemainingMs}ms`);
+    this.name = 'LLMProviderCircuitOpenError';
+  }
+}
+import type { IModelRouter, ModelRouteParams } from '../core/llm/routing/IModelRouter.js';
+import { toProviderReplayMessage, type SessionTranscriptMessage } from './sessionTranscript.js';
+import type {
+  MessageContent,
+  MessageContentPart,
+  CacheDiagnostics,
+  AttemptOutcome,
+} from '../core/llm/providers/IProvider.js';
+
+/** This module's fixed diagnostic origin; no runtime name enters telemetry. */
+const console = createContentSafeConsole('generate_text');
+
+// Re-export multimodal types for downstream consumers
+export type { MessageContent, MessageContentPart };
+export type { HostLLMPolicy } from './runtime/hostPolicy.js';
+
+async function recordAgentOSUsageLazy(
+  input: Parameters<typeof import('./runtime/usageLedger.js')['recordAgentOSUsage']>[0]
+): Promise<boolean> {
+  const { recordAgentOSUsage } = await import('./runtime/usageLedger.js');
+  return recordAgentOSUsage(input);
+}
+
+/**
+ * A single chat message in a conversation history.
+ * Mirrors the OpenAI / Anthropic message shape accepted by provider adapters.
+ */
+export interface Message {
+  /** Role of the message author. */
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  /** Content of the message. String for text-only, array for multimodal (images + text). */
+  content: MessageContent;
+}
+
+/**
+ * Extract plain text from a MessageContent value.
+ * For strings, returns as-is. For arrays, concatenates text parts.
+ */
+export function extractTextFromContent(content: MessageContent): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content ?? '');
+  return content
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text' && typeof (p as any).text === 'string')
+    .map((p) => p.text)
+    .join('\n');
+}
+
+/**
+ * Record of a single tool invocation performed during a {@link generateText} call.
+ * One record is appended per tool call, regardless of whether the call succeeded.
+ */
+export interface ToolCallRecord {
+  /** Name of the tool as registered in the `tools` map. */
+  name: string;
+  /** Parsed arguments supplied by the model. */
+  args: unknown;
+  /** Return value from the tool's `execute` function (present on success). */
+  result?: unknown;
+  /** Error message when the tool threw or returned a failure result. */
+  error?: string;
+}
+
+/**
+ * Token consumption figures reported by the provider for a single completion call.
+ * All values are approximate and provider-dependent.
+ */
+export interface TokenUsage {
+  /** Number of tokens in the prompt / input sent to the model. */
+  promptTokens: number;
+  /** Number of tokens in the model's response. */
+  completionTokens: number;
+  /** Sum of `promptTokens` and `completionTokens`. */
+  totalTokens: number;
+  /** Total cost reported by the provider across all steps, when available. */
+  costUSD?: number;
+  /**
+   * Provider-independent total input tokens INCLUDING cached reads/writes,
+   * summed across steps, and across attempts in `generateObject` (spec
+   * batch-1 C1). Anthropic's `promptTokens` is `input_tokens` alone, which
+   * leaves the cache out, so this field is `input_tokens +
+   * cache_creation_input_tokens + cache_read_input_tokens`; OpenAI and
+   * OpenRouter report prompt tokens already inclusive (used as-is). Price
+   * input from this field: on a cached Anthropic call `promptTokens` counts
+   * only the uncached tail. Tri-state: undefined = no step reported enough
+   * to compute; a reported 0 is preserved.
+   */
+  inclusiveInputTokens?: number;
+  /**
+   * Tokens served from the provider's prompt-prefix cache, billed at the
+   * cache-read rate. Reported by Anthropic (`cache_read_input_tokens`),
+   * OpenAI (`prompt_tokens_details.cached_tokens` on Chat Completions,
+   * `input_tokens_details.cached_tokens` on Responses), and OpenRouter
+   * (`prompt_tokens_details.cached_tokens`) — all normalized into this field.
+   *
+   * ACCOUNTING WARNING — the counters are distinct but NOT universally
+   * disjoint: Anthropic's `promptTokens` EXCLUDES cached tokens (its total
+   * input = `promptTokens + cacheReadTokens + cacheCreationTokens`), while
+   * OpenAI's `promptTokens` already INCLUDES cached reads (adding them
+   * double-counts). For a provider-independent input total, use the
+   * normalized inclusive input accounting rather than summing these fields.
+   */
+  cacheReadTokens?: number;
+  /**
+   * Tokens written to the provider's prompt-prefix cache as a new cache
+   * entry, billed at the cache-write rate (Anthropic: 1.25× input for the
+   * 5-minute TTL, 2× for 1-hour; OpenAI GPT-5.6+: 1.25×, reported as
+   * `cache_write_tokens` in the usage details). Same disjointness caveat as
+   * `cacheReadTokens`: excluded from Anthropic's `promptTokens`, included
+   * in OpenAI's. A `cacheReadTokens` of 0 with `cacheCreationTokens > 0`
+   * indicates the call that filled the cache; later cache hits flip the
+   * numbers.
+   */
+  cacheCreationTokens?: number;
+  /**
+   * Of {@link TokenUsage.cacheCreationTokens}, the tokens written with the
+   * provider's longer cache lifetime, billed at its higher write rate:
+   * Anthropic's 1-hour writes at 2x input
+   * (`usage.cache_creation.ephemeral_1h_input_tokens`), OpenAI's 12-hour
+   * writes at 2.5x (`cache_write_tokens_details.ttl_12h_tokens`). The rest
+   * were written with the default lifetime (5 minutes on Anthropic, 30 on
+   * OpenAI, 1.25x input each). Absent when no step's provider split its
+   * writes by lifetime.
+   */
+  cacheCreationExtendedTokens?: number;
+  /**
+   * True when some step's {@link TokenUsage.completionTokens} is an estimate rather than the provider's count: a
+   * stream the caller aborted before the provider sent its output count (Anthropic sends it only on the final
+   * `message_delta`) reports the characters it had streamed, at four characters a token. Absent when every count is
+   * the provider's own.
+   */
+  completionTokensEstimated?: true;
+}
+
+/**
+ * Configuration for the optional plan-then-execute planning phase.
+ *
+ * When `planning` is set to `true` on {@link GenerateTextOptions}, default
+ * settings are used.  Pass a `PlanningConfig` object for fine-grained control
+ * over the planning LLM call.
+ */
+export interface PlanningConfig {
+  /**
+   * Custom system prompt for the planning call.  When omitted a sensible
+   * default that asks the model to produce a numbered JSON plan is used.
+   */
+  systemPrompt?: string;
+
+  /**
+   * Sampling temperature for the planning call.
+   * Defaults to `0.2` (low creativity, high determinism for plans).
+   */
+  temperature?: number;
+
+  /**
+   * Hard token cap for the planning response.
+   * Defaults to `2048`.
+   */
+  maxTokens?: number;
+
+  /**
+   * Per-call request timeout (ms) for the planning completion. Forwarded to
+   * the provider so a stalled planning call honors the caller's bound instead
+   * of hanging until the provider default.
+   */
+  requestTimeout?: number;
+
+  /**
+   * Per-call prompt-cache control for the planning completion. Inherits the
+   * root {@link GenerateTextOptions.cache} when unset, so a `cache: false`
+   * caller's planning sub-call cannot silently re-enable auto-caching and a
+   * `{ ttl: '1h' }` caller's planning call keeps the same pacing. A
+   * planning-specific value here overrides the inherited one.
+   */
+  cache?: { ttl?: '5m' | '1h'; tail?: boolean } | false;
+
+  /**
+   * `false` turns model thinking off for the planning completion, on models
+   * that allow it. Inherits the call's `thinking: false` when unset, so a
+   * caller that switched thinking off does not pay for it in planning. A
+   * thinking budget is not inherited: it is sized for the main call and may
+   * not fit the planning call's `maxTokens`.
+   */
+  thinking?: false;
+}
+
+/**
+ * A single step in a plan produced by the planning phase.
+ * Serialised to / from the JSON plan the LLM emits.
+ */
+export interface PlanStep {
+  /** Human-readable description of what this step accomplishes. */
+  description: string;
+  /** Name of the tool to invoke, or `null` when the step is pure reasoning. */
+  tool: string | null;
+  /** Short explanation of why this step is needed. */
+  reasoning: string;
+}
+
+/**
+ * The complete plan returned by {@link createPlan}.
+ */
+export interface Plan {
+  /** Ordered list of steps the agent should follow. */
+  steps: PlanStep[];
+}
+
+/**
+ * Options for a {@link generateText} call.
+ * Either `prompt` or `messages` (or both) must be provided.
+ */
+/**
+ * A fallback provider entry specifying an alternative provider (and optionally
+ * model) to try when the primary provider fails with a retryable error.
+ *
+ * @see {@link GenerateTextOptions.fallbackProviders}
+ */
+export interface FallbackProviderEntry {
+  /** Provider identifier (e.g. `"openai"`, `"anthropic"`, `"openrouter"`). */
+  provider: string;
+  /** Model identifier override. When omitted, the provider's default text model is used. */
+  model?: string;
+  /** Key for this hop. Written by an agency's seating; omitted, the hop reads the provider's environment variable. */
+  apiKey?: string;
+  /** Base URL for this hop, written by seating; omitted, the provider's URL variable. */
+  baseUrl?: string;
+  /**
+   * Who trained this hop's model, when its id and endpoint cannot say; an
+   * agency seat's record reads it when this hop answered. Seating writes a
+   * pool entry's `vendor` here; a fixed seat's own chain may declare it.
+   */
+  vendor?: string;
+  /**
+   * Per-hop reasoning depth applied ONLY when THIS entry serves the call,
+   * forwarded as `output_config.effort` (Anthropic) / `reasoning_effort`
+   * (OpenAI). Lets a chain run a fallback at a different depth than the primary
+   * — e.g. a gpt-5.6-sol frontier fallback at `'max'` while the primary keeps its
+   * own (or no) effort, so arming the chain is dormant for the primary call.
+   * Omitted -> the hop inherits the call-level `effort`.
+   */
+  effort?: string;
+  /**
+   * Per-hop prompt-cache disposition applied ONLY when THIS entry serves the
+   * call (same override shape as {@link FallbackProviderEntry.effort}).
+   * `false` sends zero `cache_control` on the hop; `{ ttl }` re-times the
+   * hop's markers. Omitted -> the hop inherits the call-level
+   * {@link GenerateTextOptions.cache}.
+   *
+   * The canonical chains ({@link buildFallbackChain} /
+   * {@link buildPolicyAwareFallbackChain}) pin `cache: false` on every leg:
+   * rescue traffic is sporadic and one-shot-shaped, so cache writes on a
+   * fallback hop rarely earn their reads back (the claude-sonnet-5 leg
+   * measured 0.45x write amortization in wilds prod, 2026-07-13..20 — the
+   * writes cost ~2x what the reads saved). A caller-supplied entry keeps
+   * full control: omit to inherit, or set a ttl to cache a hop deliberately.
+   */
+  cache?: { ttl?: '5m' | '1h'; tail?: boolean } | false;
+  /**
+   * Extra output tokens granted ONLY when THIS entry serves the call: the hop
+   * runs with `maxTokens = <the original call's maxTokens> + headroom`. For
+   * models whose hidden reasoning shares the output cap. Every current Gemini
+   * 3.x model thinks, and its thinking tokens count against
+   * `maxOutputTokens`; a rescue hop inherits a budget sized for the primary,
+   * and without room for the thinking the visible reply comes back cut short
+   * or empty (measured 2026-09-30: `gemini-3.1-pro-preview` at 400 tokens
+   * spent 382 thinking and returned 60 characters).
+   *
+   * Ignored when the call set no `maxTokens`. Never compounds: every hop is
+   * granted its own headroom over the ORIGINAL budget, and an entry without
+   * headroom runs at the original.
+   */
+  maxTokensHeadroom?: number;
+  /**
+   * Who wrote this entry. `'policy-default'` marks an entry the policy chain
+   * built for a mature or private-adult tier; a walk may pass over only such
+   * entries (one that names the failed first model, and Claude legs after a
+   * refusal). Absent on caller-written entries, which keep their order and
+   * contents.
+   */
+  origin?: 'policy-default';
+  /**
+   * The entry's group in a policy chain. `'uncensored'` marks the catalog
+   * ladder legs; a walk runs the first two as standing legs and the rest only
+   * to replace a standing leg that failed on availability or did not fit the
+   * request.
+   */
+  group?: 'uncensored';
+}
+
+/**
+ * The original call's values for the options a fallback entry can override,
+ * carried down the fallback recursion so every hop's overrides are computed
+ * over the ORIGINAL call and never over the previous hop.
+ *
+ * @internal
+ */
+export interface FallbackHopBase {
+  maxTokens?: number;
+  effort?: string;
+  cache?: { ttl?: '5m' | '1h'; tail?: boolean } | false;
+}
+
+/**
+ * A structured block of system prompt content with optional cache breakpoint.
+ * When `cacheBreakpoint` is true, providers that support prompt caching
+ * (e.g., Anthropic) will mark this block's boundary for caching.
+ */
+export interface SystemContentBlock {
+  /** The text content of this block. */
+  text: string;
+  /** When true, marks the end of this block as a cache boundary. */
+  cacheBreakpoint?: boolean;
+  /**
+   * Cache time-to-live for this breakpoint. Defaults to the provider's
+   * standard 5-minute ephemeral cache. Set `'1h'` for the 1-hour cache —
+   * worth the higher write premium (2x base input vs 1.25x) on a stable
+   * prefix that is re-sent on a slow, human-paced cadence (per-turn narrator
+   * / companion calls minutes apart), where the 5-minute cache would expire
+   * between turns and never produce reads. Only meaningful with
+   * `cacheBreakpoint: true`.
+   */
+  cacheTtl?: '5m' | '1h';
+}
+
+export interface GenerateTextOptions {
+  /**
+   * Provider name.  When supplied without `model`, the default text model for
+   * the provider is resolved automatically from the built-in defaults registry.
+   *
+   * @example `"openai"`, `"anthropic"`, `"ollama"`
+   */
+  provider?: string;
+  /**
+   * Model identifier.  Accepted in two formats:
+   * - Plain model name (e.g. `"gpt-4o"`) when `provider` is also set. Preferred.
+   * - `"provider:model"` combined string (e.g. `"openai:gpt-4o"`).
+   *
+   * Either `provider` or `model` (or an API key env var for auto-detection) is required.
+   */
+  model?: string;
+  /** Single user turn to append after any `messages`. Convenience alternative to building a `messages` array. */
+  prompt?: string;
+  /** System prompt injected as the first message. Accepts a plain string or structured blocks with cache breakpoints. */
+  system?: string | SystemContentBlock[];
+  /** Full conversation history. Appended before `prompt` when both are supplied. */
+  messages?: Message[];
+  /**
+   * Tools the model may invoke.
+   *
+   * Accepted forms:
+   * - named high-level tool maps
+   * - external tool registries (`Record`, `Map`, or iterable)
+   * - prompt-only `ToolDefinitionForLLM[]`
+   *
+   * Prompt-only definitions are visible to the model but return an explicit
+   * tool error if the model invokes them without an executor.
+   */
+  tools?: AdaptableToolInput;
+  /**
+   * Provider `tool_choice` passthrough. Forwarded verbatim to the provider so
+   * callers can force a specific tool, force tool use, or set `'auto'`. Provider
+   * support varies; Anthropic + OpenAI honor it. Native path only (ignored on
+   * the prompt-emulation shim).
+   */
+  toolChoice?: string | Record<string, unknown>;
+  /**
+   * Per-call request timeout in milliseconds, forwarded to the provider for
+   * this call only. Large-output callers (e.g. structured-output generation
+   * that emits long strings) can raise the abort window without slowing the
+   * provider's default failover for chat or narration traffic. Native path
+   * only; providers without a request timeout ignore it. `streamText()`
+   * forwards it to the provider's stream: on Anthropic it bounds the stream's
+   * connection (the request and its response headers), and the gap between
+   * streamed events after that is the provider's `streamIdleTimeoutMs`.
+   */
+  requestTimeout?: number;
+  /**
+   * The most attempts this call makes, a first and its retries together; the provider's configured count when left
+   * out. Within one attempt, a key-scoped failure (a rejected, unpaid or throttled key) on a pool of several keys
+   * re-sends the same request with the next usable key, at most once per key, and those sends are not counted.
+   * The OpenAI, Anthropic, Gemini and OpenRouter providers read it, wait no backoff after the last attempt, and
+   * refuse a count that is not a whole number of 1 or more with a `RangeError` before anything is sent, streamed
+   * or not; the Anthropic and Gemini streams send one request and retry nothing but key hops. A request sent
+   * again on another route after a 404 (a retired Gemini id on its alias, an OpenRouter request without its
+   * schema) draws on the same count. Other providers keep their configured retries.
+   */
+  maxAttempts?: number;
+  /**
+   * Called once per attempt, with the answer of the attempt's last send (a key hop's earlier answers are not
+   * reported), so a caller can settle the attempts it paid for. The OpenAI provider (and the providers that send
+   * through it) reports attempts; the others report nothing.
+   */
+  onAttempt?: (outcome: AttemptOutcome) => void;
+  /**
+   * Ends the call when it aborts: the provider request in flight is cancelled, a provider's wait between retries
+   * (a 429's Retry-After or a backoff) ends at once, no further step, retry or fallback hop starts, and the call
+   * rejects with the signal's reason. An abort never walks the fallback chain. The signal
+   * reaches the provider as `ModelCompletionOptions.abortSignal`; a request whose provider does not read it runs to
+   * its end, and the call then rejects with the signal's reason.
+   */
+  abortSignal?: AbortSignal;
+  /**
+   * Maximum number of agentic steps (LLM calls) to execute before returning.
+   * Each tool-call round trip counts as one step. Defaults to `1`.
+   */
+  maxSteps?: number;
+  /**
+   * Tool-calling strategy. `'auto'` (default) uses native provider tool-calling,
+   * and on a tool-unsupported provider error falls back to a prompt-based shim
+   * (tool schemas rendered into the prompt, `<tool_call>` blocks parsed from the
+   * model's text). `'native'` forces native only. `'prompt'` forces the shim.
+   * The shim makes AgentOS tools work on models without native tool-use (e.g.
+   * the uncensored OpenRouter catalog). Shim roundtrips are capped by `maxSteps`
+   * (default 5 when unset on the shim path).
+   */
+  toolMode?: ToolMode;
+  /** Sampling temperature forwarded to the provider (0-2 for most providers). */
+  temperature?: number;
+  /** Nucleus sampling top-p forwarded to the provider. */
+  topP?: number;
+  /**
+   * Frequency penalty forwarded to the provider (OpenAI / OpenRouter range
+   * -2..2). Reduces verbatim token repetition. Anthropic has no equivalent and
+   * the provider drops it, so it's a no-op on Claude models.
+   */
+  frequencyPenalty?: number;
+  /**
+   * Presence penalty forwarded to the provider (OpenAI / OpenRouter range
+   * -2..2). Nudges the model toward new topics. Anthropic has no equivalent and
+   * the provider drops it, so it's a no-op on Claude models.
+   */
+  presencePenalty?: number;
+  /** Hard cap on output tokens. Provider-dependent default applies when omitted. */
+  maxTokens?: number;
+  /**
+   * Extended-thinking switch forwarded to Claude models. Any positive
+   * `budgetTokens` turns adaptive thinking on (the number itself is not sent
+   * and `maxTokens` passes through unchanged). `false` turns thinking off
+   * with the model's own off shape; Opus 5.5, Fable and Mythos always think.
+   * Omitted keeps the model's default: thinking on for Opus 5 and later,
+   * Sonnet 5 and later, Fable and Mythos, off for older models. Other
+   * providers ignore it.
+   */
+  thinking?: { budgetTokens: number } | false;
+  /**
+   * Reasoning depth / token-spend control forwarded to effort-capable models
+   * (Opus 4.5+, Sonnet 4.6, Fable/Mythos 5) as `output_config.effort`
+   * (low|medium|high|xhigh|max). Independent of `thinking` and tool_choice; the
+   * provider drops it on unsupported models or invalid values.
+   */
+  effort?: string;
+  /**
+   * OpenAI prompt-cache shard key (spec batch-1 C2; other providers ignore
+   * it). `'auto'` derives a sha256-hashed key from {@link sessionId}
+   * (omitted when no session id is set; raw ids never leave the process);
+   * an explicit string is sent verbatim; `false` omits the field. Absent
+   * defaults to `'auto'` on the native OpenAI endpoint unless the call
+   * carries `cache: false`; OpenAI-compatible gateways (custom baseURL)
+   * keep the omit default.
+   */
+  promptCacheKey?: string | 'auto' | false;
+  /**
+   * OpenAI prompt-cache retention request. Emitted only when the fail-closed
+   * capability table allows the model/value combination; unsupported combos
+   * are omitted with a debug log. See `openai-cache-params.ts`.
+   */
+  promptCacheRetention?: 'in_memory' | '24h' | '30m';
+  /**
+   * OpenAI service tier (`service_tier`, verbatim). No default. `'flex'`
+   * bills at ~batch rates but can 429 under load; automatic tier fallback
+   * is deliberately not implemented.
+   */
+  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+  /**
+   * Per-call prompt-cache control, forwarded to cache-capable providers
+   * (Anthropic directly and on `anthropic/*` slugs through OpenRouter;
+   * `false` also suppresses OpenAI's session-derived `prompt_cache_key`).
+   *
+   * - `false` — this request emits NO `cache_control` at all: the provider's
+   *   automatic markers (request-level marker, thinking-mode block markers,
+   *   the moving message-tail) are suppressed AND any caller-placed
+   *   system/message markers (e.g. {@link SystemContentBlock.cacheBreakpoint})
+   *   are stripped before the wire. Set this on TRUE one-shots — a single
+   *   never-repeated call pays the cache-write premium (1.25x/2x input) on
+   *   bytes nothing will ever read back.
+   * - `{ ttl: '1h' }` — the automatic markers (including the moving
+   *   message-tail pinned for multi-turn history) carry a 1-hour TTL instead
+   *   of the 5-minute default. Set this on slow loops: codegen
+   *   orchestrator/tool steps gap 2-14 minutes and human-paced conversation
+   *   turns regularly exceed 5 minutes, so the default-TTL entry expires
+   *   between steps and every turn re-writes. Caller-placed markers keep
+   *   their own TTLs ({@link SystemContentBlock.cacheTtl}), except that
+   *   shorter system markers are raised to 1 hour when a 1-hour tail follows
+   *   them (Anthropic rejects a longer TTL after a shorter one).
+   * - `{ tail: false }` — the provider places no breakpoint on the messages
+   *   (no moving tail, no request-level marker), and the markers the caller
+   *   set ({@link SystemContentBlock.cacheBreakpoint}) go out exactly as set.
+   *   With no caller marker anywhere, the end of the first system message is
+   *   marked instead (carrying `ttl` when given). Set this on calls that
+   *   re-send a long stable prefix and never the same tail twice (judges,
+   *   classifiers): the prefix is still read back from the cache, and the
+   *   unique tail is not written at the 1.25x/2x premium. `cache: false`
+   *   would drop the prefix marker as well.
+   * - omitted / `{ ttl: '5m' }` — default 5-minute auto markers.
+   */
+  cache?: { ttl?: '5m' | '1h'; tail?: boolean } | false;
+  /**
+   * Per-conversation affinity key, forwarded to providers that support
+   * request affinity (OpenRouter sends it as `session_id` for provider
+   * sticky routing — upstream prompt caches are host-scoped, so a
+   * load-balanced conversation otherwise cold-misses the cache a prior
+   * turn wrote on a different host). On the native OpenAI endpoint the
+   * `prompt_cache_key` shard key derives from it automatically, so the
+   * same id keeps cache routing warm there too. Pass a stable id per
+   * conversation.
+   */
+  sessionId?: string;
+  /**
+   * Enable Anthropic prompt-cache diagnostics (beta `cache-diagnosis-2026-04-07`)
+   * across the agentic loop. The loop auto-threads each step's response id into
+   * the next step's `diagnostics.previous_message_id`, so every step after the
+   * first carries a comparison verdict: `cacheMissReason: null` = prefix stable,
+   * a populated reason (`system_changed` / `tools_changed` / `messages_changed`
+   * / ...) = where the cached prefix diverged. Per-step verdicts surface on the
+   * {@link GenerationHookResult.cacheDiagnostics} hook field; the last step's
+   * verdict lands on {@link GenerateTextResult.cacheDiagnostics}. Anthropic-only
+   * (other providers ignore the option) and best-effort — diagnostics never
+   * block or fail a request.
+   *
+   * The object form seeds the FIRST step's `previous_message_id` so a caller
+   * can thread across REQUESTS, not just across the steps of one call: pass
+   * the prior turn's {@link GenerateTextResult.providerMessageId} and the
+   * first step's verdict names any divergence from that turn's prompt.
+   * `true` keeps the in-call-only behavior (first step compares nothing).
+   */
+  cacheDiagnostics?: boolean | { previousMessageId?: string | null };
+  /**
+   * Provider-specific TOP-LEVEL request-payload parameters, forwarded
+   * verbatim into `ModelCompletionOptions.customModelParams`. Provider
+   * implementations spread these onto the outgoing request body (OpenRouter /
+   * OpenAI / Anthropic / Ollama all honor it), so this is the escape hatch
+   * for params the typed options don't model — e.g. OpenRouter
+   * provider-routing preferences:
+   *
+   * ```ts
+   * customModelParams: { provider: { sort: 'throughput' } }
+   * ```
+   *
+   * Keys collide last-wins with the typed fields at the provider layer, so
+   * only pass params the target provider understands. The Anthropic provider
+   * reconciles three keys with the model: with `thinking: false` on a model
+   * that turns thinking off only at effort `high` or below (Opus 5, Sonnet
+   * 5.5, Haiku 5.5), an `output_config.effort` of `xhigh` or `max` passed here
+   * is sent as `high`; a `temperature` or `top_p` passed here for a model that
+   * rejects them is dropped (and `top_k` on Claude Haiku 5.5); and a `model`
+   * passed here is the one the request is shaped for.
+   *
+   * With `planning` on, the planning call takes OpenRouter's routing controls
+   * (`provider`, `models`, `route`, `transforms`) and `plugins` from this
+   * record, so the preferences that say where the caller's messages may go
+   * hold for it too. Every other key goes to the turn's requests alone.
+   */
+  customModelParams?: Record<string, unknown>;
+  /** Override the API key instead of reading from environment variables. */
+  apiKey?: string;
+  /** Override the provider base URL (useful for local proxies or Ollama). */
+  baseUrl?: string;
+  /** Optional durable usage ledger configuration for helper-level accounting. */
+  usageLedger?: AgentOSUsageLedgerOptions;
+  /**
+   * Chain-of-thought instruction prepended to the system prompt when tools
+   * are available.  Encourages the model to reason explicitly before choosing
+   * an action.
+   *
+   * - `false` (default): no CoT injection.
+   * - `true`: inject the default CoT instruction.
+   * - `string`: inject a custom CoT instruction.
+   */
+  chainOfThought?: boolean | string;
+  /**
+   * Enable plan-then-execute mode.  When `true` (or a {@link PlanningConfig}),
+   * an upfront LLM call decomposes the task into numbered steps before the
+   * tool-calling loop begins.  The plan is injected into the system prompt
+   * so the model executes with full awareness of the strategy.
+   *
+   * Set to `false` or omit to skip planning entirely (the default).
+   */
+  planning?: boolean | PlanningConfig;
+  /**
+   * Ordered list of fallback providers to try when the primary provider fails
+   * with a retryable error (HTTP 402/429/5xx, network errors, auth failures).
+   *
+   * **Default behavior (omit / `undefined`):** auto-build the canonical
+   * fallback chain for the primary provider via {@link buildFallbackChain},
+   * filtered to providers that have API keys present in the environment.
+   * No import needed: fallback is on by default.
+   *
+   * **Strict mode (`[]`):** explicitly opt out of fallback. The primary
+   * provider's error is re-thrown after exhausting any provider-internal
+   * retries. Use this when billing isolation, capability auditing, or
+   * provider-pinned testing requires a single-provider guarantee.
+   *
+   * **Custom chain (array of entries):** specify exactly which providers
+   * (and optional model overrides) to try, in order. Each entry's model
+   * defaults to the provider's text-generation default from
+   * {@link PROVIDER_DEFAULTS} when omitted. Providers are tried
+   * left-to-right; the first successful response wins.
+   *
+   * @example Default: auto-fallback through the canonical chain
+   * ```ts
+   * const result = await generateText({
+   *   provider: 'anthropic',
+   *   prompt: 'Hello',
+   * });
+   * // On retryable Anthropic failure, walks anthropic -> openai -> gemini -> ...
+   * ```
+   *
+   * @example Strict mode: fail if the primary is unavailable
+   * ```ts
+   * const result = await generateText({
+   *   provider: 'anthropic',
+   *   prompt: 'Hello',
+   *   fallbackProviders: [],
+   * });
+   * ```
+   *
+   * @example Custom chain
+   * ```ts
+   * const result = await generateText({
+   *   provider: 'anthropic',
+   *   prompt: 'Hello',
+   *   fallbackProviders: [
+   *     { provider: 'openai', model: 'gpt-4o-mini' },
+   *     { provider: 'openrouter' },
+   *   ],
+   * });
+   * ```
+   */
+  fallbackProviders?: FallbackProviderEntry[];
+  /**
+   * Callback invoked when a fallback provider is about to be tried after the
+   * primary (or a previous fallback) failed.  Useful for logging or metrics.
+   *
+   * @param error - The error that triggered the fallback.
+   * @param fallbackProvider - The provider the next leg is sent to. An entry
+   *   whose model id carries another provider's prefix (`{ provider:
+   *   'anthropic', model: 'openrouter:anthropic/claude-sonnet-4.5' }`) is sent
+   *   to the provider the prefix names, so this is `'openrouter'`. So is an
+   *   Anthropic entry with no Anthropic key or base URL (its own, the global
+   *   default's or `ANTHROPIC_BASE_URL`) while `OPENROUTER_API_KEY` is set:
+   *   the credential layer sends it to OpenRouter.
+   */
+  onFallback?: (error: Error, fallbackProvider: string) => void;
+  /**
+   * Optional source label forwarded to the global LLM usage observer
+   * registered via {@link setGlobalLlmObserver}. Hosts use this to
+   * tag the emitted telemetry row with a caller-defined meter key
+   * (e.g. 'narrator_turn', 'companion_reply', 'world_compile_job').
+   *
+   * Has no effect when no observer is registered.
+   */
+  source?: string;
+  /**
+   * Names the account of a call whose {@link GenerateTextOptions.budget} names none, for the global LLM usage observer
+   * (`LlmUsageEvent.accountId`). Asked for each usage event that is about to reach an observer, with the event's
+   * provider, model, source and surface. A budget that names an account wins, and this is not asked.
+   */
+  accountIdOf?: LlmUsageAccountResolver;
+  /**
+   * Internal — DO NOT set from application code. The outermost call's
+   * `Date.now()` start, threaded into the provider-fallback recursion so
+   * the winning hop's usage-observer `durationMs` reports true end-to-end
+   * wall-clock (spanning failed primary attempts) rather than only its own
+   * leg. Absent on a top-level call, where it defaults to that call's start.
+   *
+   * @internal
+   */
+  __rootStartedAt?: number;
+  /**
+   * Internal — DO NOT set from application code. Fallback-hop depth,
+   * threaded into the provider-fallback recursion so the leg's usage
+   * observer event carries `fallbackDepth` and hosts can tell leg
+   * traffic from primary traffic. Absent (0) on top-level calls.
+   *
+   * @internal
+   */
+  __fallbackDepth?: number;
+  /**
+   * Internal — DO NOT set from application code. The outermost call's
+   * `maxTokens`, `effort` and `cache`, threaded into the provider-fallback
+   * recursion so a hop's per-entry overrides (see
+   * {@link fallbackHopOverrides}) apply to that hop alone. Absent on a
+   * top-level call, where the call's own values are the base.
+   *
+   * @internal
+   */
+  __hopBase?: FallbackHopBase;
+  /**
+   * Internal — DO NOT set from application code. The fallback walk's state
+   * before this leg ran, and the leg's role, handed down the recursion. Its
+   * presence marks `fallbackProviders` as already resolved, so a nested walk
+   * never resolves it again.
+   *
+   * @internal
+   */
+  __fallbackWalk?: FallbackWalkContext;
+  /**
+   * Optional model router for intelligent provider/model selection.
+   * When provided, the router's `selectModel()` is called before provider
+   * resolution.  The router result overrides `model`/`provider`.
+   * If the router returns `null`, falls back to standard resolution.
+   */
+  router?: IModelRouter;
+  /**
+   * Routing hints passed to the model router.  Extracted automatically
+   * from system prompt and tool names when not provided.
+   */
+  routerParams?: Partial<ModelRouteParams>;
+  /**
+   * Host-level routing hints that can be forwarded into the model router
+   * without requiring callers to construct raw router params directly.
+   */
+  hostPolicy?: HostLLMPolicy;
+  /**
+   * Caller's intended content policy tier. On `'mature'` or
+   * `'private-adult'` with no explicit `fallbackProviders`, the auto-built
+   * fallback chain is {@link buildPolicyAwareFallbackChain}: the tier's
+   * ranked uncensored OpenRouter models, then the availability chain, so a
+   * content-policy refusal from the primary (an OpenAI or Anthropic model)
+   * re-routes to a model that can complete the request rather than
+   * hard-failing.
+   *
+   * Combined with the {@link isContentPolicyRefusal} branch in
+   * {@link isRetryableError}, this also makes the fallback loop fire on
+   * OpenAI's 400 + `code: 'content_policy_violation'`, which the
+   * network-only retryable matrix would otherwise treat as a hard error.
+   *
+   * When omitted, the chain follows the tier the call resolves to
+   * ({@link resolvePolicyTier}): `routerParams.policyTier`, then this field,
+   * then `hostPolicy` (a host policy without a tier counts as `standard`),
+   * then the router's default tier. `safe` and `standard` keep the
+   * availability-only chain.
+   *
+   * Mirrors the existing `policyTier` parameter on
+   * {@link GenerateImageOptions} and {@link EditImageOptions}.
+   */
+  policyTier?: 'safe' | 'standard' | 'mature' | 'private-adult';
+  /**
+   * Called before each LLM generation step.  Can inject memory context
+   * into messages, sanitize input via guardrails, or modify the prompt.
+   * Return a modified context to transform input, or void to pass through.
+   */
+  onBeforeGeneration?: (context: GenerationHookContext) => Promise<GenerationHookContext | void>;
+  /**
+   * Called after each LLM generation step.  Can check output against
+   * guardrails, redact PII, or transform the response.
+   * Return a modified result to transform output, or void to pass through.
+   */
+  onAfterGeneration?: (result: GenerationHookResult) => Promise<GenerationHookResult | void>;
+  /**
+   * A spend budget for this call and, when the same {@link SpendBudget} instance is passed to several calls, for all of
+   * them: each provider call is checked against what is left before it is made and recorded after it, a failed
+   * request's billed usage included. A call the budget refuses is not tried on a fallback provider.
+   */
+  budget?: SpendBudget | SpendBudgetOptions;
+  /**
+   * What a generation or tool hook's error does: `'warn'` (the default) logs it and goes on; `'throw'` ends the call
+   * with it, so a guard written as a hook can stop a call. A call a hook stops is not tried on a fallback provider and
+   * does not count against the provider's health.
+   */
+  hookErrors?: 'warn' | 'throw';
+  /**
+   * Called before each tool execution.  Can modify arguments, apply
+   * permission checks, or return `null` to skip the tool call entirely.
+   */
+  onBeforeToolExecution?: (info: ToolCallHookInfo) => Promise<ToolCallHookInfo | null>;
+  /**
+   * Internal — DO NOT set from application code. The tool-approval gate,
+   * set by `agency()` when `hitl.approvals.beforeTool` is listed, or
+   * forwarded from a parent agency. Every tool loop calls it after
+   * `onBeforeToolExecution`, on the arguments that hook left; anything but
+   * its exact approval skips the tool and tells the model.
+   *
+   * @internal
+   */
+  __approvalGate?: ApprovalGateFn;
+  /**
+   * Internal — set by an agency's seating on every seat and the chair. With it,
+   * provider resolution ignores a `setDefaultProvider()` default that names no
+   * provider, for the key and for the URL, and never reroutes Anthropic to
+   * OpenRouter: a provider with no key of its own fails. Rides every failover hop.
+   *
+   * @internal
+   */
+  __strictCredentials?: boolean;
+  /**
+   * Internal — set by a panel when its own deadline is the smallest bound it
+   * passes as `requestTimeout`: a timeout error then does not count against
+   * the provider's circuit breaker.
+   *
+   * @internal
+   */
+  __panelDeadline?: boolean;
+  /**
+   * Internal — set by an agency's seating on every seat and the chair: the
+   * call's error mask. The tool loops pass a tool's error through it, as one
+   * redacted string, before they write the call record, the tool turn and the
+   * `tool-result` stream part.
+   *
+   * @internal
+   */
+  __maskError?: (error: unknown) => unknown;
+  /**
+   * Internal — set by `streamObject()`. `streamText()` calls it each time it
+   * counts usage a provider reported into the stream's `usage`: a provider
+   * stream's final chunk, a prompt-shim round's response, the planning
+   * call's response, and an error that carries its step's usage (a refused
+   * turn); every fallback leg, which runs with the same options, calls it
+   * too. `usage` counts what was never reported as zero, so this tells a
+   * report of zero tokens from no report. `generateText()` does not read it.
+   *
+   * @internal
+   */
+  __onUsageReport?: () => void;
+  /**
+   * @internal Used by generateObject and AgentSession.send (with
+   * responseSchema) to forward a provider-specific response_format
+   * payload to the provider. Not part of the public API.
+   *
+   * Shape varies by provider: OpenAI accepts json_object or
+   * json_schema, Anthropic uses an internal _agentosUseToolForStructuredOutput
+   * marker whose `route` AnthropicProvider sends as the JSON output format
+   * (`output_config.format`, every model that has it, when the schema fits
+   * its limits), as a non-strict forced tool call (a model without the format,
+   * and a schema it cannot carry on a model that accepts a forced choice) or
+   * as a schema block in the system prompt (such a schema on a model that
+   * refuses a forced choice, or a forced-tool request that turns thinking on;
+   * the format itself rides with thinking), Gemini uses a
+   * _gemini.responseSchema extra.
+   * The provider implementations consume whatever shape is here.
+   */
+  _responseFormat?: { type: string } | Record<string, unknown>;
+  /**
+   * @internal Rebuilds the provider-native structured-output payload for a
+   * FALLBACK leg's provider, and for the provider and model a call resolves
+   * to when a `router` moved it off the call's own provider and model (the
+   * pair `_responseFormat` is built for) or the resolver sends it to another
+   * provider (an Anthropic call with no Anthropic key or base URL goes to
+   * OpenRouter). When absent, legs and a routed call
+   * receive `_responseFormat` verbatim (legacy behavior — provider-side
+   * guards then drop foreign shapes, so the leg runs with zero provider
+   * enforcement). generateObject and AgentSession.send supply this;
+   * hand-rolled generateText callers are unaffected. `modelId` is `''` when
+   * the fallback entry omits `model` (the provider's default text model is
+   * resolved later).
+   */
+  _responseFormatBuilder?: (
+    providerId: string,
+    modelId: string,
+  ) => Record<string, unknown> | undefined;
+  /**
+   * @internal Schema instructions (`buildSchemaInstructionText`) that a call
+   * whose `_responseFormat` carries no schema sends as a system message after
+   * its system prompt: no payload for the provider or model, or a JSON mode
+   * without one. Each fallback leg decides for its own payload. AgentSession.send
+   * supplies this for a structured send; generateObject puts the schema in its
+   * own system prompt and leaves it unset.
+   */
+  _schemaInstruction?: string;
+  /**
+   * INTERNAL (sessions): how many TRAILING entries of `messages` belong to
+   * THIS call's transcript delta rather than prior history. Sessions that
+   * carry a non-string user turn inside `messages` set 1 so the delta
+   * includes it; prompt-based calls leave it unset (the prompt push is
+   * captured positionally). Not part of the public API.
+   */
+  _transcriptIncludeTrailingCallerMessages?: number;
+  /**
+   * INTERNAL (failover): the call a fallback leg continues. The leg keeps
+   * the call's tool run id, so tool execution contexts carry the same
+   * session, numbers its steps from `stepOffset` in hooks, synthetic tool
+   * call ids and tool contexts, and reports the call's original `prompt` to
+   * hooks (a leg that continues after tool rounds receives it inside
+   * `messages` instead). Not part of the public API.
+   */
+  _continuation?: { helperToolRunId: string; stepOffset: number; prompt?: string };
+}
+
+/**
+ * The completed result returned by {@link generateText}.
+ */
+export interface GenerateTextResult {
+  /**
+   * Lossless message delta this call appended to the conversation: the
+   * request's user turn plus every assistant / tool turn the tool loop
+   * recorded, in order, in provider-replayable shape (tool_call ids,
+   * parallel results, thinking blocks). Sessions append THIS — never a
+   * reconstruction — to their history. Absent only on legacy paths that
+   * never seeded a conversation array. The prompt-shim path carries a
+   * partial delta (seeded turns only); native providers carry the full
+   * trail.
+   */
+  transcriptDelta?: SessionTranscriptMessage[];
+  /** Provider identifier used for the final run. */
+  provider: string;
+  /** Resolved model identifier used for the run. */
+  model: string;
+  /**
+   * Provider-reported model id of the final step (spec batch-1 C1) — can
+   * differ from `model` across aliases and fallback routing. Undefined on
+   * paths where no provider-reported id was captured. `model` keeps its
+   * existing meaning (zero-change).
+   */
+  responseModel?: string;
+  /**
+   * Provider-reported service tier the final step actually ran at (OpenAI
+   * `service_tier` on the response; spec batch-1 C2). Undefined on
+   * providers/paths without a tier concept.
+   */
+  serviceTier?: string;
+  /**
+   * Upstream host that actually served the request when `provider` is an
+   * aggregator/router (OpenRouter reports e.g. `'Groq'` or `'DeepInfra'`
+   * per completion). Undefined for direct providers, for aggregators that
+   * omit it, and on the prompt-shim tool path. Latency attribution:
+   * identical model + token counts vary 3-5x in wall-clock by serving
+   * host, so telemetry needs this to interpret durations.
+   */
+  servingProvider?: string;
+  /**
+   * Cache-diagnostics verdict from the LAST agentic step (Anthropic beta;
+   * present only when the run opted in via
+   * {@link GenerateTextOptions.cacheDiagnostics}). `null` = the last step's
+   * request matched its predecessor (prefix stable). A populated
+   * `cacheMissReason` names the earliest divergence. Per-step verdicts are
+   * available on the `onAfterGeneration` hook.
+   */
+  cacheDiagnostics?: CacheDiagnostics | null;
+  /**
+   * Provider message id (`msg_...`) of the LAST agentic step; present only
+   * when the run opted in via {@link GenerateTextOptions.cacheDiagnostics}.
+   * Persist it and pass it back as the next request's
+   * `cacheDiagnostics.previousMessageId` to thread the comparison across
+   * turns. `null` when the provider reported no id.
+   */
+  providerMessageId?: string | null;
+  /** Final assistant text after all agentic steps have completed. */
+  text: string;
+  /** Aggregated token usage across all steps. */
+  usage: TokenUsage;
+  /** Ordered list of every tool call made during the run. */
+  toolCalls: ToolCallRecord[];
+  /**
+   * Reason the model stopped generating.
+   * - `"stop"`: natural end of response.
+   * - `"length"`: `maxTokens` limit reached.
+   * - `"tool-calls"`: loop exhausted `maxSteps` while still calling tools.
+   * - `"error"`: provider returned an error.
+   */
+  finishReason: 'stop' | 'length' | 'tool-calls' | 'error';
+  /**
+   * Ordered records of every sub-agent call made during an `agency()` run.
+   * `undefined` for plain `generateText` / `agent()` calls.
+   */
+  agentCalls?: AgentCallRecord[];
+  /**
+   * Structured trace events emitted during the run.
+   * Populated by the agency orchestrator; `undefined` for single-agent calls.
+   */
+  trace?: AgencyTraceEvent[];
+  /**
+   * Parsed structured output from `BaseAgentConfig.output`, or from
+   * `agent().generate()` with `responseSchema`. Undefined without a schema.
+   */
+  parsed?: unknown;
+  /**
+   * The plan produced by the planning phase when `planning` is enabled.
+   * `undefined` when planning is disabled or was not requested.
+   */
+  plan?: Plan;
+  /**
+   * Per-claim citation verdicts attached when `agent({ verifyCitations: … })`
+   * is configured. `undefined` when verification was not requested or could
+   * not run for this turn.
+   *
+   * @see `VerifyCitationsConfig` (exported from `@framers/agentos/api`) for
+   * the `verifyCitations` options.
+   */
+  grounding?: import('../cognition/rag/citation/types.js').VerifiedResponse;
+  /**
+   * Per-hop provider fallback trail. `fired` is true when any non-primary
+   * provider produced — or was tried for — the result, so callers can flag a
+   * degraded run even when the final attempt recovered on the primary.
+   * `undefined` only on legacy code paths that predate the field.
+   */
+  fallback?: FallbackSignal;
+}
+
+/** @see {@link GenerateTextResult.fallback} */
+export interface FallbackSignal {
+  /** True when a non-primary provider was used or tried for this result. */
+  fired: boolean;
+  /** Provider that produced the returned result. */
+  finalProvider: string;
+  /** Model that produced the returned result. */
+  finalModel: string;
+  /**
+   * Ordered trail of every provider hop attempted, in order. Each hop names
+   * the provider and model it was sent as: a fallback entry whose model id
+   * carries another provider's prefix (`{ provider: 'anthropic', model:
+   * 'openrouter:anthropic/claude-sonnet-4.5' }`) is recorded as `{ provider:
+   * 'openrouter', model: 'anthropic/claude-sonnet-4.5' }`, and an entry
+   * `{ provider: 'anthropic', model: 'claude-sonnet-4-5' }` that the
+   * credential layer sends to OpenRouter (no Anthropic key or base URL,
+   * `OPENROUTER_API_KEY` set) as `{ provider: 'openrouter', model:
+   * 'anthropic/claude-sonnet-4-5' }`.
+   */
+  hops: Array<{ provider: string; model?: string; ok: boolean }>;
+}
+
+// ---------------------------------------------------------------------------
+// Generation lifecycle hook types
+// ---------------------------------------------------------------------------
+
+/**
+ * Context available to pre-generation hooks.
+ * Hooks may return a modified copy to transform the generation input.
+ */
+export interface GenerationHookContext {
+  /** Current messages array (system + conversation + user). */
+  messages: Message[];
+  /** System prompt: plain string or structured blocks with cache breakpoints. */
+  system: string | SystemContentBlock[] | undefined;
+  /** Tool definitions available for this step. */
+  tools: ITool[];
+  /** Resolved model ID. */
+  model: string;
+  /** Resolved provider ID. */
+  provider: string;
+  /** Current agentic step index (0-based). */
+  step: number;
+  /** The original user prompt (from opts.prompt). */
+  prompt: string | undefined;
+}
+
+/**
+ * Context available to post-generation hooks.
+ * Hooks may return a modified copy to transform the generation output.
+ */
+export interface GenerationHookResult {
+  /** Generated text from the LLM. */
+  text: string;
+  /** Tool calls requested by the LLM. */
+  toolCalls: ToolCallRecord[];
+  /** Token usage for this step. */
+  usage: TokenUsage;
+  /** Current agentic step index (0-based). */
+  step: number;
+  /**
+   * Cache-diagnostics verdict for THIS step (Anthropic beta; present only
+   * when the run opted in via {@link GenerateTextOptions.cacheDiagnostics}).
+   * `null` = this step's request matched the previous one (cached prefix
+   * stable). A populated `cacheMissReason` names the earliest divergence —
+   * log it: it is the direct answer to "why did this step miss the cache".
+   */
+  cacheDiagnostics?: CacheDiagnostics | null;
+}
+
+/**
+ * Info about a tool call before execution.
+ * Hooks may return a modified copy or `null` to skip execution.
+ */
+export interface ToolCallHookInfo {
+  /** Tool name. */
+  name: string;
+  /** Parsed arguments. */
+  args: Record<string, unknown>;
+  /** Tool call ID from the LLM. */
+  id: string;
+  /** Current agentic step index. */
+  step: number;
+}
+
+// ---------------------------------------------------------------------------
+// Chain-of-thought helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Default chain-of-thought instruction prepended to the system prompt when
+ * tools are available and `chainOfThought` is enabled.  Encourages the model
+ * to reason explicitly before selecting a tool or crafting a response.
+ */
+export const DEFAULT_COT_INSTRUCTION = `Before choosing an action, briefly reason about what you need to do and why. Consider:
+1. What information do you already have?
+2. What information do you need?
+3. Which tool is most appropriate and why?
+4. How does your communication style (from the Personality section, if present) influence how you should frame your response?
+Then proceed with your tool call or response.`;
+
+/**
+ * Resolves the chain-of-thought instruction from the `chainOfThought` option.
+ *
+ * @param cot - The `chainOfThought` option value.
+ * @returns The resolved CoT instruction string, or `undefined` if disabled.
+ *
+ * @internal
+ */
+export function resolveChainOfThought(cot: boolean | string | undefined): string | undefined {
+  if (!cot) return undefined;
+  if (typeof cot === 'string') return cot;
+  return DEFAULT_COT_INSTRUCTION;
+}
+
+// ---------------------------------------------------------------------------
+// Planning helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Default system prompt used when planning is enabled without a custom prompt.
+ * Instructs the model to decompose the user's request into a numbered JSON plan.
+ */
+const DEFAULT_PLANNING_SYSTEM_PROMPT = `You are planning how to accomplish the user's request. Break it into numbered steps.
+Describe what tools you'll need for each step. Output a JSON plan:
+{"steps": [{"description": "...", "tool": "tool_name_or_null", "reasoning": "..."}]}
+Return ONLY the JSON object: no markdown fences, no commentary.`;
+
+/**
+ * The `customModelParams` keys a planning call takes from its turn:
+ * OpenRouter's routing controls and its `plugins`. They say which upstreams
+ * may be sent the caller's messages and how the prompt is processed (context
+ * compression is a `plugins` entry), and the planning request carries those
+ * messages as the turn's does. Every other key shapes the turn's own request
+ * (`messages`, `tools`, `max_tokens`, `response_format`): spread last by the
+ * provider, it would replace the planner's messages or lift its output limit
+ * past the one its budget check counted.
+ */
+const PLANNING_INHERITED_PARAM_KEYS: readonly string[] = [...OPENROUTER_ONLY_PARAM_KEYS, 'plugins'];
+
+/**
+ * The part of a call's `customModelParams` its planning call inherits
+ * (`PLANNING_INHERITED_PARAM_KEYS`), or `undefined` when the call sets none
+ * of it.
+ */
+function planningModelParams(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!params) return undefined;
+  let inherited: Record<string, unknown> | undefined;
+  for (const key of PLANNING_INHERITED_PARAM_KEYS) {
+    if (params[key] !== undefined) (inherited ??= {})[key] = params[key];
+  }
+  return inherited;
+}
+
+/**
+ * Makes a single LLM call to create an execution plan before the tool loop.
+ *
+ * The plan is a lightweight JSON object containing ordered steps.  It is
+ * injected into the system prompt for the subsequent tool loop so the model
+ * executes with full awareness of the strategy.
+ *
+ * @param provider - The resolved LLM provider instance.
+ * @param modelId - Model identifier to use for the planning call.
+ * @param userMessages - The user-supplied messages that describe the task.
+ * @param toolNames - Names of available tools (informational context for the planner).
+ * @param config - Optional planning configuration overrides, the call's abort signal, which the planning request
+ *   is handed as it is handed `requestTimeout`, the call's `customModelParams`, of which the planning request
+ *   takes the routing keys (`PLANNING_INHERITED_PARAM_KEYS`), and `onUsageReport`, called when the planning
+ *   response reports usage (streamText passes its call's `__onUsageReport` there).
+ * @param totalUsage - Mutable usage aggregator: the planning call's tokens are added here.
+ * @param spend - The run's spend budget, the provider the planning call is sent to, and what to call the call in the
+ *   budget's records: the planning call is checked against the budget before it is made and recorded after it.
+ * @returns The parsed {@link Plan}, or `undefined` if parsing fails gracefully.
+ *
+ * @internal
+ */
+export async function createPlan(
+  provider: { generateCompletion: (...args: any[]) => Promise<any> },
+  modelId: string,
+  userMessages: Array<Record<string, unknown>>,
+  toolNames: string[],
+  config:
+    | (PlanningConfig & {
+        abortSignal?: AbortSignal;
+        customModelParams?: Record<string, unknown>;
+        maxAttempts?: number;
+        onAttempt?: (outcome: AttemptOutcome) => void;
+        onUsageReport?: () => void;
+      })
+    | undefined,
+  totalUsage: TokenUsage,
+  spend?: { budget: SpendBudget; providerId: string; what: string },
+): Promise<Plan | undefined> {
+  const systemPrompt = config?.systemPrompt ?? DEFAULT_PLANNING_SYSTEM_PROMPT;
+  const temperature = config?.temperature ?? 0.2;
+  const maxTokens = config?.maxTokens ?? 2048;
+  const requestTimeout = config?.requestTimeout;
+  const inheritedParams = planningModelParams(config?.customModelParams);
+
+  // Build the planning conversation: system prompt + user context
+  const planMessages: Array<Record<string, unknown>> = [
+    { role: 'system', content: systemPrompt },
+  ];
+
+  // Inject available tool names so the planner knows what's available
+  if (toolNames.length > 0) {
+    planMessages.push({
+      role: 'system',
+      content: `Available tools: ${toolNames.join(', ')}`,
+    });
+  }
+
+  // Append the user messages so the planner can see the actual request
+  for (const msg of userMessages) {
+    planMessages.push(msg);
+  }
+
+  // The run's budget checks the planning call before it is sent; a budget with a meter reserves it and settles it.
+  const planCall: HelperCall = {
+    what: spend?.what ?? 'generate_text.plan',
+    route: { providerId: spend?.providerId ?? '', modelId },
+    messages: planMessages,
+    maxTokens,
+    options: { cache: config?.cache, customModelParams: inheritedParams },
+    onAttempt: config?.onAttempt,
+    abortSignal: config?.abortSignal,
+  };
+  const response = await withReservation(spend?.budget, planCall, (held) => provider.generateCompletion(modelId, planMessages, {
+    temperature,
+    maxTokens,
+    ...(requestTimeout !== undefined ? { requestTimeout } : {}),
+    ...(config?.abortSignal ? { abortSignal: config.abortSignal } : {}),
+    // The call's attempt count and its report hold for the planning request too.
+    ...(config?.maxAttempts !== undefined ? { maxAttempts: config.maxAttempts } : {}),
+    ...held,
+    // Inherited (or planning-specific) cache control: a cache:false root
+    // call's planning sub-call must not auto-cache behind the caller's back.
+    ...(config?.cache !== undefined ? { cache: config.cache } : {}),
+    ...(config?.thinking === false ? { thinking: false } : {}),
+    // Of the caller's provider-specific fields, the routing ones (OpenRouter's
+    // provider preferences and plugins) apply to the planning call too.
+    ...(inheritedParams ? { customModelParams: inheritedParams } : {}),
+  }));
+
+  spend?.budget.record(costOfUsageUSD(spend.providerId, modelId, response.usage), response.usage?.totalTokens ?? 0, spend.what);
+
+  // Accumulate planning call usage
+  if (response.usage) {
+    config?.onUsageReport?.();
+    totalUsage.promptTokens += response.usage.promptTokens ?? 0;
+    totalUsage.completionTokens += response.usage.completionTokens ?? 0;
+    totalUsage.totalTokens += response.usage.totalTokens ?? 0;
+    if (typeof response.usage.costUSD === 'number') {
+      totalUsage.costUSD = (totalUsage.costUSD ?? 0) + response.usage.costUSD;
+    }
+    // Provider-layer ModelUsage carries prompt-cache metrics that were
+    // previously dropped by the TokenUsage mapping. Plumb them through
+    // so callers can see cache hit rate and per-hit savings.
+    const cacheRead = (response.usage as { cacheReadInputTokens?: number }).cacheReadInputTokens;
+    const cacheCreate = (response.usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens;
+    // typeof-only guards: a REPORTED zero is meaningful (cache miss on a
+    // cache-capable call) and must be preserved, not collapsed into absent.
+    if (typeof cacheRead === 'number') {
+      totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + cacheRead;
+    }
+    if (typeof cacheCreate === 'number') {
+      totalUsage.cacheCreationTokens = (totalUsage.cacheCreationTokens ?? 0) + cacheCreate;
+    }
+    const planCacheCreateExtended = (response.usage as { cacheCreationExtendedInputTokens?: number }).cacheCreationExtendedInputTokens;
+    if (typeof planCacheCreateExtended === 'number') {
+      totalUsage.cacheCreationExtendedTokens = (totalUsage.cacheCreationExtendedTokens ?? 0) + planCacheCreateExtended;
+    }
+    const planInclusiveIn = (response.usage as { inclusiveInputTokens?: number }).inclusiveInputTokens;
+    if (typeof planInclusiveIn === 'number') {
+      totalUsage.inclusiveInputTokens = (totalUsage.inclusiveInputTokens ?? 0) + planInclusiveIn;
+    }
+  }
+
+  const rawContent = response.choices?.[0]?.message?.content;
+  const planText = typeof rawContent === 'string' ? rawContent: '';
+
+  try {
+    const parsed = JSON.parse(planText);
+    if (Array.isArray(parsed.steps)) {
+      return {
+        steps: parsed.steps.map((s: any) => ({
+          description: String(s.description ?? ''),
+          tool: s.tool ?? null,
+          reasoning: String(s.reasoning ?? ''),
+        })),
+      };
+    }
+  } catch {
+    // If the model returns malformed JSON, fall through gracefully:
+    // the tool loop will still proceed, just without an explicit plan.
+  }
+  return undefined;
+}
+
+/**
+ * Formats a {@link Plan} into a human-readable string suitable for injection
+ * into the system prompt of the tool-calling loop.
+ *
+ * @param plan - The plan to format.
+ * @returns A multi-line string with numbered steps.
+ *
+ * @internal
+ */
+function formatPlanForPrompt(plan: Plan): string {
+  const lines = plan.steps.map(
+    (s, i) =>
+      `${i + 1}. ${s.description}${s.tool ? ` [tool: ${s.tool}]`: ''}`,
+  );
+  return `Follow this plan:\n${lines.join('\n')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * HTTP status codes and network error patterns that indicate a transient or
+ * provider-level failure worth retrying with a different provider.
+ *
+ * Matched status codes:
+ * - `401` / `403`: authentication / authorization failure (key expired or wrong provider).
+ * - `402`: payment required (quota exhausted).
+ * - `429`: rate limit exceeded.
+ * - `500` / `502` / `503` / `504`: server-side errors.
+ * - `529`: provider overloaded (Anthropic's `overloaded_error`). The request
+ *   is fine; this provider has no capacity right now, so another may serve it.
+ *
+ * Matched network errors:
+ * - `fetch failed`: generic fetch rejection (DNS, TLS, etc.).
+ * - `ECONNREFUSED` / `ETIMEDOUT` / `ENOTFOUND`: socket-level failures.
+ *
+ * @param error - The error to inspect.
+ * @returns `true` when the error is likely transient and a different provider
+ *   might succeed; `false` for deterministic user-input errors.
+ *
+ * @internal
+ */
+const RETRYABLE_HTTP_STATUSES = new Set([401, 402, 403, 429, 500, 502, 503, 504, 529]);
+
+/** Native tool rounds a generateText attempt completed before it failed. */
+interface CompletedToolRounds {
+  /** The conversation so far, without the leading system block. */
+  messages: Array<Record<string, unknown>>;
+  /** How many of those messages are caller history rather than this call's. */
+  callerHistoryCount: number;
+  /** Tool calls the completed rounds recorded. */
+  toolCalls: ToolCallRecord[];
+  /** Model steps the completed rounds used. */
+  steps: number;
+}
+
+/**
+ * Whether the tool round a continuation answers was requested without
+ * thinking blocks, as it is when another provider's model ran it.
+ */
+function toolTurnLacksThinking(messages: ReadonlyArray<Record<string, unknown>>): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
+      continue;
+    }
+    return !Array.isArray(message.thinkingBlocks) || message.thinkingBlocks.length === 0;
+  }
+  return false;
+}
+
+/** Property key that marks an error thrown after the call's tools ran. */
+const TOOLS_RAN = Symbol.for('agentos.generateText.toolsRan');
+
+/**
+ * Marks `error` as thrown after the call's tools ran, so a fallback walker
+ * that called this call as a leg stops instead of restarting on another
+ * provider, which would run the tools again. A non-object is wrapped in an
+ * Error first.
+ *
+ * @returns The marked error.
+ * @internal Shared with streamText.
+ */
+export function markToolsRan(error: unknown): unknown {
+  const target = error !== null && typeof error === 'object' ? error : new Error(String(error));
+  try {
+    Object.defineProperty(target, TOOLS_RAN, { value: true, configurable: true });
+  } catch {
+    // A frozen error cannot carry the mark.
+  }
+  return target;
+}
+
+/**
+ * Adds a provider's usage report (`ModelUsage`) to a call's running
+ * {@link TokenUsage}, as each completed step is added.
+ *
+ * @internal Shared with streamText.
+ */
+export function addModelUsage(target: TokenUsage, usage: unknown): void {
+  if (!usage || typeof usage !== 'object') return;
+  const u = usage as Record<string, unknown>;
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  target.promptTokens += num(u.promptTokens) ?? 0;
+  target.completionTokens += num(u.completionTokens) ?? 0;
+  target.totalTokens += num(u.totalTokens) ?? 0;
+  const cost = num(u.costUSD);
+  if (cost !== undefined) target.costUSD = (target.costUSD ?? 0) + cost;
+  const cacheRead = num(u.cacheReadInputTokens);
+  if (cacheRead !== undefined) target.cacheReadTokens = (target.cacheReadTokens ?? 0) + cacheRead;
+  const cacheWrite = num(u.cacheCreationInputTokens);
+  if (cacheWrite !== undefined) target.cacheCreationTokens = (target.cacheCreationTokens ?? 0) + cacheWrite;
+  const cacheWriteExtended = num(u.cacheCreationExtendedInputTokens);
+  if (cacheWriteExtended !== undefined) {
+    target.cacheCreationExtendedTokens = (target.cacheCreationExtendedTokens ?? 0) + cacheWriteExtended;
+  }
+  const inclusive = num(u.inclusiveInputTokens);
+  if (inclusive !== undefined) target.inclusiveInputTokens = (target.inclusiveInputTokens ?? 0) + inclusive;
+  if (u.completionTokensEstimated === true) target.completionTokensEstimated = true;
+}
+
+/**
+ * The usage a provider error reports for the request it ended, such as the
+ * billed tokens of a refused turn (`details.usage`).
+ *
+ * @internal Shared with streamText and the completion gateway.
+ */
+export function usageOfError(error: unknown): unknown {
+  return (error as { details?: { usage?: unknown } } | null | undefined)?.details?.usage;
+}
+
+/**
+ * Whether a usage report shows billable consumption.
+ *
+ * @internal Shared with streamText.
+ */
+export function hasBillableUsage(usage: TokenUsage): boolean {
+  return (
+    usage.promptTokens > 0 ||
+    usage.completionTokens > 0 ||
+    (usage.cacheReadTokens ?? 0) > 0 ||
+    (usage.cacheCreationTokens ?? 0) > 0
+  );
+}
+
+/**
+ * The sum of two usage reports; an optional counter stays absent when neither has it.
+ *
+ * @internal Shared with generateObject, which sums its attempts with it.
+ */
+export function sumTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  const optional = (x: number | undefined, y: number | undefined): number | undefined =>
+    x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0);
+  const costUSD = optional(a.costUSD, b.costUSD);
+  const inclusiveInputTokens = optional(a.inclusiveInputTokens, b.inclusiveInputTokens);
+  const cacheReadTokens = optional(a.cacheReadTokens, b.cacheReadTokens);
+  const cacheCreationTokens = optional(a.cacheCreationTokens, b.cacheCreationTokens);
+  const cacheCreationExtendedTokens = optional(a.cacheCreationExtendedTokens, b.cacheCreationExtendedTokens);
+  return {
+    promptTokens: a.promptTokens + b.promptTokens,
+    completionTokens: a.completionTokens + b.completionTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+    ...(costUSD !== undefined ? { costUSD } : {}),
+    ...(inclusiveInputTokens !== undefined ? { inclusiveInputTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+    ...(cacheCreationExtendedTokens !== undefined ? { cacheCreationExtendedTokens } : {}),
+    ...(a.completionTokensEstimated || b.completionTokensEstimated ? { completionTokensEstimated: true as const } : {}),
+  };
+}
+
+/** Property key that marks an error thrown after the call walked its fallback chain. */
+const CHAIN_WALKED = Symbol.for('agentos.generateText.chainWalked');
+
+/**
+ * Marks `error` as thrown after this call walked its whole remaining fallback
+ * chain and every entry failed. A walker that called this call as a leg passed
+ * it the entries after that leg (`slice(attempt)`), so on this mark it stops:
+ * walking those entries again would repeat each of them, and on a full outage
+ * leg k would run up to 2^(k-1) times. A non-object is wrapped in an Error
+ * first.
+ *
+ * @returns The marked error.
+ * @internal Shared with streamText.
+ */
+export function markChainWalked(error: unknown): unknown {
+  const target = error !== null && typeof error === 'object' ? error : new Error(String(error));
+  try {
+    Object.defineProperty(target, CHAIN_WALKED, { value: true, configurable: true });
+  } catch {
+    // A frozen error cannot carry the mark.
+  }
+  return target;
+}
+
+/**
+ * Whether `error` was marked by {@link markChainWalked}.
+ *
+ * @internal Shared with streamText.
+ */
+export function chainWalkedBefore(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as Record<symbol, unknown>)[CHAIN_WALKED] === true
+  );
+}
+
+/**
+ * Whether `error` was marked by {@link markToolsRan}.
+ *
+ * @internal Shared with streamText.
+ */
+export function toolsRanBefore(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as Record<symbol, unknown>)[TOOLS_RAN] === true
+  );
+}
+
+/**
+ * Provider error codes for request-level failures that another provider may
+ * not share: unreachable endpoints, request timeouts, retries exhausted
+ * inside the provider, a request larger than the model's context window, and
+ * OpenRouter's string code for a server failure on a stream error event.
+ * Mid-stream codes (STREAM_IDLE_TIMEOUT, STREAM_INCOMPLETE) are left out,
+ * because a stream that already delivered text must not be restarted on
+ * another provider.
+ */
+const RETRYABLE_PROVIDER_ERROR_CODES = new Set([
+  'NETWORK_ERROR',
+  'REQUEST_TIMEOUT',
+  'REQUEST_HARD_TIMEOUT',
+  'TIMEOUT',
+  'MAX_RETRIES_REACHED',
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  'server_error',
+  // Every key of the provider's pool is out (revoked, unpaid or throttled);
+  // the next provider in the chain may still answer.
+  'ALL_KEYS_FAILED',
+]);
+
+/**
+ * Provider error codes for a request timeout: OpenAI's, Anthropic's and
+ * Gemini's REQUEST_TIMEOUT, Anthropic's hard and idle timeouts, and the CLI
+ * bridges' TIMEOUT. OpenRouter and Ollama raise none of their own.
+ */
+const TIMEOUT_ERROR_CODES = new Set(['REQUEST_TIMEOUT', 'REQUEST_HARD_TIMEOUT', 'STREAM_IDLE_TIMEOUT', 'TIMEOUT']);
+
+/**
+ * Whether a provider error names a request timeout by its code.
+ *
+ * @param error - The error a provider call threw or a stream reported.
+ * @returns True when the error's `code` is one of the providers' timeout codes.
+ * @internal Shared with streamText.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' && TIMEOUT_ERROR_CODES.has(code);
+}
+
+/**
+ * Error classes a provider's stream error event names for a server failure:
+ * Anthropic's `api_error` (HTTP 500) and `overloaded_error` (529). A thrown
+ * provider error carries the HTTP status; a stream event carries the class,
+ * as `type` on a stream error chunk and as `anthropicErrorType` on the
+ * AnthropicProviderError the provider throws for an SSE `error` event.
+ */
+const RETRYABLE_PROVIDER_ERROR_TYPES = new Set(['api_error', 'overloaded_error']);
+
+/**
+ * Detect content-policy refusals across providers so the fallback chain
+ * can route them to a more permissive model (typically uncensored
+ * OpenRouter for mature/private-adult callers). The provider matrix:
+ *
+ *   - OpenAI: HTTP 400 with `error.code: 'content_policy_violation'` or
+ *     `error.type: 'content_policy_violation'`. Also surfaces as a
+ *     400 with a `safety_violations` block on the structured-output
+ *     path, which message-greps catch via "content_policy".
+ *   - Anthropic: HTTP 400 with messages like "blocked by Anthropic's
+ *     usage policies" or "violates safety guidelines". Recent SDKs
+ *     also emit `error.type: 'content_filter'`.
+ *   - Gemini: Doesn't error: instead returns `finishReason: 'SAFETY'`
+ *     in the response. Caller-side detection catches that path; this
+ *     helper only matches the error-shaped variants because the
+ *     fallback chain only fires on thrown errors.
+ *   - OpenRouter: forwards the upstream provider's error mostly
+ *     verbatim, so the OpenAI/Anthropic patterns above also catch
+ *     OpenRouter routes against gpt-4o / claude.
+ *
+ * Returns true when the message + typed fields together indicate a
+ * content-policy refusal. The caller (the fallback loop in
+ * generateText) treats this as "retryable in the policy sense" so
+ * a content-policy fallback chain can fire on a 400 even though
+ * the network fallback chain wouldn't.
+ *
+ * @internal
+ */
+export function isContentPolicyRefusal(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code;
+  const errorType = (error as { type?: unknown }).type;
+  // Typed-field detection runs first: providers with structured error
+  // shapes are the reliable signal. Substring grep is the message-only
+  // fallback for older SDKs / wrapped errors.
+  if (typeof code === 'string') {
+    const c = code.toLowerCase();
+    if (c === 'content_policy_violation' || c === 'content_filter' || c === 'safety_violations') {
+      return true;
+    }
+  }
+  if (typeof errorType === 'string') {
+    const t = errorType.toLowerCase();
+    if (t === 'content_policy_violation' || t === 'content_filter' || t === 'safety_violations') {
+      return true;
+    }
+  }
+  // Nested OpenAI error envelope (httpStatus 400 with a nested
+  // `error.code` from `details`). Some agentos providers re-throw
+  // with the raw upstream JSON in `details.error.code`.
+  const details = (error as { details?: unknown }).details;
+  if (details && typeof details === 'object') {
+    const inner = (details as { error?: unknown }).error;
+    if (inner && typeof inner === 'object') {
+      const innerCode = (inner as { code?: unknown }).code;
+      const innerType = (inner as { type?: unknown }).type;
+      if (typeof innerCode === 'string'
+        && /content_policy|content_filter|safety_violation/i.test(innerCode)) {
+        return true;
+      }
+      if (typeof innerType === 'string'
+        && /content_policy|content_filter|safety_violation/i.test(innerType)) {
+        return true;
+      }
+    }
+  }
+  const msg = error.message ?? '';
+  return /content[_ ]policy|content filter|safety guidelines|safety policy|blocked by .*'s? usage policies|safety_violations|usage policies/i.test(msg);
+}
+
+export function isRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  // An aborted request (an `AbortError`, or a provider's `REQUEST_ABORTED`)
+  // is never tried on another provider.
+  if (error.name === 'AbortError' || (error as { code?: unknown }).code === 'REQUEST_ABORTED') return false;
+  // A call the caller stopped (its spend budget's refusal, a hook under
+  // `hookErrors: 'throw'`) never moves to another provider. The text match
+  // below would otherwise read a cap such as `$500.00` as an HTTP 500.
+  if (isCallerStop(error)) return false;
+
+  // A primary that cannot initialize (rejected key, unreachable endpoint)
+  // is unusable for this call whatever the cause; the next provider may not be.
+  if (error.name === 'ProviderInitializationError') return true;
+
+  // Typed provider errors carry the HTTP status as a numeric field. Prefer that
+  // over message-grepping, since providers often substitute the body description
+  // (e.g. "This request requires more credits...") for the status code.
+  const status = (error as { httpStatus?: unknown }).httpStatus;
+  if (typeof status === 'number' && RETRYABLE_HTTP_STATUSES.has(status)) return true;
+
+  // Typed provider errors name request-level network failures and timeouts
+  // by code; their messages vary by provider (OpenAIProvider rewrites an
+  // exhausted network failure as "Network error: unable to reach ...").
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'string' && RETRYABLE_PROVIDER_ERROR_CODES.has(code)) return true;
+  const errorType =
+    (error as { type?: unknown }).type ?? (error as { anthropicErrorType?: unknown }).anthropicErrorType;
+  if (typeof errorType === 'string' && RETRYABLE_PROVIDER_ERROR_TYPES.has(errorType)) return true;
+
+  const msg = error.message;
+  // HTTP status codes that warrant a provider switch (string-grepped fallback
+  // when the error type is not a typed provider error).
+  if (/\b(402|429|500|502|503|504|529|401|403)\b/.test(msg)) return true;
+  // Network-level failures
+  if (/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network error/i.test(msg)) return true;
+  // Provider-specific phrases that always imply a retryable condition.
+  // `overloaded` covers Anthropic's `overloaded_error` when a stream
+  // reports it mid-response without an HTTP status.
+  // `credit balance` covers Anthropic's billing message ("Your credit
+  // balance is too low to access the Anthropic API") which carries
+  // none of the other phrases and is only otherwise caught by the
+  // numeric httpStatus 402 branch — a wrapped / re-thrown error that
+  // loses the typed `httpStatus` field would slip through without it.
+  // The "you have reached your ... api usage limits" phrase covers
+  // Anthropic's spend limits: the HTTP 400 "You have reached your specified
+  // (workspace) API usage limits" for a limit the operator set, which no
+  // status or code here walks, and the 429 "You have reached your API usage
+  // limits" for the tier's monthly cap. It is matched by that documented
+  // opening, so a request's own 400 that names a usage-limits parameter is
+  // not moved to the next provider.
+  if (
+    /requires more credits|insufficient credits|credit balance|you have reached your (?:specified (?:workspace )?)?api usage limits|rate limit|quota|exceeded your current quota|overloaded/i.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  // Content-policy refusals: the policy-aware fallback chain (see
+  // buildPolicyAwareFallbackChain) should fire on these so callers
+  // who tagged their request with policyTier=mature/private-adult
+  // get re-routed to an uncensored model instead of a hard error.
+  // Without this, OpenAI's 400 on a refusal escapes the fallback
+  // loop and the caller sees a raw provider error.
+  if (isContentPolicyRefusal(error)) return true;
+  return false;
+}
+
+/**
+ * Auto-discovers available LLM providers from well-known environment variables
+ * and builds an ordered fallback chain.
+ *
+ * Each entry in the returned array contains a provider identifier and an
+ * optional model suitable for fallback use.  Providers are ordered by
+ * general availability; the OpenAI legs pin `gpt-5.6-sol` — the platform's
+ * quality floor for failover traffic. A primary-provider outage must not
+ * silently downgrade user-facing output to a mini-tier model:
+ * 1. OpenAI (`gpt-5.6-sol`)
+ * 2. Anthropic (`claude-sonnet-5-5` at effort `low`, with 1024 tokens of
+ *    output headroom for thinking)
+ * 3. OpenRouter (`openai/gpt-5.6-sol`)
+ * 4. Gemini (`gemini-3.1-pro-preview`)
+ *
+ * @param excludeProvider - Provider to omit from the chain (typically the
+ *   primary provider that already failed).
+ * Every leg pins `cache: false`: failover hops are sporadic one-shots, so
+ * prompt-cache writes on a rescue leg almost never earn their reads back
+ * (see {@link FallbackProviderEntry.cache}). Callers wanting a cached hop
+ * supply their own chain with a per-entry ttl.
+ *
+ * @returns An array of `{ provider, model?, cache }` entries ready for use as
+ *   {@link GenerateTextOptions.fallbackProviders}.
+ *
+ * @example
+ * ```ts
+ * // Primary is anthropic: build fallback chain from remaining providers
+ * const chain = buildFallbackChain('anthropic');
+ * // => [{ provider: 'openai', model: 'gpt-5.6-sol' }, { provider: 'openrouter', model: 'openai/gpt-5.6-sol' }, ...]
+ * ```
+ */
+export function buildFallbackChain(
+  excludeProvider?: string,
+): FallbackProviderEntry[] {
+  const chain: FallbackProviderEntry[] = [];
+
+  if (process.env.OPENAI_API_KEY && excludeProvider !== 'openai') {
+    // gpt-5.6-sol: the 5.6 flagship variant at the gpt-5.5 price class
+    // ($5/$30 per MTok, verified against the live catalogs 2026-08-06).
+    // Always the -sol pin — the bare `gpt-5.6` alias has undocumented
+    // billing and luna/terra are cheaper tiers.
+    chain.push({ provider: 'openai', model: 'gpt-5.6-sol', cache: false });
+  }
+  if (process.env.ANTHROPIC_API_KEY && excludeProvider !== 'anthropic') {
+    // Sonnet-class, matching the gpt-5.6-sol floor on the OpenAI legs — an
+    // OpenAI-primary outage keeps frontier-adjacent quality on the way down.
+    // Sonnet 5.5 thinks by default and its thinking shares max_tokens: the hop
+    // runs at effort `low` (it skips thinking on most simple requests) with
+    // 1024 tokens of headroom over the caller's budget. A caller's
+    // `thinking: false` still reaches the hop and turns thinking off.
+    chain.push({
+      provider: 'anthropic',
+      model: 'claude-sonnet-5-5',
+      effort: 'low',
+      maxTokensHeadroom: 1024,
+      cache: false,
+    });
+  }
+  if (process.env.OPENROUTER_API_KEY && excludeProvider !== 'openrouter') {
+    // ALWAYS pin an explicit model here. A model-less OpenRouter entry
+    // defaults to the provider's `defaultModel`, so failover traffic
+    // silently lands on whatever that happens to be — an unpinned entry
+    // made `openrouter/openai/gpt-4o` the #1 LLM cost in wilds prod
+    // (2026-06-07, ~half the LLM bill). gpt-5.6-sol is the pinned quality
+    // floor (same family as the direct leg, structured-output safe) and
+    // routes around an OpenAI-direct outage that already knocked the
+    // `openai` link above out.
+    chain.push({ provider: 'openrouter', model: 'openai/gpt-5.6-sol', cache: false });
+  }
+  if (process.env.GEMINI_API_KEY && excludeProvider !== 'gemini') {
+    // Pinned at the pro tier, like every other leg: a model-less entry took
+    // the provider default (`gemini-2.5-flash`) and served a whole degraded
+    // run on a flash model (2026-09-29). `gemini-3.1-pro-preview` is the top
+    // pro model Google serves; if Google retires the preview id, the Gemini
+    // provider retries the request on its alias (`gemini-pro-latest`), so the
+    // leg keeps its tier.
+    //
+    // Gemini 3.x always thinks and the thinking shares the output cap, so
+    // the rescue hop gets bounded thinking (`effort: 'low'`, 380-470 tokens
+    // measured on the pro model) and the room for it on top of the caller's
+    // budget.
+    chain.push({
+      provider: 'gemini',
+      model: 'gemini-3.1-pro-preview',
+      cache: false,
+      effort: 'low',
+      maxTokensHeadroom: 1024,
+    });
+  }
+
+  return chain;
+}
+
+/**
+ * The options a fallback hop runs with where its entry can override the
+ * call: `effort`, `cache` and the output budget. Each is the entry's own
+ * value when it has one and the ORIGINAL call's otherwise, with the original
+ * values carried along as `__hopBase` so a fallback of the fallback starts
+ * from them again. The budget is the original `maxTokens` plus the entry's
+ * {@link FallbackProviderEntry.maxTokensHeadroom}; a call without `maxTokens`
+ * stays uncapped. Shared by the `generateText` and `streamText` walkers.
+ */
+export function fallbackHopOverrides(
+  opts: Pick<GenerateTextOptions, 'maxTokens' | 'effort' | 'cache' | '__hopBase'>,
+  entry: Pick<FallbackProviderEntry, 'effort' | 'cache' | 'maxTokensHeadroom'>,
+): {
+  maxTokens: number | undefined;
+  effort: string | undefined;
+  cache: { ttl?: '5m' | '1h'; tail?: boolean } | false | undefined;
+  __hopBase: FallbackHopBase;
+} {
+  const base: FallbackHopBase = opts.__hopBase ?? {
+    maxTokens: opts.maxTokens,
+    effort: opts.effort,
+    cache: opts.cache,
+  };
+  const headroom =
+    typeof entry.maxTokensHeadroom === 'number' && entry.maxTokensHeadroom > 0
+      ? Math.floor(entry.maxTokensHeadroom)
+      : 0;
+  return {
+    maxTokens: typeof base.maxTokens === 'number' ? base.maxTokens + headroom : base.maxTokens,
+    effort: entry.effort !== undefined ? entry.effort : base.effort,
+    cache: entry.cache !== undefined ? entry.cache : base.cache,
+    __hopBase: base,
+  };
+}
+
+/**
+ * The policy tier a call's fallback chain is built for: the explicit route
+ * tier, the call's tier, the host policy's tier (`standard` when a host
+ * policy names none), then the router's default. The primary's route block
+ * sends the first three terms only, so a delegated base router still sees no
+ * tier when no explicit source set one.
+ */
+export function resolvePolicyTier(opts: {
+  routerParams?: { policyTier?: PolicyTier };
+  policyTier?: PolicyTier;
+  hostPolicy?: HostLLMPolicy;
+  router?: { readonly policyTier?: PolicyTier };
+}): PolicyTier | undefined {
+  return (
+    opts.routerParams?.policyTier ??
+    opts.policyTier ??
+    hostPolicyToRouteParams(opts.hostPolicy).policyTier ??
+    opts.router?.policyTier
+  );
+}
+
+/** Why a fallback walk passed over an entry. */
+export type FallbackSkipReason =
+  | 'failed_primary'
+  | 'missing_capability'
+  | 'excluded_model'
+  | 'refill_not_owed'
+  | 'claude_after_refusal';
+
+/**
+ * A fallback entry after the walk's one-time resolution: the uncensored
+ * group's first two entries are standing legs, the rest refills.
+ *
+ * @internal
+ */
+export interface ResolvedFallbackEntry extends FallbackProviderEntry {
+  walkRole?: 'standing' | 'refill';
+}
+
+/**
+ * What a fallback walk has seen. It travels with the resolved slice into
+ * every nested walk.
+ *
+ * @internal
+ */
+export interface FallbackWalkState {
+  /** Standing legs that failed on availability or did not fit, not yet replaced. */
+  refillsOwed: number;
+  /** A model refusal (error code `content_filter`) ended an attempt in this walk. */
+  refusalSeen: boolean;
+}
+
+/**
+ * Handed to every fallback leg: the walk's state before the leg ran, and the
+ * leg's role.
+ *
+ * @internal
+ */
+export interface FallbackWalkContext {
+  state: FallbackWalkState;
+  role?: 'standing' | 'refill';
+}
+
+/** @internal */
+export const INITIAL_FALLBACK_WALK: Readonly<FallbackWalkState> = Object.freeze({
+  refillsOwed: 0,
+  refusalSeen: false,
+});
+
+/** Claude, direct or through OpenRouter. */
+function isClaudeEntry(entry: FallbackProviderEntry): boolean {
+  return (
+    entry.provider === 'anthropic' ||
+    (entry.provider === 'openrouter' && (entry.model ?? '').startsWith('anthropic/'))
+  );
+}
+
+/**
+ * The capabilities a call names explicitly (host policy and route params).
+ * Native tool calling is not inferred from the presence of tools: a model
+ * without it serves a tool-carrying call through the prompt shim.
+ *
+ * @internal
+ */
+export function explicitRequiredCapabilities(
+  opts: Pick<GenerateTextOptions, 'hostPolicy' | 'routerParams'>,
+): string[] {
+  return (
+    mergeRequiredCapabilities(
+      hostPolicyToRouteParams(opts.hostPolicy).requiredCapabilities,
+      opts.routerParams?.requiredCapabilities,
+    ) ?? []
+  );
+}
+
+/**
+ * The provider and model a fallback entry is sent as: resolved the way the
+ * leg's own call resolves it (a provider's default model when the entry
+ * names none, a `provider:model` id split), then through the credential
+ * layer with the entry's own key and base URL, so an Anthropic entry with no
+ * Anthropic key or base URL that `resolveProvider()` sends to OpenRouter is
+ * `openrouter` and `anthropic/<model>`. When the credentials do not resolve
+ * (the leg will fail on them), it is the model resolution's answer; when the
+ * model does not resolve, the entry as written.
+ *
+ * @param entry - The fallback entry.
+ * @param opts - `strict` for a seat's walk, whose legs resolve strictly (no
+ *   Anthropic to OpenRouter reroute).
+ * @internal Shared with streamText.
+ */
+export function fallbackEntrySentAs(
+  entry: FallbackProviderEntry,
+  opts: { strict?: boolean } = {},
+): { provider: string; model?: string } {
+  return fallbackEntryRoute(entry, opts).sentAs;
+}
+
+/**
+ * {@link fallbackEntrySentAs} with the model resolution's own answer beside
+ * it: `resolvedModel` is the model id before the credential layer moves the
+ * entry (the provider's default model when the entry names none, the id with
+ * a `provider:` or `provider/` prefix split off), undefined when the model
+ * does not resolve.
+ */
+function fallbackEntryRoute(
+  entry: FallbackProviderEntry,
+  opts: { strict?: boolean },
+): { resolvedModel?: string; sentAs: { provider: string; model?: string } } {
+  let parsed: { providerId: string; modelId: string };
+  try {
+    parsed = resolveModelOption({ provider: entry.provider, model: entry.model }, 'text');
+  } catch {
+    return { sentAs: { provider: entry.provider, model: entry.model } };
+  }
+  try {
+    // The route resolveProvider sends the leg on, read quietly: this lookup sends nothing.
+    const sent = resolveProviderRoute(parsed.providerId, parsed.modelId, {
+      apiKey: entry.apiKey,
+      baseUrl: entry.baseUrl,
+      strict: opts.strict === true,
+    });
+    if (sent && typeof sent.providerId === 'string' && typeof sent.modelId === 'string') {
+      return { resolvedModel: parsed.modelId, sentAs: { provider: sent.providerId, model: sent.modelId } };
+    }
+  } catch {
+    // No credentials: the leg fails on them, and is reported as the model resolution names it.
+  }
+  return { resolvedModel: parsed.modelId, sentAs: { provider: parsed.providerId, model: parsed.modelId } };
+}
+
+/**
+ * Resolve a call's fallback chain once, at the start of the top-level walk.
+ * Policy-chain entries (`origin: 'policy-default'`) naming the failed first
+ * model are dropped; every entry is checked, as the provider and model it
+ * will be sent as, against the call's explicitly required capabilities (a
+ * model outside the catalog counts as capable), and against the excluded
+ * models by its model as written, as the model resolution names it (the
+ * provider's default when the entry names none, a prefix split off) and as
+ * it is sent (an OpenRouter reroute's `anthropic/<model>`); the
+ * uncensored group's first two remaining entries become standing legs and
+ * the rest refills. Caller-written entries keep their order.
+ *
+ * @internal
+ */
+export function resolveFallbackChain(
+  chain: readonly FallbackProviderEntry[],
+  ctx: {
+    primary: { provider?: string; model?: string };
+    requiredCapabilities?: readonly string[];
+    excludedModelIds?: readonly string[];
+    onSkip?: (entry: FallbackProviderEntry, reason: FallbackSkipReason) => void;
+    /** A seat's walk: its legs resolve strictly, as {@link fallbackEntrySentAs} reads them. */
+    strictCredentials?: boolean;
+  },
+): ResolvedFallbackEntry[] {
+  const required = ctx.requiredCapabilities ?? [];
+  // An exclusion names a model as written or as a `provider:model` id; a leg
+  // matches by its model as written, as the model resolution names it and as
+  // it is sent, so a rerouted entry with no model or a prefixed one is still
+  // matched by the bare id.
+  const excluded = new Set<string>();
+  for (const id of ctx.excludedModelIds ?? []) {
+    excluded.add(id);
+    const prefix = knownProviderPrefixOf(id);
+    if (prefix) excluded.add(id.slice(prefix.length + 1));
+  }
+  const isExcluded = (model: string | undefined): boolean => model !== undefined && excluded.has(model);
+  const resolved: ResolvedFallbackEntry[] = [];
+  let uncensoredLegs = 0;
+  for (const entry of chain) {
+    if (
+      entry.origin === 'policy-default' &&
+      entry.provider === ctx.primary.provider &&
+      entry.model === ctx.primary.model
+    ) {
+      ctx.onSkip?.(entry, 'failed_primary');
+      continue;
+    }
+    const { resolvedModel, sentAs } = fallbackEntryRoute(entry, { strict: ctx.strictCredentials });
+    if (isExcluded(entry.model) || isExcluded(resolvedModel) || isExcluded(sentAs.model)) {
+      ctx.onSkip?.(entry, 'excluded_model');
+      continue;
+    }
+    const catalogEntry = sentAs.model !== undefined ? findCatalogTextModel(sentAs.model, sentAs.provider) : undefined;
+    if (catalogEntry && required.some((capability) => !catalogEntryHasCapability(catalogEntry, capability))) {
+      ctx.onSkip?.(entry, 'missing_capability');
+      continue;
+    }
+    if (entry.origin === 'policy-default' && entry.group === 'uncensored') {
+      resolved.push({ ...entry, walkRole: uncensoredLegs < 2 ? 'standing' : 'refill' });
+      uncensoredLegs += 1;
+    } else {
+      resolved.push(entry);
+    }
+  }
+  return resolved;
+}
+
+/**
+ * Whether the walk runs `entry` now: a refill only while a standing leg is
+ * owed one, and none of the policy chain's Claude legs after a refusal.
+ *
+ * @internal
+ */
+export function gateFallbackEntry(
+  state: FallbackWalkState,
+  entry: ResolvedFallbackEntry,
+): { run: true; state: FallbackWalkState } | { run: false; reason: FallbackSkipReason } {
+  if (state.refusalSeen && entry.origin === 'policy-default' && isClaudeEntry(entry)) {
+    return { run: false, reason: 'claude_after_refusal' };
+  }
+  if (entry.walkRole === 'refill') {
+    if (state.refillsOwed < 1) return { run: false, reason: 'refill_not_owed' };
+    return { run: true, state: { ...state, refillsOwed: state.refillsOwed - 1 } };
+  }
+  return { run: true, state };
+}
+
+/**
+ * The walk's state after an attempt failed with `error`: a standing leg that
+ * failed for anything but a content decline (a timeout, an open breaker and
+ * the context check's refusal included) is owed a refill, and a model
+ * refusal (code `content_filter`; a filter's `content_policy_violation`
+ * does not count) is recorded for the rest of the walk.
+ *
+ * @internal
+ */
+export function advanceFallbackWalk(
+  state: FallbackWalkState,
+  role: 'standing' | 'refill' | undefined,
+  error: unknown,
+): FallbackWalkState {
+  const owed = role === 'standing' && !isContentPolicyRefusal(error) ? 1 : 0;
+  const refusal = (error as { code?: unknown } | null | undefined)?.code === 'content_filter';
+  return {
+    refillsOwed: state.refillsOwed + owed,
+    refusalSeen: state.refusalSeen || refusal,
+  };
+}
+
+/** The catalog the policy chain reads its ladders from. */
+const POLICY_CATALOG = createUncensoredModelCatalog();
+
+/** A catalog model never used as a fallback leg: too weak for a rescue reply. */
+const NEVER_A_LEG_MODEL = 'meta-llama/llama-3.1-8b-instruct';
+
+/**
+ * Build a policy-tier-aware fallback chain, for callers that pass
+ * `policyTier: 'mature' | 'private-adult'`: a refusal or an outage of the
+ * primary walks to an uncensored model before the availability legs.
+ *
+ * Mature and private-adult: the tier's catalog ladder
+ * (the catalog's `getFallbackLadder`; private-adult keeps the
+ * models that permit `erotic`) as OpenRouter legs in the `uncensored`
+ * group, llama-3.1-8b left out, then the {@link buildFallbackChain} suffix.
+ * Every entry is tagged `origin: 'policy-default'`, which lets the walk drop
+ * the leg naming the failed first model, keep two standing uncensored legs,
+ * and pass over Claude legs after a refusal. Safe, standard and an absent
+ * tier get {@link buildFallbackChain} unchanged and untagged.
+ *
+ * Each leg pins `cache: false`. A missing key drops its legs instead of
+ * throwing, so a partial deploy still gets a shorter usable chain.
+ *
+ * @param tier - The call's content tier.
+ * @param excludeProvider - Provider to leave out of the availability suffix
+ *   (typically the failed primary's). The ladder legs ignore it: another
+ *   model on the same provider is a valid rescue, and the walk drops the
+ *   exact failed model.
+ */
+export function buildPolicyAwareFallbackChain(
+  tier: 'safe' | 'standard' | 'mature' | 'private-adult' | undefined,
+  excludeProvider?: string,
+): FallbackProviderEntry[] {
+  if (tier !== 'mature' && tier !== 'private-adult') {
+    return buildFallbackChain(excludeProvider);
+  }
+
+  const chain: FallbackProviderEntry[] = [];
+  if (process.env.OPENROUTER_API_KEY) {
+    const ladder =
+      tier === 'private-adult'
+        ? POLICY_CATALOG.getFallbackLadder('private-adult', { contentIntent: 'erotic' })
+        : POLICY_CATALOG.getFallbackLadder('mature');
+    for (const entry of ladder) {
+      if (entry.modelId === NEVER_A_LEG_MODEL) continue;
+      chain.push({
+        provider: entry.providerId,
+        model: entry.modelId,
+        cache: false,
+        origin: 'policy-default',
+        group: 'uncensored',
+      });
+    }
+  }
+
+  for (const entry of buildFallbackChain(excludeProvider)) {
+    const listed = chain.some((e) => e.provider === entry.provider && e.model === entry.model);
+    if (!listed) chain.push({ ...entry, origin: 'policy-default' });
+  }
+  return chain;
+}
+
+function buildHelperToolExecutionContext(
+  source: 'generateText',
+  runId: string,
+  stepIndex: number,
+  correlationId?: string,
+): ToolExecutionContext {
+  return {
+    gmiId: `${source}:${runId}`,
+    personaId: `${source}:persona`,
+    userContext: {
+      userId: 'system',
+      source,
+    },
+    correlationId: correlationId ?? `${source}:tool:${stepIndex + 1}:${randomUUID()}`,
+    sessionData: {
+      sessionId: `${source}:${runId}`,
+      source,
+      stepIndex,
+    },
+  };
+}
+
+/**
+ * Stateless text generation with optional multi-step tool calling.
+ *
+ * Creates a temporary provider manager, executes one or more LLM completion
+ * steps (each tool-call round trip counts as one step), and returns the final
+ * assembled result.  Provider credentials are resolved from environment
+ * variables unless overridden in `opts`.
+ *
+ * When `planning` is enabled, an upfront LLM call produces a step-by-step plan
+ * that is then injected into the system prompt for the tool loop.
+ *
+ * @param opts - Generation options including model, prompt/messages, and optional tools.
+ * @returns A promise that resolves to the final text, token usage, tool call log, and finish reason.
+ *
+ * @example
+ * ```ts
+ * const result = await generateText({
+ *   provider: 'openai',
+ *   model: 'gpt-4o',
+ *   prompt: 'Summarise the history of the Roman Empire in two sentences.',
+ * });
+ * console.log(result.text);
+ * ```
+ */
+export async function generateText(opts: GenerateTextOptions): Promise<GenerateTextResult> {
+  // A call whose signal has already aborted is refused before anything is set up or sent.
+  opts.abortSignal?.throwIfAborted();
+  // One budget instance for the whole call: every options object built from
+  // `opts` below (a fallback hop, a continuation leg) carries it, so each hop
+  // is charged to the same budget.
+  const budget = asSpendBudget(opts.budget);
+  if (budget) opts = { ...opts, budget };
+  // Where this call's usage events read their account.
+  const usageAccount: LlmUsageAccountSource = { budget, accountIdOf: opts.accountIdOf };
+  const startedAt = Date.now();
+  // Root-of-call start for observer `durationMs`. On a provider-fallback the
+  // primary attempt fails and generateText recurses (below) targeting the
+  // fallback provider; the WINNING recursive call fires the single usage
+  // observer and returns straight up, so the outer call never fires its own.
+  // Without threading, that event's durationMs would time only the winning
+  // hop and hide the failed-primary wait — making a slow fallback turn read
+  // as fast, exactly the case a latency dashboard must surface. Inherit the
+  // outermost start (passed as the internal `__rootStartedAt`) so the fired
+  // durationMs is true end-to-end wall-clock. Internal-only; not part of the
+  // public GenerateTextOptions surface.
+  const rootStartedAt =
+    typeof opts.__rootStartedAt === 'number' ? opts.__rootStartedAt : startedAt;
+  let metricStatus: 'ok' | 'error' = 'ok';
+  let metricUsage: TokenUsage | undefined;
+  let metricProviderId: string | undefined;
+  /** The id this attempt's health is recorded under: see providerHealthKey. */
+  let healthProviderId: string | undefined;
+  let metricModelId: string | undefined;
+  // What this attempt did that a failover must not repeat. Written inside
+  // the span callback and read by the fallback walk below, so it lives on an
+  // object rather than in narrowed locals.
+  // What this attempt consumed, planning and completed steps included. It
+  // lives outside the span callback so a failed attempt still reports the
+  // tokens it was billed for.
+  const attemptUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const toolProgress: {
+    // Native tool rounds this attempt completed. A failover continues the
+    // conversation from them instead of restarting the call, which would
+    // run those tools a second time (a sent email, a write). Refreshed after
+    // every full round.
+    completedToolRounds?: CompletedToolRounds;
+    // Set once the prompt-tool shim runs a tool. The shim keeps its rounds
+    // to itself, so they cannot be continued, and such a call does not fail
+    // over.
+    shimRanTool: boolean;
+  } = { shimRanTool: false };
+  // The tool run this call's tool execution contexts belong to, and the
+  // step it starts at. A fallback leg that continues the call keeps both,
+  // so tools see one session across providers and steps keep counting.
+  const helperToolRunId = opts._continuation?.helperToolRunId ?? randomUUID();
+  const stepOffset = opts._continuation?.stepOffset ?? 0;
+  // A tool's error text as the call's mask leaves it (an agency seat's), one
+  // redacted string for the call record and the tool turn alike. Declared
+  // here so the prompt shim and the native tool loop both see it.
+  const maskToolText = (text: string): string => {
+    const masked = opts.__maskError?.(text);
+    return typeof masked === 'string' ? masked : text;
+  };
+  /**
+   * A tool's successful output as the next request carries it. Under an
+   * agency's call mask the listed values alone are replaced, so a URL the tool
+   * returns keeps its query and its credentials as the tool gave them; a bare
+   * mask is applied as it is. A failed tool's text takes the error mask.
+   */
+  const maskToolOutput = (text: string): string => (isCallMask(opts.__maskError) ? opts.__maskError.text(text) : maskToolText(text));
+  /**
+   * A tool's output as a value, masked before it is serialized: under an
+   * agency's call mask each string, and each number whose digits hold a listed
+   * value, is replaced, so a secret JSON escaping would change (one with a
+   * quote or a backslash) is masked whole, and the call record holds the
+   * masked output. A bare mask reads text only and leaves the value as it is.
+   */
+  const maskToolValue = (output: unknown): unknown => (isCallMask(opts.__maskError) ? opts.__maskError.strings(output, true) : output);
+  /** A masked turn as the request carries it: the JSON it still is, else (a replacement inside what a class wrote through toJSON) the masked text as a JSON string. */
+  const asJsonText = (sent: string, turn: string): string => {
+    if (sent === turn) return sent;
+    try {
+      JSON.parse(sent);
+      return sent;
+    } catch {
+      return JSON.stringify(sent);
+    }
+  };
+  /**
+   * A tool turn's JSON: the output's, else `absent`'s, for an output that is
+   * absent or that JSON leaves out (a function, a symbol, a toJSON that
+   * returns nothing). A tool that succeeded with such an output is sent as one
+   * that returned nothing, never as a failure. When the mask made a copy of
+   * the output, `returned` (the output as the tool gave it) is written first:
+   * the copy reads a getter that throws as undefined, so an output no
+   * serializer can write (such a getter, a toJSON that throws) fails the tool
+   * here as it does without a mask.
+   */
+  const toolTurnJson = (output: unknown, absent: unknown, returned: unknown = output): string => {
+    if (returned !== output && returned != null) JSON.stringify(returned);
+    return (output == null ? undefined : (JSON.stringify(output) as string | undefined)) ?? (JSON.stringify(absent) as string | undefined) ?? '""';
+  };
+
+  try {
+    const successResult: GenerateTextResult = await withAgentOSSpan('agentos.api.generate_text', async (span) => {
+      let { providerId, modelId } = resolveModelOption(opts, 'text');
+      // The provider the call's own key and base URL are for. A router that
+      // moves the call to another provider sends it there on that provider's
+      // own credentials, as a fallback leg runs.
+      const credentialProviderId = providerId;
+      // The call's own model: with that provider, the pair a caller's
+      // structured-output payload (`_responseFormat`) is built for.
+      const ownModelId = modelId;
+
+      // --- Model routing (optional) ---
+      if (opts.router) {
+        try {
+          const toolNames = opts.tools
+            ? (Array.isArray(opts.tools)
+                ? opts.tools
+               : [...((opts.tools as any).values?.() ?? [])]
+              )
+                .map((t: any) => t.name ?? t.function?.name)
+                .filter(Boolean) as string[]
+           : [];
+          const hostPolicyRouteParams = hostPolicyToRouteParams(opts.hostPolicy);
+          const requiredCapabilities = mergeRequiredCapabilities(
+            hostPolicyRouteParams.requiredCapabilities,
+            opts.routerParams?.requiredCapabilities,
+            toolNames.length > 0 ? ['function_calling']: undefined,
+          );
+          const routeParams: ModelRouteParams = {
+            taskHint:
+              opts.routerParams?.taskHint ?? (typeof opts.system === 'string' ? opts.system: undefined) ?? opts.prompt ?? '',
+            ...hostPolicyRouteParams,
+            ...opts.routerParams,
+            optimizationPreference:
+              opts.routerParams?.optimizationPreference
+              ?? hostPolicyRouteParams.optimizationPreference
+              ?? 'balanced',
+            requiredCapabilities,
+            preferredProviderIds:
+              opts.routerParams?.preferredProviderIds
+              ?? hostPolicyRouteParams.preferredProviderIds,
+            policyTier:
+              opts.routerParams?.policyTier
+              ?? opts.policyTier
+              ?? hostPolicyRouteParams.policyTier,
+          };
+          const routeResult = await opts.router.selectModel(
+            routeParams,
+            undefined,
+          );
+          if (routeResult) {
+            providerId =
+              routeResult.modelInfo?.providerId ?? providerId;
+            modelId = routeResult.modelId;
+          }
+        } catch (routerErr) {
+          console.warn(
+            '[agentos] Model router error, falling back to standard resolution:',
+            routerErr,
+          );
+        }
+      }
+
+      // A blank baseUrl counts here and changes nothing: resolveProvider drops it, so the record is the provider's own.
+      const ownCredentials =
+        providerId === credentialProviderId && (opts.apiKey !== undefined || opts.baseUrl !== undefined);
+      // An agency seat resolves strictly: no provider-less default, no reroute.
+      // A call a router moved to another provider takes none of its own key
+      // and URL there, and only a seat's call carries the strict flag.
+      const strict = opts.__strictCredentials === true;
+      const resolved = resolveProvider(
+        providerId,
+        modelId,
+        providerId === credentialProviderId
+          ? { apiKey: opts.apiKey, baseUrl: opts.baseUrl, strict }
+          : strict
+            ? { strict }
+            : undefined,
+      );
+      metricProviderId = resolved.providerId;
+      metricModelId = resolved.modelId;
+
+      // The structured-output payload this call sends. The caller built
+      // `_responseFormat` for the call's own provider and model. A call the
+      // router moved to another provider or model, and a call the resolver
+      // sends to another provider than the one it names (an Anthropic call
+      // with no Anthropic key or base URL goes to OpenRouter), is sent the
+      // payload of the provider and model it resolved to, rebuilt with the
+      // caller's builder as each fallback leg's is: that provider drops a
+      // payload shaped for another (OpenRouter forwards only json_object and
+      // json_schema), while such a payload would still count below as carrying
+      // the schema and keep the schema instructions out of the prompt. A call
+      // sent to its own provider and model, and a call with no builder, sends
+      // the caller's payload as it is.
+      const movedByRouter = providerId !== credentialProviderId || modelId !== ownModelId;
+      const sentToAnotherProvider = resolved.providerId !== providerId;
+      const responseFormat: GenerateTextOptions['_responseFormat'] =
+        (movedByRouter || sentToAnotherProvider) && typeof opts._responseFormatBuilder === 'function'
+          ? safeBuildLegResponseFormat(opts._responseFormatBuilder, resolved.providerId, resolved.modelId, routingLogger)
+          : opts._responseFormat;
+
+      // A key or base URL of the call's own, when it differs from the
+      // provider's, has a health record of its own. So do the credentials a
+      // seat's strict resolution reaches when they differ from the provider's:
+      // a default that names no provider serves the provider's other callers
+      // and never a seat. The provider's are read quietly: that lookup sends
+      // nothing, to OpenRouter or anywhere else.
+      const healthId = providerHealthKey(
+        resolved,
+        ownCredentials || strict ? () => resolveProvider(providerId, modelId, { quiet: true }) : undefined,
+      );
+      healthProviderId = healthId;
+
+      // ── Provider health circuit-breaker ──────────────────────────────
+      // If the resolved primary has tripped its breaker (e.g. a recent
+      // 402 / 401), skip the network call entirely and let the catch
+      // block route us into the fallback chain. The synthetic 503-coded
+      // error matches `isRetryableError`'s retryable-status list and
+      // flows through `fallback_fired` like any other transient
+      // failure: but with zero network latency. See
+      // {@link LLMProviderHealthRegistry} for the policy that decides
+      // when a provider is considered open. This check runs BEFORE
+      // `createProviderManager` so we don't spend the SDK init cost
+      // on a known-bad provider either.
+      if (globalLLMProviderHealth.isOpen(healthId)) {
+        const stats = globalLLMProviderHealth.getStats(healthId);
+        throw new LLMProviderCircuitOpenError(
+          resolved.providerId,
+          stats?.cooldownRemainingMs ?? 0,
+        );
+      }
+
+      const manager = await createProviderManager(resolved);
+      const provider = manager.getProvider(resolved.providerId);
+      if (!provider) throw new Error(`Provider ${resolved.providerId} not available.`);
+
+      span?.setAttribute('llm.provider', resolved.providerId);
+      span?.setAttribute('llm.model', resolved.modelId);
+
+      let tools = adaptTools(opts.tools);
+      // The names the table held when it was last adapted.
+      let adaptedNames = toolInputNames(opts.tools);
+      let toolMap = new Map<string, ITool>();
+      for (const t of tools) toolMap.set(t.name, t);
+
+      // Build messages
+      const messages: Array<Record<string, unknown>> = [];
+
+      // --- Chain-of-thought injection ---
+      // When CoT is enabled and tools are provided, prepend a reasoning
+      // instruction to the system prompt so the model explicitly reasons
+      // before selecting a tool or composing a response.
+      const cotInstruction = resolveChainOfThought(opts.chainOfThought);
+      const hasTools = tools.length > 0;
+
+      if (typeof opts.system === 'string' || !opts.system) {
+        // Plain string system prompt (existing behavior)
+        if (cotInstruction && hasTools) {
+          const systemContent = opts.system
+            ? `${cotInstruction}\n\n${opts.system}`
+           : cotInstruction;
+          messages.push({ role: 'system', content: systemContent });
+        } else if (opts.system) {
+          messages.push({ role: 'system', content: opts.system });
+        }
+      } else {
+        // Structured SystemContentBlock[]: convert to content parts with cache_control
+        const blocks = opts.system as SystemContentBlock[];
+        const parts = blocks.map(block => ({
+          type: 'text' as const,
+          text: block.text,
+          ...(block.cacheBreakpoint
+            ? { cache_control: { type: 'ephemeral' as const, ...(block.cacheTtl === '1h' ? { ttl: '1h' as const } : {}) } }
+            : {}),
+        }));
+
+        // Prepend CoT instruction as the first non-cached block if needed
+        if (cotInstruction && hasTools) {
+          parts.unshift({ type: 'text' as const, text: cotInstruction });
+        }
+
+        messages.push({ role: 'system', content: parts });
+      }
+
+      // A structured call whose payload carries no schema sends it after the
+      // system prompt, so the model sees what it has to answer in.
+      if (opts._schemaInstruction && !responseFormatCarriesSchema(responseFormat as Record<string, unknown> | undefined)) {
+        messages.push({ role: 'system', content: opts._schemaInstruction });
+      }
+
+      // Everything above is built from opts (system prompt, chain-of-thought
+      // instruction, schema instructions); a failover continuation rebuilds
+      // it, so it is left out of the conversation a continuation carries.
+      const generatedSystemCount = messages.length;
+      if (opts.messages) {
+        // Session history replays through here, so keep the tool pairing
+        // and thinking fields (see toProviderReplayMessage).
+        for (const m of opts.messages) messages.push(toProviderReplayMessage(m));
+      }
+      // Transcript delta capture (sessions, spec 2026-07-20 §1b): everything
+      // from here on is THIS call's contribution. Callers that carry their
+      // new user turn inside opts.messages mark how many trailing caller
+      // messages belong to the delta.
+      let transcriptDeltaStart =
+        messages.length - (opts._transcriptIncludeTrailingCallerMessages ?? 0);
+      // Caller history (its system messages included) that precedes this
+      // call's contribution.
+      const callerHistoryCount = Math.max(0, transcriptDeltaStart - generatedSystemCount);
+      // The plan's system message, when planning adds one; a continuation
+      // leaves it out (the fallback plans again if planning is on).
+      let planMessage: Record<string, unknown> | undefined;
+      if (opts.prompt) messages.push({ role: 'user', content: opts.prompt });
+
+      span?.setAttribute('agentos.api.tool_count', tools.length);
+
+      const toolSchemasOf = (list: ITool[]) =>
+        list.length > 0
+          ? list.map((t) => ({
+              type: 'function' as const,
+              function: { name: t.name, description: t.description, parameters: t.inputSchema },
+            }))
+         : undefined;
+      let toolSchemas = toolSchemasOf(tools);
+      // A table that grew since the call started is read again before a later
+      // step: a hierarchical manager's spawn_specialist writes delegate_to_<role>
+      // into the table the manager was given, and the manager's next step
+      // sends the new tool and runs it when the model calls it. The names are
+      // read first, which converts no schema: a table whose names are
+      // unchanged keeps the tools of the first read and is not adapted again,
+      // and a table given as a single-use iterable (a generator), which the
+      // first read exhausted, is not read again.
+      const reusableTools = !isSingleUseToolInput(opts.tools);
+      const refreshTools = (): void => {
+        if (!reusableTools) return;
+        const names = toolInputNames(opts.tools);
+        if (names.length === adaptedNames.length && names.every((name, i) => name === adaptedNames[i])) return;
+        adaptedNames = names;
+        const current = adaptTools(opts.tools);
+        if (current.length === tools.length && current.every((t, i) => t.name === tools[i].name)) return;
+        tools = current;
+        toolMap = new Map(current.map((t) => [t.name, t]));
+        toolSchemas = toolSchemasOf(current);
+      };
+
+      // A catalog model is sent only a request it can hold: otherwise the
+      // call throws in place of the send and the walk moves on. Checked on
+      // the first native send and on the prompt shim's first send.
+      const assertFitsContextWindow = (sent: { messages: ReadonlyArray<unknown>; tools?: unknown }): void => {
+        const fit = checkContextFit({
+          provider: resolved.providerId,
+          model: resolved.modelId,
+          messages: sent.messages,
+          tools: sent.tools,
+          maxTokens: opts.maxTokens,
+          customModelParams: opts.customModelParams,
+        });
+        if (!fit.fits && fit.contextWindow !== undefined) {
+          throw new ContextWindowExceededError({
+            provider: resolved.providerId,
+            model: resolved.modelId,
+            contextWindow: fit.contextWindow,
+            estimatedInputTokens: fit.estimatedInputTokens,
+            outputTokens: fit.outputTokens,
+          });
+        }
+      };
+
+      const allToolCalls: ToolCallRecord[] = [];
+      const totalUsage = attemptUsage;
+      // Provider-reported model id of the final step (spec batch-1 C1);
+      // additive — the public `model` field keeps the resolved requested id.
+      let lastResponseModelId: string | undefined;
+      // Provider-reported service tier of the final step (spec batch-1 C2).
+      let lastServiceTier: string | undefined;
+      const maxSteps = opts.maxSteps ?? 1;
+      span?.setAttribute('agentos.api.max_steps', maxSteps);
+
+      // -----------------------------------------------------------------
+      // Planning phase (optional)
+      // When `opts.planning` is truthy, make one LLM call to decompose the
+      // task into a numbered step list.  The plan is injected into the
+      // message array as a system message so the tool loop is plan-aware.
+      // -----------------------------------------------------------------
+      let resolvedPlan: Plan | undefined;
+      const planningEnabled = !!opts.planning;
+      span?.setAttribute('agentos.api.planning_enabled', planningEnabled);
+
+      if (planningEnabled) {
+        const planConfig = typeof opts.planning === 'object' ? opts.planning: undefined;
+
+        // Collect only user-role messages for the planner
+        const userMessages = messages.filter((m) => m.role === 'user');
+        const toolNames = tools.map((t) => t.name);
+
+        resolvedPlan = await createPlan(
+          provider,
+          resolved.modelId,
+          userMessages,
+          toolNames,
+          // Thread the caller's per-call requestTimeout + cache control into
+          // the planning completion (planning-specific overrides win), and the
+          // call's abort signal.
+          {
+            ...planConfig,
+            requestTimeout: planConfig?.requestTimeout ?? opts.requestTimeout,
+            ...(planConfig?.cache !== undefined || opts.cache !== undefined
+              ? { cache: planConfig?.cache ?? opts.cache }
+              : {}),
+            ...(planConfig?.thinking === false || opts.thinking === false ? { thinking: false as const } : {}),
+            ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+            ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+            ...(opts.onAttempt ? { onAttempt: opts.onAttempt } : {}),
+            ...(opts.customModelParams !== undefined ? { customModelParams: opts.customModelParams } : {}),
+          },
+          totalUsage,
+          budget ? { budget, providerId: resolved.providerId, what: 'generate_text.plan' } : undefined,
+        );
+
+        if (resolvedPlan) {
+          // Inject the plan as a system message right after any existing
+          // system messages so the tool loop executes plan-aware.
+          const planPrompt = formatPlanForPrompt(resolvedPlan);
+          const firstNonSystem = messages.findIndex((m) => m.role !== 'system');
+          const insertIdx = firstNonSystem === -1 ? messages.length: firstNonSystem;
+          planMessage = { role: 'system', content: planPrompt };
+          messages.splice(insertIdx, 0, planMessage);
+          // The plan lands ahead of this call's transcript delta; keep the
+          // delta starting at the same message.
+          if (insertIdx <= transcriptDeltaStart) transcriptDeltaStart += 1;
+          span?.setAttribute('agentos.api.plan_steps', resolvedPlan.steps.length);
+        }
+      }
+
+      // --- Prompt-based tool-calling shim (toolMode) ---
+      // For models without native tool-use, render tool schemas into the
+      // prompt and parse <tool_call> blocks out of the model's text. 'prompt'
+      // forces it up front; 'auto' tries native first and falls back on the
+      // provider's tool-unsupported error (see the catch after the loop).
+      const toolMode: ToolMode = opts.toolMode ?? 'auto';
+      const shimMaxRoundtrips = opts.maxSteps ?? 5;
+      let shimSendChecked = false;
+      const runShim = async (): Promise<GenerateTextResult> => {
+        const loopResult = await runEmulatedToolLoop({
+          tools: Array.from(toolMap.values()),
+          // The table is read again before each later round, as on the native
+          // loop, so a tool added mid-call (a spawned specialist's delegate
+          // tool) is listed and runs.
+          currentTools: () => {
+            refreshTools();
+            return Array.from(toolMap.values());
+          },
+          onToolExecute: () => {
+            toolProgress.shimRanTool = true;
+          },
+          // The hook, then the approval gate, before each parsed call runs,
+          // as on the native loop below.
+          onBeforeToolExecution: opts.onBeforeToolExecution,
+          hookErrors: opts.hookErrors,
+          approvalGate: opts.__approvalGate,
+          // A seat's mask reaches the shim's tool errors too, and a successful
+          // output passes the listed values alone.
+          maskToolError: opts.__maskError ? maskToolText : undefined,
+          maskToolOutput: opts.__maskError ? maskToolOutput : undefined,
+          maskToolValue: opts.__maskError ? maskToolValue : undefined,
+          // Native tool turns (session history, a failover continuation)
+          // become the shim's own <tool_call> / <tool_response> text.
+          messages: toShimMessages(messages),
+          maxRoundtrips: shimMaxRoundtrips,
+          callModel: async (msgs) => {
+            // No round starts once the caller's signal has aborted.
+            opts.abortSignal?.throwIfAborted();
+            // The shim sends rendered tool text in place of native schemas,
+            // so its first send is checked on its own.
+            if (!shimSendChecked) {
+              shimSendChecked = true;
+              assertFitsContextWindow({ messages: msgs });
+            }
+            const shimCall: HelperCall = { what: 'generate_text.shim', route: resolved, messages: msgs, maxTokens: opts.maxTokens, options: opts, onAttempt: opts.onAttempt, abortSignal: opts.abortSignal };
+            const r = await withReservation(budget, shimCall, (held) => provider.generateCompletion(resolved.modelId, msgs as any, {
+              temperature: opts.temperature,
+              ...(opts.topP !== undefined ? { topP: opts.topP } : {}),
+              ...(opts.frequencyPenalty !== undefined ? { frequencyPenalty: opts.frequencyPenalty } : {}),
+              ...(opts.presencePenalty !== undefined ? { presencePenalty: opts.presencePenalty } : {}),
+              maxTokens: opts.maxTokens,
+              // Forward the extended-thinking budget on the shim path too so
+              // thinking-capable models stay consistent across tool modes;
+              // the provider decides applicability. Omitted = thinking off.
+              ...(opts.thinking !== undefined ? { thinking: opts.thinking } : {}),
+              // Forward reasoning effort the same way; provider drops it on
+              // unsupported models/values.
+              ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
+              // Forward per-call cache control (opt-out / 1h TTL) so the
+              // shim path honors it like the native step loop below.
+              ...(opts.cache !== undefined ? { cache: opts.cache } : {}),
+              // Per-conversation affinity key (OpenRouter session_id sticky
+              // routing; other providers ignore it).
+              ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+              ...(opts.promptCacheKey !== undefined ? { promptCacheKey: opts.promptCacheKey } : {}),
+              ...(opts.promptCacheKey === 'auto' && (opts.sessionId ?? opts.usageLedger?.sessionId) !== undefined
+                ? { promptCacheSessionId: (opts.sessionId ?? opts.usageLedger?.sessionId) as string }
+                : {}),
+              ...(opts.promptCacheRetention !== undefined ? { promptCacheRetention: opts.promptCacheRetention } : {}),
+              ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
+              // Forward provider-specific top-level payload params (e.g.
+              // OpenRouter provider-routing preferences) on the shim path too.
+              ...(opts.customModelParams !== undefined
+                ? { customModelParams: opts.customModelParams }
+                : {}),
+              // Forward per-call requestTimeout so the prompt-tool-calling shim
+              // (toolMode:'prompt') honors the caller's timeout like the native
+              // step loop already does. Without it, a stalled provider call on
+              // this path hangs until the provider's own default, silently
+              // ignoring the caller's requestTimeout bound.
+              ...(opts.requestTimeout !== undefined ? { requestTimeout: opts.requestTimeout } : {}),
+              ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+              // The call's attempt count and its report, as on the native step loop below.
+              ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+              ...held,
+            } as any));
+            budget?.record(costOfUsageUSD(resolved.providerId, resolved.modelId, r.usage), r.usage?.totalTokens ?? 0, 'generate_text.shim');
+            // Aggregate the COMPLETE normalized usage from every shim
+            // roundtrip (spec batch-1 review fold) as each call returns, so
+            // an attempt that fails on a later round still reports what its
+            // earlier rounds consumed. The loop's own {totalTokens} sum is
+            // left unused, or it would count twice.
+            if (r.usage) {
+              if (typeof r.usage.totalTokens === 'number') totalUsage.totalTokens += r.usage.totalTokens;
+              if (typeof r.usage.promptTokens === 'number') totalUsage.promptTokens += r.usage.promptTokens;
+              if (typeof r.usage.completionTokens === 'number') totalUsage.completionTokens += r.usage.completionTokens;
+              if (typeof r.usage.costUSD === 'number') totalUsage.costUSD = (totalUsage.costUSD ?? 0) + r.usage.costUSD;
+              if (typeof r.usage.cacheReadInputTokens === 'number') {
+                totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + r.usage.cacheReadInputTokens;
+              }
+              if (typeof r.usage.cacheCreationInputTokens === 'number') {
+                totalUsage.cacheCreationTokens = (totalUsage.cacheCreationTokens ?? 0) + r.usage.cacheCreationInputTokens;
+              }
+              if (typeof r.usage.cacheCreationExtendedInputTokens === 'number') {
+                totalUsage.cacheCreationExtendedTokens = (totalUsage.cacheCreationExtendedTokens ?? 0) + r.usage.cacheCreationExtendedInputTokens;
+              }
+              if (typeof r.usage.inclusiveInputTokens === 'number') {
+                totalUsage.inclusiveInputTokens = (totalUsage.inclusiveInputTokens ?? 0) + r.usage.inclusiveInputTokens;
+              }
+            }
+            if (typeof r.modelId === 'string' && r.modelId) lastResponseModelId = r.modelId;
+            if (typeof r.serviceTier === 'string' && r.serviceTier) lastServiceTier = r.serviceTier;
+            // A request whose provider did not read the signal ran to its end:
+            // its usage is counted above, and the call stops here.
+            opts.abortSignal?.throwIfAborted();
+            const cc = r.choices?.[0]?.message?.content;
+            return {
+              text: typeof cc === 'string' ? cc : ((cc as any)?.text ?? ''),
+              usage: { totalTokens: r.usage?.totalTokens ?? 0 },
+            };
+          },
+        });
+        // An abort during the shim's last tool round ends the call here, once
+        // the round has run, instead of returning the round as the result.
+        opts.abortSignal?.throwIfAborted();
+        const shimUsage: TokenUsage = { ...totalUsage };
+        metricUsage = shimUsage;
+        // Dual-emit the same root-span attribute pairs as the native
+        // terminals below — the shim early-return is a first-class chat
+        // terminal, not a bypass (spec batch-1 residual).
+        span?.setAttribute('agentos.api.finish_reason', loopResult.finishReason);
+        span?.setAttribute('agentos.api.tool_calls', loopResult.toolCalls.length);
+        attachUsageAttributes(span, shimUsage);
+        attachGenAiAttributes(span, { providerName: resolved.providerId, operationName: 'chat', requestModel: resolved.modelId, responseModel: lastResponseModelId, usage: shimUsage, ...(opts.serviceTier !== undefined ? { requestServiceTier: opts.serviceTier } : {}), ...(lastServiceTier !== undefined ? { responseServiceTier: lastServiceTier } : {}) });
+        fireLlmUsageObserver({
+          provider: resolved.providerId,
+          model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+          usage: shimUsage,
+          source: opts.source,
+          ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+          finishReason: loopResult.finishReason,
+          surface: 'generateText',
+          durationMs: Date.now() - rootStartedAt,
+        }, usageAccount);
+        // The shim's final assistant text lives in loopResult, never on the
+        // messages array — push it so the transcript delta ends on the reply.
+        messages.push({ role: 'assistant', content: loopResult.text });
+        return {
+          transcriptDelta: messages.slice(transcriptDeltaStart) as unknown as SessionTranscriptMessage[],
+          provider: resolved.providerId,
+          model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+          ...(lastServiceTier !== undefined ? { serviceTier: lastServiceTier } : {}),
+          text: loopResult.text,
+          usage: shimUsage,
+          toolCalls: loopResult.toolCalls.map((c) => ({
+            name: c.name,
+            args: c.args,
+            ...(c.error ? { error: c.error } : {}),
+          })) as ToolCallRecord[],
+          finishReason: loopResult.finishReason,
+          plan: resolvedPlan,
+        };
+      };
+      const toolUnsupportedErr = (e: unknown): boolean =>
+        e instanceof Error &&
+        /support tool use|does not support (tools|function)|no endpoints found that support/i.test(e.message);
+      if (tools.length > 0 && toolMode === 'prompt') {
+        return await runShim();
+      }
+
+      // Serving-host attribution from the most recent step's completion
+      // (aggregators like OpenRouter report which upstream host served the
+      // call). Carried onto the result so callers can attribute latency.
+      let lastServingProvider: string | undefined;
+      // Cache-diagnostics threading (opts.cacheDiagnostics): each step passes
+      // the PREVIOUS step's provider message id so the API can compare the two
+      // requests and report where the cached prefix diverged. The object
+      // form seeds the FIRST step with the caller's prior-request message id
+      // (cross-request threading); `true` seeds null (opt-in, nothing to
+      // compare yet) — in-call threading only.
+      let lastProviderMessageId: string | null =
+        typeof opts.cacheDiagnostics === 'object' && opts.cacheDiagnostics !== null
+          ? (opts.cacheDiagnostics.previousMessageId ?? null)
+          : null;
+      let lastCacheDiagnostics: CacheDiagnostics | null | undefined;
+      try {
+      for (let step = 0; step < maxSteps; step++) {
+        // No step starts once the caller's signal has aborted.
+        opts.abortSignal?.throwIfAborted();
+        if (step > 0) refreshTools();
+        // The step's index in the whole call: a fallback leg that continues
+        // after completed tool rounds numbers on from them.
+        const runStep = stepOffset + step;
+        // --- onBeforeGeneration hook ---
+        let effectiveMessages = messages;
+        if (opts.onBeforeGeneration) {
+          try {
+            const hookCtx: GenerationHookContext = {
+              messages: [...messages] as any,
+              system: opts.system,
+              tools: Array.from(toolMap.values()),
+              model: resolved.modelId,
+              provider: resolved.providerId,
+              step: runStep,
+              prompt: opts.prompt ?? opts._continuation?.prompt,
+            };
+            const modified = await opts.onBeforeGeneration(hookCtx);
+            if (modified) {
+              effectiveMessages = modified.messages as any;
+            }
+          } catch (hookErr) {
+            if (opts.hookErrors === 'throw') throw markHookStop(hookErr);
+            console.warn('[agentos] onBeforeGeneration hook error:', hookErr);
+          }
+        }
+
+        // A continuation leg's first send carries its completed tool rounds.
+        // Later steps are not checked again.
+        if (step === 0) assertFitsContextWindow({ messages: effectiveMessages, tools: toolSchemas });
+        // Checked against the budget before it is sent; a budget with a meter reserves the step and settles it.
+        const stepHold = await holdCall(budget, {
+          what: 'generate_text.step',
+          route: resolved,
+          messages: effectiveMessages,
+          tools: toolSchemas,
+          maxTokens: opts.maxTokens,
+          options: { ...opts, responseFormat },
+          onAttempt: opts.onAttempt,
+          abortSignal: opts.abortSignal,
+        });
+
+        const response = await stepHold.run(() => withAgentOSSpan(
+          'agentos.api.generate_text.step',
+          async (stepSpan) => {
+            stepSpan?.setAttribute('llm.provider', resolved.providerId);
+            stepSpan?.setAttribute('llm.model', resolved.modelId);
+            stepSpan?.setAttribute('agentos.api.step', runStep + 1);
+            stepSpan?.setAttribute('agentos.api.tool_count', tools.length);
+
+            const stepResponse = await provider.generateCompletion(
+              resolved.modelId,
+              effectiveMessages as any,
+              {
+                tools: toolSchemas,
+                temperature: opts.temperature,
+                ...(opts.topP !== undefined ? { topP: opts.topP } : {}),
+                ...(opts.frequencyPenalty !== undefined ? { frequencyPenalty: opts.frequencyPenalty } : {}),
+                ...(opts.presencePenalty !== undefined ? { presencePenalty: opts.presencePenalty } : {}),
+                maxTokens: opts.maxTokens,
+                // Forward the extended-thinking switch so thinking-capable
+                // models (Opus 4.7/4.8) emit reasoning blocks; the provider's
+                // resolveThinkingPayload decides applicability and emits the
+                // adaptive form. Omitted callers keep the default (thinking off).
+                ...(opts.thinking !== undefined ? { thinking: opts.thinking } : {}),
+                // Forward reasoning effort (output_config.effort) the same way;
+                // the provider drops it on unsupported models/values.
+                ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
+                // Forward per-call cache control: `false` = zero cache_control
+                // on the wire (true one-shots); `{ ttl: '1h' }` = 1h TTL on
+                // the auto markers incl. the moving message-tail (slow loops).
+                ...(opts.cache !== undefined ? { cache: opts.cache } : {}),
+                // Per-conversation affinity key (OpenRouter session_id sticky
+                // routing; other providers ignore it).
+                ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+              ...(opts.promptCacheKey !== undefined ? { promptCacheKey: opts.promptCacheKey } : {}),
+              ...(opts.promptCacheKey === 'auto' && (opts.sessionId ?? opts.usageLedger?.sessionId) !== undefined
+                ? { promptCacheSessionId: (opts.sessionId ?? opts.usageLedger?.sessionId) as string }
+                : {}),
+              ...(opts.promptCacheRetention !== undefined ? { promptCacheRetention: opts.promptCacheRetention } : {}),
+              ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
+                // Cache diagnostics: thread the previous step's message id so
+                // the API explains any prefix divergence between loop steps.
+                ...(opts.cacheDiagnostics
+                  ? { cacheDiagnostics: { previousMessageId: lastProviderMessageId } }
+                  : {}),
+                // Forward provider-specific top-level payload params (e.g.
+                // OpenRouter provider-routing preferences); providers spread
+                // them onto the request body.
+                ...(opts.customModelParams !== undefined
+                  ? { customModelParams: opts.customModelParams }
+                  : {}),
+                // Forward caller toolChoice so orchestrators can force tool_use
+                // (e.g. ai-codegen); models narrate under tool_choice: 'auto'.
+                ...(opts.toolChoice !== undefined ? { toolChoice: opts.toolChoice } : {}),
+                // Forward per-call requestTimeout so large-output callers
+                // (e.g. codegen structured output) get a longer abort window
+                // than the provider default; omitted callers keep the default.
+                ...(opts.requestTimeout !== undefined ? { requestTimeout: opts.requestTimeout } : {}),
+                // The caller's signal cancels the request in flight.
+                ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+                // The most requests this step sends and the report of each, so a caller can settle the attempts it paid for.
+                ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+                ...stepHold.providerOptions,
+                ...(responseFormat ? { responseFormat }: {}),
+              } as any
+            );
+            attachUsageAttributes(stepSpan, {
+              promptTokens: stepResponse.usage?.promptTokens,
+              completionTokens: stepResponse.usage?.completionTokens,
+              totalTokens: stepResponse.usage?.totalTokens,
+              costUSD: stepResponse.usage?.costUSD,
+            });
+            // Per-step GenAI semconv attrs (queue item: step-span wiring).
+            // ModelUsage's cache fields are the *InputTokens spellings —
+            // mapped here onto the ApiUsageLike names the helper reads.
+            attachGenAiAttributes(stepSpan, {
+              providerName: resolved.providerId,
+              operationName: 'chat',
+              requestModel: resolved.modelId,
+              ...(typeof stepResponse.modelId === 'string' && stepResponse.modelId
+                ? { responseModel: stepResponse.modelId }
+                : {}),
+              ...(opts.serviceTier !== undefined ? { requestServiceTier: opts.serviceTier } : {}),
+              ...(typeof stepResponse.serviceTier === 'string'
+                ? { responseServiceTier: stepResponse.serviceTier }
+                : {}),
+              usage: {
+                promptTokens: stepResponse.usage?.promptTokens,
+                completionTokens: stepResponse.usage?.completionTokens,
+                inclusiveInputTokens: stepResponse.usage?.inclusiveInputTokens,
+                cacheReadTokens: stepResponse.usage?.cacheReadInputTokens,
+                cacheCreationTokens: stepResponse.usage?.cacheCreationInputTokens,
+              },
+            });
+            return stepResponse;
+          }
+        ));
+
+        if (typeof response.servingProvider === 'string' && response.servingProvider.length > 0) {
+          lastServingProvider = response.servingProvider;
+        }
+        if (typeof response.modelId === 'string' && response.modelId) {
+          lastResponseModelId = response.modelId;
+        }
+        if (typeof response.serviceTier === 'string' && response.serviceTier) {
+          lastServiceTier = response.serviceTier;
+        }
+        if (opts.cacheDiagnostics) {
+          // Chain the id for the NEXT step's comparison; keep this step's
+          // verdict for the hook + final result.
+          lastProviderMessageId = typeof response.id === 'string' && response.id ? response.id : null;
+          lastCacheDiagnostics = response.cacheDiagnostics;
+        }
+        budget?.record(
+          costOfUsageUSD(resolved.providerId, resolved.modelId, response.usage),
+          response.usage?.totalTokens ?? 0,
+          'generate_text.step',
+        );
+        if (response.usage) {
+          totalUsage.promptTokens += response.usage.promptTokens ?? 0;
+          totalUsage.completionTokens += response.usage.completionTokens ?? 0;
+          totalUsage.totalTokens += response.usage.totalTokens ?? 0;
+          if (typeof response.usage.costUSD === 'number') {
+            totalUsage.costUSD = (totalUsage.costUSD ?? 0) + response.usage.costUSD;
+          }
+          // Plumb prompt-cache metrics through so generateText() callers
+          // can measure cache hit rate. Provider-layer ModelUsage carries
+          // these fields; TokenUsage was dropping them.
+          const cacheRead = (response.usage as { cacheReadInputTokens?: number }).cacheReadInputTokens;
+          const cacheCreate = (response.usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens;
+          // typeof-only guards: a REPORTED zero is meaningful (cache miss on
+          // a cache-capable call) and must be preserved, not dropped.
+          if (typeof cacheRead === 'number') {
+            totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + cacheRead;
+          }
+          if (typeof cacheCreate === 'number') {
+            totalUsage.cacheCreationTokens = (totalUsage.cacheCreationTokens ?? 0) + cacheCreate;
+          }
+          const stepCacheCreateExtended = (response.usage as { cacheCreationExtendedInputTokens?: number }).cacheCreationExtendedInputTokens;
+          if (typeof stepCacheCreateExtended === 'number') {
+            totalUsage.cacheCreationExtendedTokens = (totalUsage.cacheCreationExtendedTokens ?? 0) + stepCacheCreateExtended;
+          }
+          const stepInclusiveIn = (response.usage as { inclusiveInputTokens?: number }).inclusiveInputTokens;
+          if (typeof stepInclusiveIn === 'number') {
+            totalUsage.inclusiveInputTokens = (totalUsage.inclusiveInputTokens ?? 0) + stepInclusiveIn;
+          }
+        }
+        // A request whose provider did not read the signal ran to its end: its
+        // usage is counted above, and the call stops here.
+        opts.abortSignal?.throwIfAborted();
+
+        const choice = response.choices?.[0];
+        if (!choice) break;
+
+        const content = choice.message?.content;
+        let textContent = typeof content === 'string' ? content: ((content as any)?.text ?? '');
+        let toolCallsInChoice = resolveDynamicToolCalls(choice.message?.tool_calls, {
+          text: textContent,
+          step: runStep,
+          toolsAvailable: tools.length > 0,
+        });
+
+        // --- onAfterGeneration hook ---
+        if (opts.onAfterGeneration) {
+          try {
+            const stepUsage: TokenUsage = {
+              promptTokens: response.usage?.promptTokens ?? 0,
+              completionTokens: response.usage?.completionTokens ?? 0,
+              totalTokens: response.usage?.totalTokens ?? 0,
+              costUSD: response.usage?.costUSD,
+              cacheReadTokens: (response.usage as { cacheReadInputTokens?: number } | undefined)?.cacheReadInputTokens,
+              cacheCreationTokens: (response.usage as { cacheCreationInputTokens?: number } | undefined)?.cacheCreationInputTokens,
+            };
+            const toolCallRecords: ToolCallRecord[] = toolCallsInChoice.map((tc: any) => ({
+              name: (tc as any).function?.name ?? (tc as any).name ?? '',
+              args: (tc as any).function?.arguments ?? '{}',
+            }));
+            const hookResult: GenerationHookResult = {
+              text: textContent,
+              toolCalls: toolCallRecords,
+              usage: stepUsage,
+              step: runStep,
+              ...(response.cacheDiagnostics !== undefined
+                ? { cacheDiagnostics: response.cacheDiagnostics }
+                : {}),
+            };
+            const modified = await opts.onAfterGeneration(hookResult);
+            if (modified) {
+              textContent = modified.text;
+              if (modified.toolCalls.length === 0 && toolCallsInChoice.length > 0) {
+                toolCallsInChoice = [];
+              }
+            }
+          } catch (hookErr) {
+            if (opts.hookErrors === 'throw') throw markHookStop(hookErr);
+            console.warn('[agentos] onAfterGeneration hook error:', hookErr);
+          }
+        }
+        // An abort while the hook ran ends the call here: the step's reply is
+        // not returned, and its tools do not run.
+        opts.abortSignal?.throwIfAborted();
+
+        if (textContent && toolCallsInChoice.length === 0) {
+          metricUsage = totalUsage;
+          span?.setAttribute('agentos.api.finish_reason', choice.finishReason ?? 'stop');
+          span?.setAttribute('agentos.api.tool_calls', allToolCalls.length);
+          attachUsageAttributes(span, totalUsage);
+        attachGenAiAttributes(span, { providerName: resolved.providerId, operationName: 'chat', requestModel: resolved.modelId, responseModel: lastResponseModelId, usage: totalUsage, ...(opts.serviceTier !== undefined ? { requestServiceTier: opts.serviceTier } : {}), ...(lastServiceTier !== undefined ? { responseServiceTier: lastServiceTier } : {}) });
+          // 2026-05-29 — fire the global LLM usage observer so hosts
+          // (wilds-ai foundation_usage_events, billing dashboards) get
+          // the resolved provider + model + cost without wrapping every
+          // callsite. No-op when no observer is registered.
+          fireLlmUsageObserver({
+            provider: resolved.providerId,
+            model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+            usage: totalUsage,
+            source: opts.source,
+            ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+            finishReason: choice.finishReason ?? 'stop',
+            surface: 'generateText',
+            durationMs: Date.now() - rootStartedAt,
+            ...(lastServingProvider ? { servingProvider: lastServingProvider } : {}),
+          }, usageAccount);
+          // Final assistant turn is not on the loop's messages array at a stop
+          // terminal; push it so the transcript delta ends on the reply (a
+          // session history must never end on a tool result).
+          messages.push({
+            role: 'assistant',
+            content: textContent,
+            ...(resolved.providerId === 'minimax' && choice.message?.reasoningText !== undefined
+              ? { reasoningText: choice.message.reasoningText } : {}),
+            ...(((choice.message as unknown as { thinking?: unknown } | undefined)?.thinking) !== undefined
+              ? { thinking: (choice.message as unknown as { thinking?: unknown }).thinking }
+              : {}),
+            ...(choice.message?.thinkingBlocks?.length
+              ? { thinkingBlocks: choice.message.thinkingBlocks }
+              : {}),
+          });
+          return {
+            transcriptDelta: messages.slice(transcriptDeltaStart) as unknown as SessionTranscriptMessage[],
+            provider: resolved.providerId,
+            model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+          ...(lastServiceTier !== undefined ? { serviceTier: lastServiceTier } : {}),
+            ...(lastServingProvider ? { servingProvider: lastServingProvider } : {}),
+            ...(lastCacheDiagnostics !== undefined
+              ? { cacheDiagnostics: lastCacheDiagnostics }
+              : {}),
+            ...(opts.cacheDiagnostics ? { providerMessageId: lastProviderMessageId } : {}),
+            text: textContent,
+            usage: totalUsage,
+            toolCalls: allToolCalls,
+            finishReason: (choice.finishReason ?? 'stop') as GenerateTextResult['finishReason'],
+            plan: resolvedPlan,
+          };
+        }
+
+        if (toolCallsInChoice.length > 0) {
+          // Preserve the captured thinking blocks on the replayed assistant
+          // turn. With extended thinking enabled, Anthropic requires the
+          // most-recent assistant tool_use turn to carry its thinking blocks
+          // verbatim (signature intact) on the next request; dropping them
+          // 400s the continuation step. AnthropicProvider strips thinking from
+          // all earlier assistant turns at payload-build time, so carrying it
+          // here on every tool step is safe. Inert when thinking is off
+          // (no blocks present), keeping the non-thinking path byte-identical.
+          const stepThinkingBlocks = choice.message?.thinkingBlocks;
+          messages.push({
+            role: 'assistant',
+            content: textContent || null,
+            tool_calls: toolCallsInChoice,
+            ...(resolved.providerId === 'minimax' && choice.message?.reasoningText !== undefined
+              ? { reasoningText: choice.message.reasoningText } : {}),
+            ...(stepThinkingBlocks && stepThinkingBlocks.length > 0
+              ? { thinkingBlocks: stepThinkingBlocks }
+              : {}),
+          } as any);
+
+          for (const tc of toolCallsInChoice) {
+            const fnName = (tc as any).function?.name ?? (tc as any).name ?? '';
+            const fnArgs = (tc as any).function?.arguments ?? '{}';
+            const tcId = (tc as any).id ?? '';
+            const tool = toolMap.get(fnName);
+            const record: ToolCallRecord = {
+              name: fnName,
+              args: fnArgs,
+            };
+
+            let parsedArgs: unknown;
+            try {
+              parsedArgs =
+                typeof fnArgs === 'string' ? JSON.parse(fnArgs): fnArgs;
+              record.args = parsedArgs;
+            } catch {
+              record.error = `Tool "${fnName}" arguments were not valid JSON.`;
+              messages.push({
+                role: 'tool',
+                tool_call_id: tcId,
+                content: JSON.stringify({ error: record.error }),
+              } as any);
+              allToolCalls.push(record);
+              continue;
+            }
+
+            // --- onBeforeToolExecution hook ---
+            if (opts.onBeforeToolExecution) {
+              try {
+                const hookInfo: ToolCallHookInfo = {
+                  name: fnName,
+                  args: parsedArgs as Record<string, unknown>,
+                  id: tcId || '',
+                  step: runStep,
+                };
+                const hookResult = await opts.onBeforeToolExecution(hookInfo);
+                if (hookResult === null) {
+                  record.error = 'Skipped by onBeforeToolExecution hook';
+                  messages.push({
+                    role: 'tool',
+                    tool_call_id: tcId,
+                    content: JSON.stringify({ skipped: true }),
+                  } as any);
+                  allToolCalls.push(record);
+                  continue;
+                }
+                parsedArgs = hookResult.args;
+              } catch (hookErr) {
+                if (opts.hookErrors === 'throw') throw markHookStop(hookErr);
+                console.warn('[agentos] onBeforeToolExecution hook error:', hookErr);
+              }
+            }
+
+            // --- approval gate (agency hitl.approvals.beforeTool) ---
+            // Runs after the hook, on the arguments the hook left. Anything but
+            // the exact approval skips the tool and tells the model. A tool
+            // that does not exist is reported below without asking anyone.
+            if (tool && opts.__approvalGate) {
+              const verdict = await askApprovalGate(opts.__approvalGate, {
+                name: fnName,
+                args: (parsedArgs ?? {}) as Record<string, unknown>,
+                id: tcId || '',
+                step: runStep,
+              });
+              if (verdict !== APPROVAL_GRANTED) {
+                record.error = `Skipped: ${verdict.reason}`;
+                messages.push({
+                  role: 'tool',
+                  tool_call_id: tcId,
+                  content: JSON.stringify({ skipped: true, reason: verdict.reason }),
+                } as any);
+                allToolCalls.push(record);
+                continue;
+              }
+            }
+
+            if (tool) {
+              try {
+                const result = await tool.execute(
+                  parsedArgs as any,
+                  buildHelperToolExecutionContext(
+                    'generateText',
+                    helperToolRunId,
+                    runStep,
+                    tcId || undefined,
+                  ),
+                );
+                // One masked output serves the record and the tool turn: the
+                // seat's next request carries no key. The output is masked as
+                // a value before it is serialized, then the whole turn passes
+                // the text mask: a tool that returns a credential of the call
+                // (a config read, an echo of the environment) would otherwise
+                // send it to the seat's provider, and the call's list holds no
+                // value a model is meant to read. A successful output passes
+                // the listed values alone, so a URL it returns is sent as the
+                // tool gave it; a failed tool's turn takes the error mask, URL
+                // patterns included. A turn a replacement left as no JSON is
+                // sent as a JSON string, and an output JSON leaves out (a
+                // function, a symbol) as an absent one is, so a tool that
+                // succeeded never reaches the mask as no text and fails there.
+                // An output no serializer can write fails here, masked or not.
+                const errorText = typeof result.error === 'string' ? maskToolText(result.error) : result.error;
+                const output = maskToolValue(result.output);
+                record.result = output;
+                record.error = result.success ? undefined: errorText;
+                const turn = toolTurnJson(output, errorText ?? '', result.output);
+                messages.push({
+                  role: 'tool',
+                  tool_call_id: tcId,
+                  content: asJsonText(result.success ? maskToolOutput(turn) : maskToolText(turn), turn),
+                } as any);
+              } catch (err: any) {
+                record.error = maskToolText(err?.message ?? String(err));
+                messages.push({
+                  role: 'tool',
+                  tool_call_id: tcId,
+                  content: JSON.stringify({ error: record.error }),
+                } as any);
+              }
+            } else {
+              record.error = `Tool "${fnName}" not found.`;
+              messages.push({
+                role: 'tool',
+                tool_call_id: tcId,
+                content: JSON.stringify({ error: record.error }),
+              } as any);
+            }
+            allToolCalls.push(record);
+          }
+          toolProgress.completedToolRounds = {
+            messages: messages.slice(generatedSystemCount).filter((m) => m !== planMessage),
+            callerHistoryCount,
+            toolCalls: [...allToolCalls],
+            steps: step + 1,
+          };
+          continue;
+        }
+
+        metricUsage = totalUsage;
+        span?.setAttribute('agentos.api.finish_reason', choice.finishReason ?? 'stop');
+        span?.setAttribute('agentos.api.tool_calls', allToolCalls.length);
+        attachUsageAttributes(span, totalUsage);
+        attachGenAiAttributes(span, { providerName: resolved.providerId, operationName: 'chat', requestModel: resolved.modelId, responseModel: lastResponseModelId, usage: totalUsage, ...(opts.serviceTier !== undefined ? { requestServiceTier: opts.serviceTier } : {}), ...(lastServiceTier !== undefined ? { responseServiceTier: lastServiceTier } : {}) });
+        fireLlmUsageObserver({
+          provider: resolved.providerId,
+          model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+          usage: totalUsage,
+          source: opts.source,
+          ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+          finishReason: choice.finishReason ?? 'stop',
+          surface: 'generateText',
+          durationMs: Date.now() - rootStartedAt,
+          ...(lastServingProvider ? { servingProvider: lastServingProvider } : {}),
+        }, usageAccount);
+        // Final assistant turn is not on the loop's messages array at a stop
+        // terminal; push it so the transcript delta ends on the reply (a
+        // session history must never end on a tool result).
+        messages.push({
+          role: 'assistant',
+          content: textContent,
+          ...(resolved.providerId === 'minimax' && choice.message?.reasoningText !== undefined
+            ? { reasoningText: choice.message.reasoningText } : {}),
+          ...(((choice.message as unknown as { thinking?: unknown } | undefined)?.thinking) !== undefined
+            ? { thinking: (choice.message as unknown as { thinking?: unknown }).thinking }
+            : {}),
+          ...(choice.message?.thinkingBlocks?.length
+            ? { thinkingBlocks: choice.message.thinkingBlocks }
+            : {}),
+        });
+        return {
+          transcriptDelta: messages.slice(transcriptDeltaStart) as unknown as SessionTranscriptMessage[],
+          provider: resolved.providerId,
+          model: resolved.modelId,
+          ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+          ...(lastServiceTier !== undefined ? { serviceTier: lastServiceTier } : {}),
+          ...(lastServingProvider ? { servingProvider: lastServingProvider } : {}),
+          ...(lastCacheDiagnostics !== undefined ? { cacheDiagnostics: lastCacheDiagnostics } : {}),
+          ...(opts.cacheDiagnostics ? { providerMessageId: lastProviderMessageId } : {}),
+          text: textContent,
+          usage: totalUsage,
+          toolCalls: allToolCalls,
+          finishReason: (choice.finishReason ?? 'stop') as GenerateTextResult['finishReason'],
+          plan: resolvedPlan,
+        };
+      }
+      } catch (loopErr) {
+        // 'auto' reactive fallback: when the provider rejects native tool-use,
+        // re-run the turn through the prompt-based shim.
+        if (tools.length > 0 && toolMode === 'auto' && toolUnsupportedErr(loopErr)) {
+          return await runShim();
+        }
+        throw loopErr;
+      }
+
+      // An abort during the last tool round ends the call here, once the round
+      // has run, instead of returning the round as the result.
+      opts.abortSignal?.throwIfAborted();
+
+      const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
+      metricUsage = totalUsage;
+      span?.setAttribute('agentos.api.finish_reason', 'tool-calls');
+      span?.setAttribute('agentos.api.tool_calls', allToolCalls.length);
+      attachUsageAttributes(span, totalUsage);
+      attachGenAiAttributes(span, { providerName: resolved.providerId, operationName: 'chat', requestModel: resolved.modelId, responseModel: lastResponseModelId, usage: totalUsage, ...(opts.serviceTier !== undefined ? { requestServiceTier: opts.serviceTier } : {}), ...(lastServiceTier !== undefined ? { responseServiceTier: lastServiceTier } : {}) });
+      fireLlmUsageObserver({
+        provider: resolved.providerId,
+        model: resolved.modelId,
+        usage: totalUsage,
+        source: opts.source,
+        ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+        finishReason: 'tool-calls',
+        surface: 'generateText',
+        durationMs: Date.now() - rootStartedAt,
+        ...(lastServingProvider ? { servingProvider: lastServingProvider } : {}),
+      }, usageAccount);
+      return {
+        transcriptDelta: messages.slice(transcriptDeltaStart) as unknown as SessionTranscriptMessage[],
+        provider: resolved.providerId,
+        model: resolved.modelId,
+        ...(lastResponseModelId !== undefined ? { responseModel: lastResponseModelId } : {}),
+        ...(lastServiceTier !== undefined ? { serviceTier: lastServiceTier } : {}),
+        text: (lastAssistant?.content as string) ?? '',
+        usage: totalUsage,
+        toolCalls: allToolCalls,
+        finishReason: 'tool-calls',
+        plan: resolvedPlan,
+        ...(lastCacheDiagnostics !== undefined
+          ? { cacheDiagnostics: lastCacheDiagnostics }
+          : {}),
+        ...(opts.cacheDiagnostics ? { providerMessageId: lastProviderMessageId } : {}),
+      };
+    });
+    // The primary attempt succeeded: let the registry know so its
+    // failure streak resets. Safe to call on a never-failed provider;
+    // the registry no-ops in that case.
+    if (healthProviderId) {
+      globalLLMProviderHealth.recordSuccess(healthProviderId);
+    }
+    return {
+      ...successResult,
+      fallback: {
+        fired: false,
+        finalProvider: successResult.provider,
+        finalModel: successResult.model,
+        hops: [{ provider: successResult.provider, model: successResult.model, ok: true }],
+      },
+    };
+  } catch (error) {
+    // The caller's signal ended the call, whatever error the provider made of
+    // the abort (a timeout, a dropped connection).
+    const aborted = opts.abortSignal?.aborted === true;
+    // Record the primary attempt as a failure on the health registry
+    // BEFORE walking the fallback chain. Subsequent calls in this
+    // process will now see this provider as open (per the registry's
+    // status-aware policy) and skip the network round-trip entirely.
+    // Note: we record against `metricProviderId` not the inbound
+    // `opts.provider` because the model router may have resolved a
+    // different provider than the caller asked for. A call the caller
+    // stopped (its spend budget's refusal, a hook's stop, an abort) says
+    // nothing about the provider and is not recorded; neither is a timeout
+    // the panel's own deadline produced, when the deadline flag is set.
+    if (
+      healthProviderId &&
+      !(error instanceof LLMProviderCircuitOpenError) &&
+      !aborted &&
+      !isCallerStop(error) &&
+      !(opts.__panelDeadline && isTimeoutError(error))
+    ) {
+      globalLLMProviderHealth.recordFailure(healthProviderId, error);
+    }
+    // The failed attempt is billed for its completed steps and for a step
+    // the provider ended with usage attached (a refused turn). It is metered
+    // here, once: this call's ledger row and a usage event of its own; a
+    // fallback leg meters itself.
+    addModelUsage(attemptUsage, usageOfError(error));
+    // The spend budget is charged what the failed request was billed, as it
+    // is charged for each step that completed.
+    if (budget && usageOfError(error) !== undefined) {
+      const billed: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      addModelUsage(billed, usageOfError(error));
+      budget.record(costOfUsageUSD(metricProviderId ?? '', metricModelId ?? '', billed), billed.totalTokens, 'generate_text.failed');
+    }
+    metricUsage = attemptUsage;
+    if (hasBillableUsage(attemptUsage)) {
+      fireLlmUsageObserver({
+        provider: metricProviderId ?? 'unknown',
+        model: metricModelId ?? 'unknown',
+        usage: { ...attemptUsage },
+        source: opts.source,
+        ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+        finishReason: 'error',
+        surface: 'generateText',
+        durationMs: Date.now() - rootStartedAt,
+      }, usageAccount);
+    }
+    // An aborted call walks no fallback chain: it rejects with the signal's
+    // reason, unwrapped, so the caller gets the error it can test for.
+    if (aborted) {
+      metricStatus = 'error';
+      throw opts.abortSignal?.reason;
+    }
+    // The failed primary heads the fallback trail.
+    const primaryProviderId = metricProviderId;
+    const primaryModelId = metricModelId;
+    const fallbackHops: FallbackSignal['hops'] = [
+      { provider: primaryProviderId ?? 'unknown', model: primaryModelId, ok: false },
+    ];
+    // ── Fallback chain ────────────────────────────────────────────────
+    // Caller-supplied wins, undefined auto-builds from env keys for the
+    // call's resolved tier (the policy-aware chain on mature and
+    // private-adult), an empty array opts out. The top-level walk resolves
+    // the chain once: it drops the policy chain's entry for the failed first
+    // model, applies the call's explicit capability and exclusion
+    // requirements, and marks the uncensored group's standing legs and
+    // refills. A leg receives its resolved slice and never resolves it again.
+    const walkTier = resolvePolicyTier(opts);
+    const chainEntries = opts.fallbackProviders === undefined
+      ? buildPolicyAwareFallbackChain(walkTier, metricProviderId)
+      : opts.fallbackProviders;
+    // A seat's legs resolve strictly: no Anthropic to OpenRouter reroute.
+    const strictLegs = opts.__strictCredentials === true;
+    // The skip line names the provider and model the entry would be sent as,
+    // as the circuit-open and fired lines do, so one entry is one provider.
+    const logLegSkip = (entry: FallbackProviderEntry, reason: FallbackSkipReason): void => {
+      const skippedAs = fallbackEntrySentAs(entry, { strict: strictLegs });
+      fallbackLogger.warn('llm.fallback_skipped', { api: 'generateText', primaryProvider: providerName(metricProviderId), fallbackProvider: providerName(skippedAs.provider), ...(skippedAs.model !== undefined ? { fallbackModel: safePath(skippedAs.model) } : {}), reason: skipReason(reason) });
+    };
+    // Resolved only when the walk runs, so its skip lines describe a walk.
+    // A call whose prompt-shim tools already ran cannot be continued, and a
+    // restart would run them again; it surfaces the error instead.
+    const walks = isRetryableError(error) && !toolProgress.shimRanTool;
+    const effectiveFallbacks: ResolvedFallbackEntry[] = !walks
+      ? []
+      : opts.__fallbackWalk
+        ? chainEntries
+        : resolveFallbackChain(chainEntries, {
+            primary: { provider: metricProviderId, model: metricModelId },
+            requiredCapabilities: explicitRequiredCapabilities(opts),
+            excludedModelIds: opts.routerParams?.excludedModelIds,
+            onSkip: logLegSkip,
+            strictCredentials: strictLegs,
+          });
+    // This attempt's own failure updates the walk: a refusal is recorded,
+    // and a standing leg that failed on availability is owed a refill.
+    let walkState = advanceFallbackWalk(
+      opts.__fallbackWalk?.state ?? INITIAL_FALLBACK_WALK,
+      opts.__fallbackWalk?.role,
+      error,
+    );
+
+    if (walks && effectiveFallbacks.length) {
+      let lastError = error;
+      let attempt = 0;
+      for (const fb of effectiveFallbacks) {
+        attempt += 1;
+        // A refill runs only while a standing leg is owed one, and the
+        // policy chain's Claude legs are passed over after a refusal.
+        const gate = gateFallbackEntry(walkState, fb);
+        if (!gate.run) {
+          logLegSkip(fb, gate.reason);
+          continue;
+        }
+        walkState = gate.state;
+        // Skip fallback entries whose breaker is already open. Without
+        // this check, the loop would still spend a full network round-
+        // trip on every dead fallback in the chain before reaching the
+        // next healthy one. The recursive `generateText` call below would
+        // also short-circuit at the same isOpen() check, but the outer
+        // skip avoids the recursion overhead + the extra log line.
+        // The breaker read is the provider the leg is sent to: an
+        // `openrouter:` id under another provider goes to OpenRouter.
+        // That record speaks only for a leg that runs on the provider's
+        // shared credentials. A leg with a key or URL of its own, and every
+        // leg of a seat's call (strict, so a default that names no provider
+        // never reaches it), can keep the record of the key it sends
+        // (providerHealthKey), which the call below reads before it sends;
+        // a failure of another key skips none of them.
+        // A blank fb.baseUrl skips only this read: the call below drops it and reads its breaker before it sends.
+        // An Anthropic entry with no Anthropic key or base URL is sent to
+        // OpenRouter by the credential layer: its breaker read, its lines and
+        // its hop are OpenRouter's.
+        const legSentAs = fallbackEntrySentAs(fb, { strict: strictLegs });
+        const legProvider = legSentAs.provider;
+        const legOnSharedCredentials =
+          fb.apiKey === undefined && fb.baseUrl === undefined && opts.__strictCredentials !== true;
+        if (legOnSharedCredentials && globalLLMProviderHealth.isOpen(legProvider)) {
+          fallbackLogger.warn('llm.fallback_circuit_open', { api: 'generateText', primaryProvider: providerName(metricProviderId), fallbackProvider: providerName(legProvider), attempt });
+          // An open breaker is an availability failure: a standing leg is
+          // owed a refill.
+          walkState = advanceFallbackWalk(walkState, fb.walkRole, undefined);
+          continue;
+        }
+        try {
+          const lastErr = lastError instanceof Error ? lastError: new Error(String(lastError));
+          // Per-leg structured-output rebuild: when the caller supplied a
+          // builder, recompute the provider-native payload for THIS leg's
+          // provider, once, for the recursion below. The payload is built for
+          // the provider and model the leg is sent to, not the provider the
+          // entry names: `{ provider: 'anthropic', model:
+          // 'openrouter:anthropic/...' }` goes to OpenRouter, which drops an
+          // Anthropic marker while the marker would still keep the schema out
+          // of the prompt. An entry with no model keeps `''`, so the builder
+          // decides on the schema alone.
+          const hasResponseFormatBuilder = typeof opts._responseFormatBuilder === 'function';
+          const rebuiltResponseFormat = hasResponseFormatBuilder
+            ? safeBuildLegResponseFormat(
+                opts._responseFormatBuilder!,
+                legSentAs.provider,
+                fb.model ? (legSentAs.model ?? '') : '',
+              )
+            : undefined;
+          // The line, the callback and the leg's hop name the provider and
+          // model the leg is sent as, not the provider the entry says.
+          fallbackLogger.warn('llm.fallback_fired', { api: 'generateText', primaryProvider: providerName(metricProviderId), fallbackProvider: providerName(legSentAs.provider), ...(legSentAs.model !== undefined ? { fallbackModel: safePath(legSentAs.model) } : {}), attempt, ...errorFields(lastErr) });
+          // A seat's callback is handed the error through the seat's mask, as it would leave the seat.
+          opts.onFallback?.(opts.__maskError ? (opts.__maskError(lastErr) as Error) : lastErr, legSentAs.provider);
+          // Build a new options object targeting the fallback provider.
+          const fallbackResult = await generateText({
+            ...opts,
+            provider: fb.provider,
+            model: fb.model,
+            // Legs run as named: no router re-picks the model, and the call's
+            // resolved tier travels with them.
+            router: undefined,
+            policyTier: walkTier,
+            // The walk's state before this leg, and its role.
+            __fallbackWalk: { state: walkState, role: fb.walkRole },
+            // When a builder exists, ALWAYS override _responseFormat —
+            // including with an explicit `undefined` on builder failure or
+            // decline. Merely omitting the key would let the `...opts`
+            // spread above carry the STALE primary-shaped payload into the
+            // leg. Absent builder -> legacy verbatim carry.
+            ...(hasResponseFormatBuilder ? { _responseFormat: rebuiltResponseFormat } : {}),
+            // Carry the outermost call's start so the winning hop's usage
+            // observer reports true end-to-end durationMs (spanning this
+            // failed primary + every fallback hop), not just its own leg.
+            __rootStartedAt: rootStartedAt,
+            // Stamp the leg's observer events with its hop depth (see
+            // LlmUsageEvent.fallbackDepth).
+            __fallbackDepth: (opts.__fallbackDepth ?? 0) + 1,
+            // Per-hop effort, cache and output budget. An entry's `effort` /
+            // `cache` override the call level for THIS hop only, and its
+            // `maxTokensHeadroom` is added to the call's maxTokens; an entry
+            // without one takes the ORIGINAL call's value — not the previous
+            // hop's, which is what the `...opts` spread used to hand the next
+            // entry when a hop failed and fell back again. Lets an explicit
+            // chain run a fallback at a different depth than the primary
+            // without changing the primary call's effort, and the canonical
+            // chains pin `cache: false` on their legs so a rescue hop sends
+            // zero cache_control (no write premium on one-shot failover
+            // traffic).
+            ...fallbackHopOverrides(opts, fb),
+            // The hop's own key and URL, when its entry carries them (an
+            // agency's seating writes them); otherwise the fallback
+            // provider's environment, never the primary's overrides.
+            apiKey: fb.apiKey,
+            baseUrl: fb.baseUrl,
+            // Preserve the REMAINING resolved chain (entries AFTER the current
+            // fb; `attempt` is 1-indexed so slice(attempt) drops fb and all
+            // already-tried entries). This stops the recursion from rebuilding
+            // the default cheap chain (which includes gpt-4o-mini) when a
+            // fallback hop also fails — so an explicit frontier-only chain
+            // (e.g. codegen's [gpt-5.6-sol, openrouter:gpt-5.6-sol]) is honored
+            // end-to-end. The final entry passes [] -> explicit opt-out -> throw.
+            // When the leg walks these entries and every one fails, it throws a
+            // chain-walked error and the loop below stops instead of trying the
+            // same entries again.
+            fallbackProviders: effectiveFallbacks.slice(attempt),
+            // The leg's own walk reports each hop it takes to the caller; this
+            // loop stops once that walk has run, so every hop is reported once.
+            onFallback: opts.onFallback,
+            // Continue after the tool rounds this attempt completed: the leg
+            // receives the conversation so far (prompt included, so no new
+            // prompt), counts all of it as this call's transcript delta, and
+            // keeps the steps that remain.
+            _continuation: {
+              helperToolRunId,
+              stepOffset: stepOffset + (toolProgress.completedToolRounds?.steps ?? 0),
+              prompt: opts.prompt ?? opts._continuation?.prompt,
+            },
+            ...(toolProgress.completedToolRounds
+              ? {
+                  messages: toolProgress.completedToolRounds.messages as unknown as Message[],
+                  prompt: undefined,
+                  _transcriptIncludeTrailingCallerMessages:
+                    toolProgress.completedToolRounds.messages.length - toolProgress.completedToolRounds.callerHistoryCount,
+                  maxSteps: Math.max(1, (opts.maxSteps ?? 1) - toolProgress.completedToolRounds.steps),
+                  // Claude's budgeted thinking requires the tool turn being
+                  // answered to open with its signed thinking, and a turn
+                  // another model ran has none, so the continuation runs
+                  // without a thinking budget. Adaptive thinking turns itself
+                  // off for such a turn. `thinking: false` stays as asked.
+                  ...(typeof opts.thinking === 'object' &&
+                  opts.thinking !== null &&
+                  (fb.provider === 'anthropic' || /claude/i.test(fb.model ?? '')) &&
+                  toolTurnLacksThinking(toolProgress.completedToolRounds.messages)
+                    ? { thinking: undefined }
+                    : {}),
+                }
+              : {}),
+          });
+          fallbackLogger.info('llm.fallback_succeeded', { api: 'generateText', primaryProvider: providerName(metricProviderId), fallbackProvider: providerName(fallbackResult.provider), attempt });
+          metricStatus = 'ok';
+          fallbackHops.push(
+            ...(fallbackResult.fallback?.hops ?? [
+              { provider: fallbackResult.provider, model: fallbackResult.model, ok: true },
+            ]),
+          );
+          return {
+            ...fallbackResult,
+            // The call's usage covers the failed attempt and the leg.
+            usage: sumTokenUsage(attemptUsage, fallbackResult.usage),
+            ...(toolProgress.completedToolRounds
+              ? { toolCalls: [...toolProgress.completedToolRounds.toolCalls, ...fallbackResult.toolCalls] }
+              : {}),
+            fallback: {
+              fired: true,
+              finalProvider: fallbackResult.provider,
+              finalModel: fallbackResult.model,
+              hops: fallbackHops,
+            },
+          };
+        } catch (fbError) {
+          // The caller's signal ended the leg: no later leg starts, and the
+          // call rejects with the signal's reason.
+          if (opts.abortSignal?.aborted) {
+            metricStatus = 'error';
+            throw opts.abortSignal.reason;
+          }
+          lastError = fbError;
+          fallbackHops.push({ provider: legSentAs.provider, model: legSentAs.model, ok: false });
+          // The leg ran tools before it failed. A later leg would start
+          // from a conversation that does not show them and run them again.
+          if (toolsRanBefore(fbError)) break;
+          // The leg walked every entry after it and all of them failed.
+          if (chainWalkedBefore(fbError)) break;
+          // The call's budget refused the leg, or a hook stopped it: every
+          // later leg would be stopped the same way.
+          if (isCallerStop(fbError)) break;
+          walkState = advanceFallbackWalk(walkState, fb.walkRole, fbError);
+        }
+      }
+      // All fallbacks exhausted: fall through to throw
+      const lastErr = lastError instanceof Error ? lastError: new Error(String(lastError));
+      fallbackLogger.error('llm.fallback_exhausted', { api: 'generateText', primaryProvider: providerName(metricProviderId), attempts: attempt, ...errorFields(lastErr) });
+      metricStatus = 'error';
+      throw markChainWalked(
+        toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(lastError) : lastError,
+      );
+    }
+
+    metricStatus = 'error';
+    // Marked so a walker that called this one as a fallback leg stops too.
+    throw toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(error) : error;
+  } finally {
+    try {
+      await recordAgentOSUsageLazy({
+        providerId: metricProviderId,
+        modelId: metricModelId,
+        usage: metricUsage,
+        options: {
+          ...opts.usageLedger,
+          source: opts.usageLedger?.source ?? 'generateText',
+        },
+      });
+    } catch {
+      // Helper-level usage persistence is best-effort and should not break generation.
+    }
+    recordAgentOSTurnMetrics({
+      durationMs: Date.now() - rootStartedAt,
+      status: metricStatus,
+      usage: toTurnMetricUsage(metricUsage),
+    });
+  }
+}

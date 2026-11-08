@@ -1,0 +1,1897 @@
+/**
+ * @fileoverview Unified SQLite connection manager for a single agent's long-term brain.
+ *
+ * One `brain.sqlite` file stores everything the memory ingestion engine needs:
+ * memory traces, knowledge graph nodes/edges, document ingestion records,
+ * conversation history, consolidation logs, and retrieval feedback signals.
+ *
+ * ## Cognitive science grounding
+ * The schema mirrors Tulving's LTM taxonomy:
+ * - `memory_traces`       → episodic + semantic + procedural + prospective memories
+ * - `knowledge_nodes/edges` → semantic network (Collins & Quillian spreading-activation model)
+ * - `documents/chunks`    → external world model (grounded episodic encoding)
+ * - `conversations/messages` → episodic conversational buffer
+ * - `consolidation_log`   → slow-wave sleep analogue (offline consolidation events)
+ * - `retrieval_feedback`  → Hebbian reinforcement ("neurons that fire together wire together")
+ *
+ * ## Storage design choices
+ * - **Cross-platform**: Uses `@framers/sql-storage-adapter` StorageAdapter interface,
+ *   enabling browser (IndexedDB/sql.js), mobile (Capacitor), and Postgres backends
+ *   in addition to the default Node.js better-sqlite3 path.
+ * - **WAL mode**: allows concurrent reads during writes (when adapter supports it).
+ * - **FTS5 with Porter tokenizer**: enables fast full-text search over memory content with
+ *   morphological stemming (retrieval cue → "retriev*").
+ * - **Embeddings as BLOBs**: raw Float32Array buffers stored directly — no external vector DB
+ *   dependency for the SQLite-backed path; vector similarity runs in-process via HNSW.
+ * - **JSON columns**: tags, emotions, metadata stored as JSON TEXT for schema flexibility
+ *   without sacrificing query-ability via SQLite's json_extract().
+ *
+ * @module memory/store/Brain
+ */
+
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { v4 as uuidv4 } from 'uuid';
+import type {
+  StorageAdapter,
+  StorageRunResult,
+  StorageParameters,
+  StorageFeatures,
+} from '@framers/sql-storage-adapter';
+import { resolveStorageAdapter, createStorageFeatures, createPostgresAdapter } from '@framers/sql-storage-adapter';
+import {
+  DDL_ARCHIVED_TRACES,
+  DDL_ARCHIVED_TRACES_IDX_AGENT_TIME,
+  DDL_ARCHIVED_TRACES_IDX_REASON,
+  DDL_ARCHIVE_ACCESS_LOG,
+  DDL_ARCHIVE_ACCESS_LOG_IDX,
+} from '../../archive/SqlStorageMemoryArchive.js';
+import { MigrationRunner, MIGRATIONS, LATEST_SCHEMA_VERSION } from './migrations/index.js';
+import { ensureScopeIdColumn, fillScopeIds, postgresIndexExists } from './migrations/v2-to-v3.js';
+import { retryLostCreate } from './migrations/lost-create.js';
+import { PORTABLE_TABLES, PORTABLE_TABLE_PRIMARY_KEYS } from './portable-tables.js';
+import { redactPostgresPassword } from './postgresPasswordRedaction.js';
+import { keyTraceCopies } from './SqlKnowledgeGraph.js';
+import {
+  brainHoldsScopeIdFormRecord,
+  encodedCopyProperties,
+  encodePlainScopeId,
+  holdsScopeIdsTheFormChanges,
+  importScopeIdFormDecision,
+  readScopeIdFormRecord,
+  SCOPE_ID_FORM_KEY,
+  writeScopeIdFormRecord,
+} from './scopeIdForm.js';
+import { parseTraceMetadata, scopeIdOfMetadata } from './tracePersistence.js';
+
+/**
+ * How many times `exportToSqlite` and `importFromSqlite` copy a brain whose scope-id form record changes while they
+ * read it.
+ */
+const SCOPE_ID_FORM_PASSES = 3;
+
+/**
+ * Thrown inside a copy (`exportToSqlite`'s read of this brain, `importFromSqlite`'s transaction) when the scope-id
+ * form record of the brain it reads changed while it read the rows: the copy is made again, and after the last pass
+ * the call throws it.
+ */
+class ScopeIdFormChangedWhileCopied extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ScopeIdFormChangedWhileCopied';
+  }
+}
+
+/**
+ * One table's rows of a plain source as an import into a Brain that holds the encoded scope-id form writes them: each
+ * trace's `user` or `persona` scope id encoded, in its column and its metadata, and each knowledge-graph memory node's
+ * stored scope id with it. A row whose id the encoded form keeps is written as it is.
+ */
+function encodedSourceRows(table: string, rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (table === 'knowledge_nodes') {
+    return rows.map((row) =>
+      row.type === 'memory' && typeof row.properties === 'string'
+        ? { ...row, properties: encodedCopyProperties(row.properties) }
+        : row,
+    );
+  }
+  if (table !== 'memory_traces') return rows;
+  return rows.map((row) => {
+    const named = typeof row.scope_id === 'string' && row.scope_id !== '' ? row.scope_id : scopeIdOfMetadata(row.metadata);
+    const scopeId = encodePlainScopeId(String(row.scope), named);
+    if (scopeId === named) return row;
+    const metadata =
+      typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata)
+        ? { ...(row.metadata as Record<string, unknown>) }
+        : parseTraceMetadata(typeof row.metadata === 'string' ? row.metadata : null);
+    metadata.scopeId = scopeId;
+    return { ...row, scope_id: scopeId, metadata: JSON.stringify(metadata) };
+  });
+}
+
+/**
+ * Derive a stable brain identifier from the database file path.
+ *
+ * `:memory:` becomes `'default'`. For real paths, the file basename is used
+ * with extensions stripped (e.g. `companion-alice.sqlite` becomes
+ * `companion-alice`; `foo.brain.sqlite` becomes `foo.brain`).
+ *
+ * Used by {@link Brain.open} when the caller does not supply an
+ * explicit `brainId`.
+ */
+/** Each `CREATE INDEX IF NOT EXISTS <name> ON <table> ...;` statement of a schema script, with the index's name and its table's. */
+const CREATE_INDEX_IF_NOT_EXISTS =
+  /CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s+ON\s+([A-Za-z_][A-Za-z0-9_]*)\b[^;]*;?/gi;
+
+/**
+ * Runs a schema script on Postgres: its other statements first (the script's `CREATE TABLE IF NOT EXISTS`), then each
+ * of its `CREATE INDEX IF NOT EXISTS` statements whose index Postgres does not have. Postgres takes the table's SHARE
+ * lock before it checks IF NOT EXISTS, so an open would otherwise wait for any long write transaction on the table,
+ * and while it waited, every writer queued behind its lock request would wait too. Each index is looked for once its
+ * table exists, on the table the statement's name resolves to then, which is the table the statement indexes: one the
+ * script has just made in the first schema on the search path, though a later schema holds a table of that name, or
+ * a session's temporary table of that name where the search path reaches it first (a path that does not name
+ * `pg_temp` searches the session's temporary schema before any other). Each call may run on another connection of a
+ * pool, so a pool's connections are taken to share their session state, as the adapter's `withConnection` asks.
+ */
+async function execSchemaScriptOnPostgres(adapter: StorageAdapter, script: string): Promise<void> {
+  const indexes = [...script.matchAll(CREATE_INDEX_IF_NOT_EXISTS)].map((match) => ({
+    statement: match[0],
+    name: match[1]!,
+    table: match[2]!,
+  }));
+  const rest = script.replace(CREATE_INDEX_IF_NOT_EXISTS, '');
+  if (rest.trim().length > 0) await retryLostCreate(() => adapter.exec(rest));
+  for (const { statement, name, table } of indexes) {
+    if (await postgresIndexExists(adapter, name, table)) continue;
+    await retryLostCreate(() => adapter.exec(statement));
+  }
+}
+
+/**
+ * Whether anything is at `entry`: a file, a folder, or a link, dangling or
+ * not. `lstat` reads the entry itself, where `access` follows a link and
+ * reports a dangling one as free.
+ */
+async function entryExists(entry: string): Promise<boolean> {
+  return fs.lstat(entry).then(
+    () => true,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    },
+  );
+}
+
+/**
+ * Moves the finished file at `from` to `to` in one step, so `to` holds the
+ * whole file or nothing, and never replaces a file already at `to`.
+ *
+ * A hard link fails with EEXIST when `to` exists; once it succeeds the export
+ * is published, and the temporary name is removed on a best-effort basis (a
+ * file left at `from` never turns a published export into a failure). A file
+ * system without hard links (FAT and exFAT, some network shares) gets a check
+ * that `to` is free and then a rename, which is atomic but replaces: the
+ * instant between the two is the only moment a file appearing at `to` could
+ * be replaced there.
+ *
+ * @throws {Error} Naming `to` when a file is already there.
+ */
+async function publishWithoutReplacing(from: string, to: string): Promise<void> {
+  const taken = (): Error => new Error(`Brain.exportToSqlite: target already exists: ${to}`);
+  try {
+    await fs.link(from, to);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') {
+      throw taken();
+    }
+    if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'EXDEV' && code !== 'ENOSYS') {
+      throw error;
+    }
+    if (await entryExists(to)) {
+      throw taken();
+    }
+    await fs.rename(from, to);
+    return;
+  }
+  await fs.rm(from, { force: true }).catch(() => undefined);
+}
+
+function parseBetterSqliteUri(dbPath: string): {
+  body: string;
+  params: URLSearchParams;
+  rawQuery: string;
+} {
+  const withoutFragment = dbPath.split('#', 1)[0];
+  const queryIndex = withoutFragment.indexOf('?');
+  const resource = queryIndex >= 0
+    ? withoutFragment.slice(0, queryIndex)
+    : withoutFragment;
+  const query = queryIndex >= 0 ? withoutFragment.slice(queryIndex + 1) : '';
+  const encodedBody = resource.slice('file:'.length);
+  let body: string;
+  try {
+    body = decodeURIComponent(encodedBody);
+  } catch {
+    body = encodedBody;
+  }
+  return { body, params: new URLSearchParams(query), rawQuery: query };
+}
+
+function sqliteUriBodyToPath(body: string): string {
+  if (body.toLowerCase().startsWith('//localhost/')) {
+    return body.slice('//localhost'.length);
+  }
+  if (body.startsWith('///')) {
+    return body.slice(2);
+  }
+  return body;
+}
+
+function sharedMemoryUriParameterIdentity(rawQuery: string): string {
+  const parameters = rawQuery.split('&');
+  // This is intentionally limited to the exact stock SQLite pair. SQLite
+  // passes every parameter to the VFS, so preserve raw spelling and ordering
+  // whenever duplicates, encodings, VFS selectors, or extra keys are present.
+  if (
+    parameters.length === 2 &&
+    parameters.includes('mode=memory') &&
+    parameters.includes('cache=shared')
+  ) {
+    return 'cache=shared&mode=memory';
+  }
+  return rawQuery;
+}
+
+interface SqliteOpenedResource {
+  /** Absolute filename reported by SQLite, empty for in-memory, null when unavailable. */
+  filename: string | null;
+  /** True only when the opened connection proves that a file URI selected memory mode. */
+  isUriMemory: boolean;
+  /** Ordered URI query string, retained conservatively for VFS-sensitive identity. */
+  uriParameters: string;
+  /** Whether this SQLite build can honor `cache=shared` for named memory URIs. */
+  supportsSharedCache: boolean;
+  /** Whether filename or caller-literal identity is safe to intern process-wide. */
+  identityKnown: boolean;
+}
+
+function deriveBrainIdFromPath(
+  dbPath: string,
+  openedResource: SqliteOpenedResource,
+): string {
+  let resourcePath = openedResource.filename || dbPath;
+  if (openedResource.isUriMemory) {
+    const { body } = parseBetterSqliteUri(dbPath);
+    resourcePath = sqliteUriBodyToPath(body);
+  }
+  if (resourcePath === ':memory:' || resourcePath === '') return 'default';
+  const basename = path.basename(resourcePath);
+  const lastDot = basename.lastIndexOf('.');
+  return lastDot > 0 ? basename.slice(0, lastDot) : basename;
+}
+
+interface CoordinationTokenRegistration {
+  identity: string;
+  reference: ReferenceLike<object>;
+}
+
+interface ReferenceLike<T extends object> {
+  deref(): T | undefined;
+}
+
+interface FinalizerLike<T> {
+  register(target: object, heldValue: T, unregisterToken?: object): void;
+  unregister(unregisterToken: object): boolean;
+}
+
+const WeakRefImplementation =
+  typeof WeakRef === 'function' ? WeakRef : undefined;
+const FinalizationRegistryImplementation =
+  typeof FinalizationRegistry === 'function' ? FinalizationRegistry : undefined;
+
+function createReference<T extends object>(target: T): ReferenceLike<T> {
+  if (WeakRefImplementation) return new WeakRefImplementation(target);
+  // Compatibility fallback for runtimes that do not expose WeakRef. Interned
+  // Brain identities then live for the process lifetime and remain bounded by
+  // the number of backing resources opened by that runtime.
+  return { deref: () => target };
+}
+
+const coordinationTokens = new Map<string, ReferenceLike<object>>();
+const adapterCoordinationTokens = new WeakMap<StorageAdapter, Map<string, object>>();
+const coordinationTokenFinalizer: FinalizerLike<CoordinationTokenRegistration> | null =
+  FinalizationRegistryImplementation
+    ? new FinalizationRegistryImplementation<CoordinationTokenRegistration>(
+        ({ identity, reference }) => {
+          if (coordinationTokens.get(identity) === reference) {
+            coordinationTokens.delete(identity);
+          }
+        },
+      )
+    : null;
+
+function internCoordinationToken(identity: string): object {
+  const existing = coordinationTokens.get(identity)?.deref();
+  if (existing) return existing;
+  const token = {};
+  const reference = createReference(token);
+  coordinationTokens.set(identity, reference);
+  coordinationTokenFinalizer?.register(token, { identity, reference }, reference);
+  return token;
+}
+
+function rememberAdapterCoordinationToken(
+  adapter: StorageAdapter,
+  brainId: string,
+  token: object,
+): void {
+  let tokens = adapterCoordinationTokens.get(adapter);
+  if (!tokens) {
+    tokens = new Map();
+    adapterCoordinationTokens.set(adapter, tokens);
+  }
+  tokens.set(brainId, token);
+}
+
+function coordinationTokenForAdapter(adapter: StorageAdapter, brainId: string): object {
+  let tokens = adapterCoordinationTokens.get(adapter);
+  if (!tokens) {
+    tokens = new Map();
+    adapterCoordinationTokens.set(adapter, tokens);
+  }
+  let token = tokens.get(brainId);
+  if (!token) {
+    token = {};
+    tokens.set(brainId, token);
+  }
+  return token;
+}
+
+function rememberedAdapterCoordinationToken(
+  adapter: StorageAdapter,
+  brainId: string,
+): object | undefined {
+  return adapterCoordinationTokens.get(adapter)?.get(brainId);
+}
+
+async function sqliteCoordinationIdentity(
+  dbPath: string,
+  brainId: string,
+  adapterKind: string,
+  openedResource: SqliteOpenedResource,
+): Promise<string | null> {
+  if (openedResource.isUriMemory) {
+    const { body, params } = parseBetterSqliteUri(dbPath);
+    if (params.get('cache') !== 'shared' || !openedResource.supportsSharedCache) {
+      return null;
+    }
+    return JSON.stringify([
+      'sqlite-memory-uri',
+      adapterKind,
+      sqliteUriBodyToPath(body),
+      sharedMemoryUriParameterIdentity(openedResource.uriParameters),
+      brainId,
+    ]);
+  }
+
+  if (!openedResource.identityKnown || openedResource.filename === '') {
+    return null;
+  }
+
+  // `PRAGMA database_list` exposes SQLite's opened filename, which is the
+  // VFS-resolved absolute path. This distinguishes an actually parsed file URI
+  // from a literal `file:` filename without trusting mutable process state.
+  const resourcePath = openedResource.filename ?? dbPath;
+  const target = await fs.realpath(resourcePath).catch(() => path.resolve(resourcePath));
+  return JSON.stringify([
+    'sqlite',
+    adapterKind,
+    target,
+    openedResource.uriParameters,
+    brainId,
+  ]);
+}
+
+async function inspectSqliteOpenedResource(
+  adapter: StorageAdapter,
+  dbPath: string,
+): Promise<SqliteOpenedResource> {
+  if (adapter.kind !== 'better-sqlite3') {
+    return {
+      filename: null,
+      isUriMemory: false,
+      uriParameters: '',
+      supportsSharedCache: false,
+      identityKnown: dbPath.length > 0,
+    };
+  }
+
+  const parsedUri = dbPath.startsWith('file:')
+    ? parseBetterSqliteUri(dbPath)
+    : null;
+
+  let filename: string | null;
+  try {
+    const rows = await adapter.all<{ seq: number; name: string; file: string }>(
+      'PRAGMA database_list',
+    );
+    const main = rows.find((row) => row.name === 'main') ?? rows[0];
+    filename = typeof main?.file === 'string' ? main.file : null;
+  } catch {
+    // A file URI can name private or ephemeral databases. Without SQLite's
+    // opened filename, interning its raw text could merge distinct resources.
+    return {
+      filename: null,
+      isUriMemory: false,
+      uriParameters: '',
+      supportsSharedCache: false,
+      identityKnown:
+        dbPath.length > 0 &&
+        !dbPath.startsWith('file:') &&
+        !dbPath.startsWith(':'),
+    };
+  }
+
+  let supportsSharedCache = false;
+  try {
+    const sharedCacheRow = await adapter.get<{ omitted: number }>(
+      "SELECT sqlite_compileoption_used('OMIT_SHARED_CACHE') AS omitted",
+    );
+    supportsSharedCache = Number(sharedCacheRow?.omitted ?? 0) === 0;
+  } catch {
+    // The opened filename remains authoritative for disk identity. Treat
+    // shared-memory support as unavailable when the compile probe is missing.
+  }
+
+  const isUriMemory = Boolean(
+    parsedUri &&
+    filename === '' &&
+    (parsedUri.body === ':memory:' || parsedUri.params.get('mode') === 'memory'),
+  );
+  return {
+    filename,
+    isUriMemory,
+    uriParameters: parsedUri?.rawQuery ?? '',
+    supportsSharedCache,
+    identityKnown: filename !== null,
+  };
+}
+
+function postgresCoordinationIdentity(connectionString: string, brainId: string): string {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(connectionString)) {
+    try {
+      const url = new URL(connectionString);
+      // Keep the role in the internal identity. PostgreSQL defaults the
+      // database to the role when no path is supplied, and role-specific RLS
+      // or `$user` schemas must never share a coordination namespace.
+      url.password = '';
+      for (const key of [...url.searchParams.keys()]) {
+        if (
+          ['password', 'passfile', 'sslcert', 'sslkey', 'sslpassword']
+            .includes(key.toLowerCase())
+        ) {
+          url.searchParams.delete(key);
+        }
+      }
+      url.searchParams.sort();
+      return JSON.stringify(['postgres', url.toString(), brainId]);
+    } catch {
+      // Fall through to credential stripping for malformed or keyword input.
+    }
+  }
+
+  const credentialKey = '(?:password|passfile|sslcert|sslkey|sslpassword)';
+  const withoutCredentials = connectionString
+    .replace(/^([a-z][a-z0-9+.-]*:\/\/[^:@/]+):[^@/]*@/i, '$1@')
+    .replace(new RegExp(`\\b${credentialKey}\\s*=\\s*'(?:''|\\\\'|[^'])*'`, 'gi'), '')
+    .replace(new RegExp(`\\b${credentialKey}\\s*=\\s*"(?:""|\\\\"|[^"])*"`, 'gi'), '')
+    .replace(new RegExp(`\\b${credentialKey}\\s*=\\s*[^\\s'"]+`, 'gi'), '')
+    .trim();
+  return JSON.stringify(['postgres', withoutCredentials, brainId]);
+}
+
+// redactPostgresPassword extracted to ./postgresPasswordRedaction.ts
+// (handles both URL form and keyword form; see postgresPasswordRedaction.test.ts).
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+// SCHEMA_VERSION moved to migrations/index.ts as LATEST_SCHEMA_VERSION
+// (derived from the highest registered migration, so adding v2-to-v3.ts
+// auto-bumps the seed value).
+
+// ---------------------------------------------------------------------------
+// DDL — full schema
+// ---------------------------------------------------------------------------
+
+/**
+ * Brain metadata key-value store.
+ * Used for versioning, agent identity, and embedding configuration.
+ */
+const DDL_BRAIN_META = `
+CREATE TABLE IF NOT EXISTS brain_meta (
+  brain_id TEXT NOT NULL,
+  key      TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  PRIMARY KEY (brain_id, key)
+);
+`;
+
+/**
+ * Core memory trace table (Tulving's unified trace model).
+ *
+ * Column notes:
+ * - `embedding` is a raw BLOB (Float32Array serialised as little-endian bytes).
+ * - `strength` is the Ebbinghaus retrievability R ∈ [0, 1].
+ * - `tags` / `emotions` / `metadata` are JSON TEXT columns.
+ * - `deleted` is a soft-delete flag (0 = active, 1 = tombstoned).
+ * - `scope_id` is the trace's scope id, also kept in `metadata.scopeId`; `''` for a trace filed under no scope id.
+ *   Its index is created by `ensureScopeIdColumn` (migrations/v2-to-v3.ts), after the column is known to exist.
+ */
+const DDL_MEMORY_TRACES = `
+CREATE TABLE IF NOT EXISTS memory_traces (
+  brain_id        TEXT    NOT NULL,
+  id              TEXT    NOT NULL,
+  type            TEXT    NOT NULL,
+  scope           TEXT    NOT NULL,
+  content         TEXT    NOT NULL,
+  embedding       BLOB,
+  strength        REAL    NOT NULL DEFAULT 1.0,
+  created_at      INTEGER NOT NULL,
+  last_accessed   INTEGER,
+  retrieval_count INTEGER NOT NULL DEFAULT 0,
+  tags            TEXT    NOT NULL DEFAULT '[]',
+  emotions        TEXT    NOT NULL DEFAULT '{}',
+  metadata        TEXT    NOT NULL DEFAULT '{}',
+  deleted         INTEGER NOT NULL DEFAULT 0,
+  scope_id        TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_traces_brain_type
+  ON memory_traces (brain_id, type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_traces_brain_scope
+  ON memory_traces (brain_id, scope);
+`;
+
+// FTS index DDL is now generated dynamically by features.fts.createIndex()
+// to support both SQLite FTS5 and Postgres tsvector/GIN.
+
+/**
+ * Knowledge graph nodes (semantic network).
+ * Each node represents a real-world entity or concept the agent has learned about.
+ *
+ * `properties` is a JSON TEXT column holding arbitrary typed attributes.
+ * `source` is a JSON TEXT provenance reference.
+ * `confidence` ∈ [0, 1] — certainty of this node's existence / accuracy.
+ */
+const DDL_KNOWLEDGE_NODES = `
+CREATE TABLE IF NOT EXISTS knowledge_nodes (
+  brain_id   TEXT    NOT NULL,
+  id         TEXT    NOT NULL,
+  type       TEXT    NOT NULL,
+  label      TEXT    NOT NULL,
+  properties TEXT    NOT NULL DEFAULT '{}',
+  embedding  BLOB,
+  confidence REAL    NOT NULL DEFAULT 1.0,
+  source     TEXT    NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_nodes_brain_type
+  ON knowledge_nodes (brain_id, type);
+`;
+
+/**
+ * Knowledge graph edges (typed relationships).
+ * Models semantic links between knowledge nodes (e.g. IS_A, HAS_PART, CAUSED_BY).
+ *
+ * `bidirectional = 1` means the edge applies in both directions (e.g. SIBLING_OF).
+ * `weight` ∈ [0, 1] represents relationship strength / confidence.
+ */
+const DDL_KNOWLEDGE_EDGES = `
+CREATE TABLE IF NOT EXISTS knowledge_edges (
+  brain_id      TEXT    NOT NULL,
+  id            TEXT    NOT NULL,
+  source_id     TEXT    NOT NULL,
+  target_id     TEXT    NOT NULL,
+  type          TEXT    NOT NULL,
+  weight        REAL    NOT NULL DEFAULT 1.0,
+  bidirectional INTEGER NOT NULL DEFAULT 0,
+  metadata      TEXT    NOT NULL DEFAULT '{}',
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (brain_id, id),
+  FOREIGN KEY (brain_id, source_id) REFERENCES knowledge_nodes(brain_id, id),
+  FOREIGN KEY (brain_id, target_id) REFERENCES knowledge_nodes(brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_edges_brain_source
+  ON knowledge_edges (brain_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_edges_brain_target
+  ON knowledge_edges (brain_id, target_id);
+`;
+
+/**
+ * Ingested document registry.
+ *
+ * Tracks every external document (PDF, Markdown, web page, etc.) that has
+ * been chunked and embedded into this agent's brain.
+ *
+ * `content_hash` enables idempotent re-ingestion (skip if unchanged).
+ */
+const DDL_DOCUMENTS = `
+CREATE TABLE IF NOT EXISTS documents (
+  brain_id     TEXT    NOT NULL,
+  id           TEXT    NOT NULL,
+  path         TEXT    NOT NULL,
+  format       TEXT    NOT NULL,
+  title        TEXT,
+  content_hash TEXT    NOT NULL,
+  chunk_count  INTEGER NOT NULL DEFAULT 0,
+  metadata     TEXT    NOT NULL DEFAULT '{}',
+  ingested_at  INTEGER NOT NULL,
+  PRIMARY KEY (brain_id, id)
+);
+`;
+
+/**
+ * Document chunk table.
+ *
+ * Each chunk corresponds to a contiguous passage of text extracted from a
+ * parent document. `trace_id` links to the corresponding memory trace so
+ * retrieval pipelines can cross-reference vector search results.
+ */
+const DDL_DOCUMENT_CHUNKS = `
+CREATE TABLE IF NOT EXISTS document_chunks (
+  brain_id     TEXT    NOT NULL,
+  id           TEXT    NOT NULL,
+  document_id  TEXT    NOT NULL,
+  trace_id     TEXT,
+  content      TEXT    NOT NULL,
+  chunk_index  INTEGER NOT NULL,
+  page_number  INTEGER,
+  embedding    BLOB,
+  PRIMARY KEY (brain_id, id),
+  FOREIGN KEY (brain_id, document_id) REFERENCES documents(brain_id, id),
+  FOREIGN KEY (brain_id, trace_id) REFERENCES memory_traces(brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_brain_document
+  ON document_chunks (brain_id, document_id, chunk_index);
+`;
+
+/**
+ * Document image table.
+ *
+ * Stores visual assets extracted from documents (e.g. figures, diagrams).
+ * `caption` and `embedding` support multimodal retrieval.
+ */
+const DDL_DOCUMENT_IMAGES = `
+CREATE TABLE IF NOT EXISTS document_images (
+  brain_id    TEXT    NOT NULL,
+  id          TEXT    NOT NULL,
+  document_id TEXT    NOT NULL,
+  chunk_id    TEXT,
+  data        BLOB    NOT NULL,
+  mime_type   TEXT    NOT NULL,
+  caption     TEXT,
+  page_number INTEGER,
+  embedding   BLOB,
+  PRIMARY KEY (brain_id, id),
+  FOREIGN KEY (brain_id, document_id) REFERENCES documents(brain_id, id),
+  FOREIGN KEY (brain_id, chunk_id) REFERENCES document_chunks(brain_id, id)
+);
+`;
+
+/**
+ * Consolidation log.
+ *
+ * Records each offline consolidation run — the analogue of slow-wave sleep
+ * memory consolidation. Tracks how many traces were pruned, merged, derived
+ * (by inference), or compacted (losslessly compressed).
+ */
+const DDL_CONSOLIDATION_LOG = `
+CREATE TABLE IF NOT EXISTS consolidation_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  brain_id    TEXT    NOT NULL,
+  ran_at      INTEGER NOT NULL,
+  pruned      INTEGER NOT NULL DEFAULT 0,
+  merged      INTEGER NOT NULL DEFAULT 0,
+  derived     INTEGER NOT NULL DEFAULT 0,
+  compacted   INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_brain_time
+  ON consolidation_log (brain_id, ran_at DESC);
+`;
+
+/**
+ * Retrieval feedback signals.
+ *
+ * Captures explicit (thumbs up/down) or implicit (click, dwell time, follow-up)
+ * feedback on retrieved memory traces. Used by the spaced-repetition scheduler
+ * to modulate `strength` and `stability` updates (Hebbian reinforcement).
+ *
+ * `signal` examples: 'positive', 'negative', 'neutral', 'implicit_positive'.
+ */
+const DDL_RETRIEVAL_FEEDBACK = `
+CREATE TABLE IF NOT EXISTS retrieval_feedback (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  brain_id   TEXT    NOT NULL,
+  trace_id   TEXT    NOT NULL,
+  signal     TEXT    NOT NULL,
+  query      TEXT,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (brain_id, trace_id) REFERENCES memory_traces(brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_feedback_brain_trace
+  ON retrieval_feedback (brain_id, trace_id, created_at DESC);
+`;
+
+/**
+ * Conversation sessions.
+ *
+ * Provides a lightweight conversational buffer independent of external message
+ * stores. Primarily used for episodic memory encoding (conversation → trace).
+ */
+const DDL_CONVERSATIONS = `
+CREATE TABLE IF NOT EXISTS conversations (
+  brain_id   TEXT    NOT NULL,
+  id         TEXT    NOT NULL,
+  title      TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  metadata   TEXT    NOT NULL DEFAULT '{}',
+  PRIMARY KEY (brain_id, id)
+);
+`;
+
+/**
+ * Conversation messages.
+ *
+ * Each message belongs to a conversation. `role` follows the OpenAI convention:
+ * 'user' | 'assistant' | 'system' | 'tool'.
+ */
+const DDL_MESSAGES = `
+CREATE TABLE IF NOT EXISTS messages (
+  brain_id        TEXT    NOT NULL,
+  id              TEXT    NOT NULL,
+  conversation_id TEXT    NOT NULL,
+  role            TEXT    NOT NULL,
+  content         TEXT    NOT NULL,
+  created_at      INTEGER NOT NULL,
+  metadata        TEXT    NOT NULL DEFAULT '{}',
+  PRIMARY KEY (brain_id, id),
+  FOREIGN KEY (brain_id, conversation_id) REFERENCES conversations(brain_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_brain_conversation
+  ON messages (brain_id, conversation_id, created_at);
+`;
+
+/**
+ * Prospective memory items table.
+ *
+ * Stores time-based, event-based, and context-based reminders/intentions
+ * that the ProspectiveMemoryManager checks each turn. Items are registered
+ * automatically from commitment and intention observation notes.
+ *
+ * `trigger_type` determines how the item fires:
+ * - 'time_based': fires at or after `trigger_at` timestamp
+ * - 'event_based': fires when `trigger_event` name occurs
+ * - 'context_based': fires when embedding similarity to `cue_embedding` exceeds threshold
+ */
+const DDL_PROSPECTIVE_ITEMS = `
+CREATE TABLE IF NOT EXISTS prospective_items (
+  brain_id             TEXT    NOT NULL,
+  id                   TEXT    NOT NULL,
+  content              TEXT    NOT NULL,
+  trigger_type         TEXT    NOT NULL,
+  trigger_at           INTEGER,
+  trigger_event        TEXT,
+  cue_text             TEXT,
+  cue_embedding        BLOB,
+  similarity_threshold REAL    DEFAULT 0.7,
+  importance           REAL    NOT NULL DEFAULT 0.5,
+  triggered            INTEGER NOT NULL DEFAULT 0,
+  recurring            INTEGER NOT NULL DEFAULT 0,
+  source_trace_id      TEXT,
+  created_at           INTEGER NOT NULL,
+  PRIMARY KEY (brain_id, id)
+);
+`;
+
+// ---------------------------------------------------------------------------
+// Brain
+// ---------------------------------------------------------------------------
+
+/**
+ * Unified cross-platform connection manager for a single agent's persistent brain.
+ *
+ * Uses the `StorageAdapter` interface from `@framers/sql-storage-adapter` to
+ * support multiple backends (better-sqlite3, sql.js, IndexedDB, Postgres, etc.)
+ * transparently. All methods are async.
+ *
+ * **Usage:**
+ * ```ts
+ * const brain = await Brain.open('/path/to/agent/brain.sqlite');
+ *
+ * // Async query API for subsystems
+ * const row = await brain.get<{ value: string }>('SELECT value FROM brain_meta WHERE key = ?', ['schema_version']);
+ *
+ * // Meta helpers
+ * await brain.setMeta('last_sync', Date.now().toString());
+ * const ver = await brain.getMeta('schema_version'); // '1'
+ *
+ * await brain.close();
+ * ```
+ *
+ * Subsystems (KnowledgeGraph, MemoryGraph, ConsolidationLoop, etc.)
+ * receive the `Brain` instance and call its async proxy methods
+ * (`run`, `get`, `all`, `exec`, `transaction`) for all database operations.
+ */
+export class Brain {
+  /**
+   * The cross-platform storage adapter backing this brain.
+   * Not exposed publicly — consumers use the async proxy methods instead.
+   */
+  private readonly _adapter: StorageAdapter;
+
+  /**
+   * Platform-aware feature bundle (dialect, FTS, BLOB codec, exporter).
+   * Created by `createStorageFeatures(adapter)` during `open()`.
+   */
+  private readonly _features: StorageFeatures;
+
+  /**
+   * Brain identifier used to scope every brain-owned table row.
+   *
+   * In SQLite per-file mode, defaults to the file basename (or `'default'`
+   * for `:memory:`); subsystems pass it through to the `brain_id` column
+   * on every INSERT/UPDATE and into every WHERE clause on SELECT.
+   *
+   * In Postgres mode (multi-tenant), this is required and must be unique
+   * per brain across the database.
+   */
+  readonly #brainId: string;
+
+  /**
+   * Opaque process-local key for coordinating operations that target the
+   * same durable storage resource. It intentionally contains no path or
+   * connection-string material.
+   */
+  readonly #coordinationToken: object;
+
+  // ---------------------------------------------------------------------------
+  // Constructor (private — use Brain.open())
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Private constructor — use `Brain.open(dbPath)` instead.
+   *
+   * @param adapter  - A fully initialised StorageAdapter instance.
+   * @param features - Platform-aware feature bundle.
+   * @param brainId  - Brain identifier used to scope multi-tenant queries.
+   * @param coordinationToken - Opaque identity of the backing store and brain.
+   */
+  private constructor(
+    adapter: StorageAdapter,
+    features: StorageFeatures,
+    brainId: string,
+    coordinationToken: object,
+  ) {
+    this._adapter = adapter;
+    this._features = features;
+    this.#brainId = brainId;
+    this.#coordinationToken = coordinationToken;
+  }
+
+  /**
+   * Brain identifier scoping every query through this Brain instance.
+   * Subsystems (KnowledgeGraph, MemoryGraph, ConsolidationLoop) read this
+   * to inject `brain_id` into their own SQL.
+   */
+  get brainId(): string {
+    return this.#brainId;
+  }
+
+  /**
+   * Opaque identity used to serialize same-process operations across
+   * separate Brain handles that address the same backing store.
+   */
+  get coordinationToken(): object {
+    return this.#coordinationToken;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Async factories (three named entry points)
+  //
+  // Naming convention:
+  //   - openSqlite / openPostgres: factory by-DIALECT. The caller specifies
+  //     "I want a SQLite-backed brain at this file" or "I want a Postgres-
+  //     backed brain at this URL." The adapter is constructed internally.
+  //   - openWithAdapter: factory by-PRE-BUILT-ADAPTER. The caller has already
+  //     built the StorageAdapter (e.g., to share a connection pool with
+  //     another subsystem) and hands it to Brain to consume.
+  //
+  // The naming asymmetry is intentional: the first two are dialect-specific
+  // entry points; the third is the escape hatch for advanced cases where the
+  // adapter is owned outside the Brain.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Open a Brain backed by SQLite. Tries adapters in order:
+   * better-sqlite3 (Node native) -> sql.js (WASM) -> indexeddb (browser).
+   *
+   * @param dbPath - File path. Use `:memory:` for in-process testing.
+   * @param opts.brainId - Optional explicit brainId; defaults to file basename
+   *   (or `'default'` for `:memory:`).
+   * @param opts.priority - Override the default adapter priority.
+   * @param opts.coordinationToken - Optional process-local identity for
+   *   non-filesystem adapters whose resource name is adapter-specific.
+   * @returns A fully initialised `Brain` instance with the latest schema.
+   */
+  static async openSqlite(
+    dbPath: string,
+    opts: {
+      brainId?: string;
+      priority?: ('better-sqlite3' | 'sqljs' | 'indexeddb')[];
+      coordinationToken?: object;
+    } = {},
+  ): Promise<Brain> {
+    const adapter = await resolveStorageAdapter({
+      filePath: dbPath,
+      priority: opts.priority ?? ['better-sqlite3', 'sqljs', 'indexeddb'],
+      quiet: true,
+    });
+    const openedResource = await inspectSqliteOpenedResource(adapter, dbPath);
+    const brainId = opts.brainId ?? deriveBrainIdFromPath(dbPath, openedResource);
+    const usesFileIdentity =
+      adapter.kind === 'better-sqlite3' ||
+      (adapter.kind === 'sqljs' && adapter.capabilities.has('persistence'));
+    const identity = usesFileIdentity && dbPath !== ':memory:'
+      ? await sqliteCoordinationIdentity(
+          dbPath,
+          brainId,
+          adapter.kind,
+          openedResource,
+        )
+      : null;
+    const coordinationToken =
+      opts.coordinationToken ??
+      (identity
+        ? internCoordinationToken(identity)
+        : coordinationTokenForAdapter(adapter, brainId));
+    rememberAdapterCoordinationToken(adapter, brainId, coordinationToken);
+    return Brain._initialize(adapter, brainId, coordinationToken);
+  }
+
+  /**
+   * Open a Brain backed by PostgreSQL. Requires the `pg` npm package and
+   * a reachable Postgres instance.
+   *
+   * Every integer column of the Brain's schema is `BIGINT` on Postgres, and
+   * this adapter reads `BIGINT` as a number, as SQLite returns its integers:
+   * a trace's retrieval count, access and creation times and deleted flag
+   * load as numbers on both dialects.
+   *
+   * @param connectionString - Standard Postgres connection URL.
+   * @param opts.brainId - REQUIRED. Used to scope every query so multiple
+   *   brains can share one Postgres database without leaking rows.
+   * @param opts.poolSize - pg connection pool size. Defaults to 10.
+   */
+  static async openPostgres(
+    connectionString: string,
+    opts: { brainId: string; poolSize?: number },
+  ): Promise<Brain> {
+    if (!opts.brainId) {
+      throw new Error('Brain.openPostgres: opts.brainId is required (Postgres mode is multi-tenant)');
+    }
+    // Use createPostgresAdapter directly so we can pass pool size; the
+    // resolveStorageAdapter facade only forwards `connectionString`.
+    let adapter: StorageAdapter;
+    try {
+      adapter = await createPostgresAdapter({
+        connectionString,
+        max: opts.poolSize ?? 10,
+        // pg reads BIGINT as a string by default; the Brain's integer columns are BIGINT here.
+        typeParsers: { int8: 'number' },
+      });
+      await adapter.open();
+    } catch (err) {
+      const safe = redactPostgresPassword(connectionString);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Brain.openPostgres: connection failed for ${safe}: ${msg}`);
+    }
+    const coordinationToken = internCoordinationToken(
+      postgresCoordinationIdentity(connectionString, opts.brainId),
+    );
+    rememberAdapterCoordinationToken(adapter, opts.brainId, coordinationToken);
+    return Brain._initialize(adapter, opts.brainId, coordinationToken);
+  }
+
+  /**
+   * Open a Brain with a pre-resolved StorageAdapter. Use when sharing an
+   * adapter across subsystems (e.g., wilds-ai foundation pool + brain) or
+   * when the consumer needs full control over adapter resolution.
+   *
+   * **CONCURRENCY CAVEAT (Postgres adapters):** the underlying
+   * `PostgresAdapter` tracks `transactionalClient` as instance-shared
+   * mutable state. Two concurrent `Brain.transaction(...)` calls on the
+   * same shared adapter (or any subsystem call that internally opens a
+   * transaction) will overwrite each other's connection assignment, which
+   * corrupts both transactions silently. If the consumer dispatches
+   * concurrent writes through subsystems sharing one adapter, either:
+   *   1. construct a fresh `PostgresAdapter` per logical actor, OR
+   *   2. serialize transactions at the consumer layer until the adapter
+   *      gets `AsyncLocalStorage`-tracked transactional clients.
+   * Non-transactional concurrent reads/writes against a shared adapter
+   * are safe (the pool handles those correctly).
+   *
+   * **INTEGER COLUMNS (Postgres adapters):** the Brain's integer columns are
+   * `BIGINT` on Postgres, which pg reads as strings unless the adapter is
+   * opened with `typeParsers: { int8: 'number' }`, as {@link Brain.openPostgres}
+   * opens its own. Read as strings, a trace's retrieval count and times load
+   * as text, and an access appends to the count instead of adding to it.
+   *
+   * @param adapter - Pre-built StorageAdapter instance.
+   * @param opts.brainId - Required for postgres-kind adapters; optional for
+   *   sqlite-kind adapters (defaults to `'default'`).
+   * @param opts.coordinationToken - Optional shared opaque token for separate
+   *   adapter objects that address the same backing database and brain.
+   */
+  static async openWithAdapter(
+    adapter: StorageAdapter,
+    opts: { brainId?: string; coordinationToken?: object } = {},
+  ): Promise<Brain> {
+    const isPostgres = adapter.kind.includes('postgres');
+    if (isPostgres && !opts.brainId) {
+      throw new Error(
+        'Brain.openWithAdapter: opts.brainId is required for postgres-kind adapters',
+      );
+    }
+    const brainId = opts.brainId ?? 'default';
+    const remembered = rememberedAdapterCoordinationToken(adapter, brainId);
+    if (
+      opts.coordinationToken &&
+      remembered &&
+      remembered !== opts.coordinationToken
+    ) {
+      throw new Error(
+        'Brain.openWithAdapter: coordinationToken conflicts with the token already ' +
+          'registered for this adapter and brainId',
+      );
+    }
+    const coordinationToken =
+      opts.coordinationToken ?? remembered ?? coordinationTokenForAdapter(adapter, brainId);
+    rememberAdapterCoordinationToken(adapter, brainId, coordinationToken);
+    return Brain._initialize(adapter, brainId, coordinationToken);
+  }
+
+  /**
+   * Internal common initialization path used by all three factories.
+   *
+   * Sequence:
+   * 1. Build platform-aware feature bundle.
+   * 2. Set WAL mode (dialect.pragma returns null on Postgres).
+   * 3. Enable foreign key enforcement (dialect.pragma returns null on Postgres).
+   * 4. Run the pending schema migrations (idempotent; no-op for fresh DBs and the latest schema).
+   * 5. Apply full DDL via _initSchema().
+   * 6. File the brain's traces that hold `scope_id` `''` while their metadata names a scope id (`fillScopeIds`).
+   * 7. Seed brain_meta defaults.
+   * 8. Repair the full-text index (SQLite).
+   */
+  private static async _initialize(
+    adapter: StorageAdapter,
+    brainId: string,
+    coordinationToken: object,
+  ): Promise<Brain> {
+    const features = createStorageFeatures(adapter);
+    const brain = new Brain(adapter, features, brainId, coordinationToken);
+
+    const walPragma = features.dialect.pragma('journal_mode', 'WAL');
+    if (walPragma) await adapter.exec(walPragma);
+
+    const fkPragma = features.dialect.pragma('foreign_keys', 'ON');
+    if (fkPragma) await adapter.exec(fkPragma);
+
+    await MigrationRunner.runPending(adapter, features, brainId, MIGRATIONS);
+    await brain._initSchema();
+    // A release older than `scope_id` writes the column's default, '', to a brain at version 3 too, whose migration
+    // never runs again.
+    await fillScopeIds(adapter, brainId);
+    await brain._seedMeta();
+    await brain._repairFullTextIndex();
+
+    return brain;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Async proxy methods (for consumer subsystems)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Execute a mutation statement (INSERT, UPDATE, DELETE).
+   *
+   * @param sql    - SQL statement with `?` positional placeholders.
+   * @param params - Parameter array matching the placeholders.
+   * @returns Metadata about affected rows.
+   */
+  async run(sql: string, params?: StorageParameters): Promise<StorageRunResult> {
+    return this._adapter.run(sql, params);
+  }
+
+  /**
+   * Retrieve a single row (or null if none found).
+   *
+   * @param sql    - SQL SELECT statement.
+   * @param params - Parameter array.
+   * @returns First matching row or null.
+   */
+  async get<T = unknown>(sql: string, params?: StorageParameters): Promise<T | null> {
+    return this._adapter.get<T>(sql, params);
+  }
+
+  /**
+   * Retrieve all rows matching the statement.
+   *
+   * @param sql    - SQL SELECT statement.
+   * @param params - Parameter array.
+   * @returns Array of matching rows (empty array if none).
+   */
+  async all<T = unknown>(sql: string, params?: StorageParameters): Promise<T[]> {
+    return this._adapter.all<T>(sql, params);
+  }
+
+  /**
+   * Execute a script containing multiple SQL statements.
+   *
+   * @param sql - SQL script (semicolon-delimited statements).
+   */
+  async exec(sql: string): Promise<void> {
+    return this._adapter.exec(sql);
+  }
+
+  /**
+   * Execute a callback within a database transaction.
+   *
+   * The transaction is automatically committed on success or rolled back
+   * on error.
+   *
+   * @param fn - Async callback receiving a transactional adapter.
+   * @returns Result of the callback.
+   */
+  async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+    return this._adapter.transaction(fn);
+  }
+
+  /**
+   * Expose the raw storage adapter for advanced usage.
+   *
+   * Code that needs the adapter itself reads it here; the brain's own
+   * queries go through `run`, `get`, `all` and `transaction`.
+   */
+  get adapter(): StorageAdapter {
+    return this._adapter;
+  }
+
+  /**
+   * Platform-aware feature bundle (dialect, FTS, BLOB codec, exporter).
+   * Consumers use this to generate cross-platform SQL instead of hardcoding
+   * SQLite-specific syntax.
+   */
+  get features(): StorageFeatures {
+    return this._features;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private init helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Execute idempotent DDL statements to initialize the schema.
+   * `CREATE TABLE IF NOT EXISTS` is safe to re-run, so a sequential setup path
+   * is sufficient and avoids adapter-specific transaction quirks during DDL.
+   */
+  private async _initSchema(): Promise<void> {
+    const adapter = this._adapter;
+    const ddlStatements = [
+      DDL_BRAIN_META,
+      DDL_MEMORY_TRACES,
+      DDL_KNOWLEDGE_NODES,
+      DDL_KNOWLEDGE_EDGES,
+      DDL_DOCUMENTS,
+      DDL_DOCUMENT_CHUNKS,
+      DDL_DOCUMENT_IMAGES,
+      DDL_CONSOLIDATION_LOG,
+      DDL_RETRIEVAL_FEEDBACK,
+      DDL_CONVERSATIONS,
+      DDL_MESSAGES,
+      DDL_PROSPECTIVE_ITEMS,
+      // Memory archive tables (write-ahead cold storage for verbatim content)
+      DDL_ARCHIVED_TRACES,
+      DDL_ARCHIVED_TRACES_IDX_AGENT_TIME,
+      DDL_ARCHIVED_TRACES_IDX_REASON,
+      DDL_ARCHIVE_ACCESS_LOG,
+      DDL_ARCHIVE_ACCESS_LOG_IDX,
+    ];
+
+    const postgres = this._features.dialect.name === 'postgres';
+    for (const statement of ddlStatements) {
+      const normalized = this._normalizeDdlForDialect(statement);
+      if (postgres) await execSchemaScriptOnPostgres(adapter, normalized);
+      else await retryLostCreate(() => adapter.exec(normalized));
+    }
+
+    // A table another path created without `scope_id` (a migration engine's copy) gains it here; a fresh table has it.
+    // The step makes two indexes, and the first opens of several brains make them at the same moment, so an open can
+    // lose the race for one and then for the other: retryLostCreate runs the step until a run loses none.
+    await retryLostCreate(async () => {
+      await ensureScopeIdColumn(adapter);
+    });
+
+    // FTS index via feature abstraction (FTS5 on SQLite, tsvector/GIN on Postgres).
+    // SQL.js builds may not include FTS5, so keep the core schema independent.
+    const ftsDdl = this._features.fts.createIndex({
+      table: 'memory_traces_fts',
+      columns: ['content', 'tags'],
+      contentTable: 'memory_traces',
+      tokenizer: 'porter ascii',
+    });
+    try {
+      await retryLostCreate(() => adapter.exec(ftsDdl));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('no such module: fts5')) {
+        throw error;
+      }
+    }
+  }
+
+  private _normalizeDdlForDialect(statement: string): string {
+    if (this._features.dialect.name !== 'postgres') {
+      return statement;
+    }
+
+    return statement
+      .replace(/\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/g, this._features.dialect.autoIncrementPrimaryKey())
+      // SQLite stores every INTEGER as a 64-bit value, but Postgres INTEGER is int4
+      // (max 2_147_483_647). Millisecond-epoch columns (`created_at`, `last_accessed`,
+      // `ingested_at`, `trigger_at`, ...) hold Date.now() values (~1.78e12) that overflow
+      // int4 with `value out of range for type integer` (pg_strtoint32). Map every
+      // remaining INTEGER to BIGINT so Postgres matches SQLite's integer width. Runs after
+      // the AUTOINCREMENT rewrite, so identity columns become `BIGINT GENERATED ALWAYS AS
+      // IDENTITY` (valid, and consistent with the 64-bit surrogate keys SQLite produces).
+      .replace(/\bINTEGER\b/g, 'BIGINT')
+      .replace(/\bBLOB\b/g, 'BYTEA');
+  }
+
+  /**
+   * Repair the full-text index when it disagrees with the content table,
+   * checked on every open.
+   *
+   * `memory_traces_fts` is external-content with no triggers, so it only
+   * covers rows a writer synced. Brains written through the cognitive
+   * pipeline before `MemoryStore.store()` synced carry an EMPTY index, a
+   * failed sync leaves one row out, and a revival leaves the entry under its
+   * old rowid behind: the upsert rewrites the row in place, and
+   * `MemoryStore.store()` then moves it to a fresh rowid. Each makes the
+   * index's set of document ids differ from the content table's rowids. Both
+   * sets hold unique ids, so they are equal exactly when both counts equal
+   * the size of their join (|T ∩ D| = |T| = |D|); anything else triggers a
+   * rebuild from the content table. That is exact (defects cannot cancel)
+   * and costs one primary-key probe into the index's document table per
+   * content row, with no temporary index.
+   *
+   * The check cannot see indexed content rewritten under an unchanged
+   * rowid set. The writers that rewrite indexed text in place
+   * (MemoryUpdateTool, the Memory facade, ConsolidationLoop, SqliteImporter's
+   * tag merge, and `MemoryStore.store()` when a revival's move fails) rebuild
+   * the index themselves, and so do the writers that hard delete traces
+   * (`importFromSqlite`, `MemoryStore.deleteTraces` and `Memory.deleteTraces`).
+   * SQLite only: on Postgres the index is a column of each row, and every
+   * open fills the rows where it is null. Best-effort: nothing here may
+   * block opening the brain.
+   */
+  private async _repairFullTextIndex(): Promise<void> {
+    if (this._features.dialect.name === 'postgres') {
+      return;
+    }
+    try {
+      const sets = await this._adapter.get<{
+        trace_rows: number;
+        indexed_docs: number;
+        matched: number;
+      }>(
+        `SELECT (SELECT count(*) FROM memory_traces) AS trace_rows,
+                (SELECT count(*) FROM memory_traces_fts_docsize) AS indexed_docs,
+                (SELECT count(*) FROM memory_traces t
+                   JOIN memory_traces_fts_docsize d ON d.rowid = t.rowid) AS matched`,
+      );
+      if (
+        !sets ||
+        (Number(sets.trace_rows) === Number(sets.matched) &&
+          Number(sets.indexed_docs) === Number(sets.matched))
+      ) {
+        return;
+      }
+      await this._adapter.exec(this._features.fts.rebuildCommand('memory_traces_fts'));
+    } catch (error) {
+      this._warnFullTextIndexError('repair', error);
+    }
+  }
+
+  /**
+   * Rebuild this brain's full-text index from its traces (best-effort), with
+   * the statement `fullTextRebuild` returns: the whole index on SQLite, the
+   * `_tsv` column of this brain's rows on Postgres. Used after bulk writes
+   * that bypass per-row syncing.
+   */
+  private async _rebuildFullTextIndex(): Promise<void> {
+    try {
+      const rebuild = this.fullTextRebuild();
+      await this._adapter.run(rebuild.sql, rebuild.params);
+    } catch (error) {
+      this._warnFullTextIndexError('rebuild', error);
+    }
+  }
+
+  /** Log a full-text index failure, staying silent when the database holds no index. */
+  private _warnFullTextIndexError(action: 'repair' | 'rebuild', error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    // A database the index was never created in has nothing to maintain. sql.js and the IndexedDB
+    // adapter get an FTS4 index (sql-storage-adapter 0.7.5 and later), every other SQLite adapter FTS5.
+    if (message.includes('no such module: fts5') || message.includes('no such table: memory_traces_fts')) {
+      return;
+    }
+    console.warn(`[Brain] full-text index ${action} failed for brain ${this.#brainId}: ${message}`);
+  }
+
+  /**
+   * Seed `brain_meta` with mandatory keys on first creation.
+   * Uses INSERT OR IGNORE to be idempotent on subsequent opens.
+   */
+  private async _seedMeta(): Promise<void> {
+    const { dialect } = this._features;
+    // INSERT OR IGNORE is idempotent — no transaction needed.
+    // Avoids sql.js "cannot rollback" errors when DDL from _initSchema()
+    // leaves the connection in an implicit-commit state.
+    await this._adapter.run(
+      dialect.insertOrIgnore('brain_meta', ['brain_id', 'key', 'value'], ['?', '?', '?']),
+      [this.#brainId, 'schema_version', String(LATEST_SCHEMA_VERSION)],
+    );
+    await this._adapter.run(
+      dialect.insertOrIgnore('brain_meta', ['brain_id', 'key', 'value'], ['?', '?', '?']),
+      [this.#brainId, 'created_at', Date.now().toString()],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Read a value from the `brain_meta` key-value store.
+   *
+   * @param key - The metadata key to look up.
+   * @returns The stored string value, or `undefined` if the key does not exist.
+   */
+  async getMeta(key: string): Promise<string | undefined> {
+    const row = await this._adapter.get<{ value: string }>(
+      'SELECT value FROM brain_meta WHERE brain_id = ? AND key = ?',
+      [this.#brainId, key],
+    );
+
+    return row?.value;
+  }
+
+  /**
+   * Upsert a value into the `brain_meta` key-value store.
+   *
+   * Uses `INSERT OR REPLACE` semantics — creates the row if absent, or
+   * overwrites if present.
+   *
+   * @param key   - The metadata key.
+   * @param value - The string value to store.
+   */
+  async setMeta(key: string, value: string): Promise<void> {
+    await this._adapter.run(
+      this._features.dialect.insertOrReplace(
+        'brain_meta',
+        ['brain_id', 'key', 'value'],
+        ['?', '?', '?'],
+        'brain_id, key',
+      ),
+      [this.#brainId, key, value],
+    );
+  }
+
+  /**
+   * Check whether a given embedding dimension is compatible with this brain.
+   *
+   * On first call (no stored `embedding_dimensions`), returns `true` and stores
+   * the provided dimension for future compatibility checks.
+   *
+   * Subsequent calls compare `dimensions` against the stored value.
+   * Mismatches indicate that a different embedding model was used to encode
+   * memories — mixing dimensions would corrupt vector similarity searches.
+   *
+   * @param dimensions - The embedding vector length to check (e.g. 1536 for OpenAI ada-002).
+   * @returns `true` if compatible (or no prior value), `false` on mismatch.
+   */
+  async checkEmbeddingCompat(dimensions: number): Promise<boolean> {
+    const stored = await this.getMeta('embedding_dimensions');
+
+    if (stored === undefined) {
+      // First embedding model encounter — store and accept.
+      await this.setMeta('embedding_dimensions', String(dimensions));
+      return true;
+    }
+
+    return parseInt(stored, 10) === dimensions;
+  }
+
+  /**
+   * The statement that rebuilds this brain's full-text index from its traces,
+   * for `run()` on the brain or on a transaction. SQLite keeps the index in
+   * one FTS5 table per file and rebuilds it whole. Postgres keeps it in the
+   * `_tsv` column of the `memory_traces` table every brain shares, so there
+   * the statement updates this brain's rows only.
+   *
+   * @returns The SQL and its parameters.
+   */
+  fullTextRebuild(): { sql: string; params: unknown[] } {
+    const sql = this._features.fts.rebuildCommand('memory_traces_fts');
+    if (this._features.dialect.name !== 'postgres') {
+      return { sql, params: [] };
+    }
+    return { sql: `${sql} ${/\bwhere\b/i.test(sql) ? 'AND' : 'WHERE'} brain_id = ?`, params: [this.#brainId] };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Portable artifact: export to / import from a SQLite snapshot
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Materialize this brain to a portable SQLite file at `targetPath`.
+   *
+   * Source can be any backend (SQLite, Postgres, Capacitor, etc.); output
+   * is always a fresh SQLite file. Used by `.wildsoul`-style export and
+   * other portability flows.
+   *
+   * Refuses to overwrite an existing file at `targetPath` so callers do
+   * not silently lose data.
+   *
+   * The rows come from one consistent view of the database where it gives
+   * one, Postgres or a SQLite file in WAL mode as `openSqlite` opens it (see
+   * `_readSnapshot`), so a write that lands while the export runs is wholly
+   * in the file or wholly out of it. The brain's scope-id form record
+   * (`scope_id_form` in `brain_meta`; see `scopeIdForm.ts`) is read before
+   * the rows and again after them: on a brain with one connection, which
+   * reads no snapshot, a re-file that commits while the export reads makes
+   * the export copy again, so the file's record names the form its rows are
+   * in. The file is written under a temporary name beside `targetPath` and
+   * moved there once whole: a failed export leaves nothing at `targetPath`,
+   * and a retry can run. A file that appears at `targetPath` while the
+   * export runs is kept, and the export fails.
+   *
+   * Forking semantics: rows are emitted with the source brainId. Importing
+   * the resulting file under a different brainId produces a fork.
+   *
+   * @param targetPath - Destination file path. File must not exist.
+   * @returns Bytes written to the destination file.
+   * @throws When anything exists at `targetPath`, before the export or once
+   *   it is written; or when the scope-id form record changed while the
+   *   export read the rows, on each of three passes.
+   */
+  async exportToSqlite(targetPath: string): Promise<{ bytesWritten: number }> {
+    // Refuse to overwrite anything at the target, a dangling link included.
+    if (await entryExists(targetPath)) {
+      throw new Error(`Brain.exportToSqlite: target already exists: ${targetPath}`);
+    }
+
+    for (let pass = 1; ; pass += 1) {
+      const partialPath = `${targetPath}.partial-${uuidv4()}`;
+      try {
+        // Open a fresh SQLite Brain at the partial path. We import under the
+        // source brainId so the export file is identifiable as belonging to
+        // this brain even if the receiving Brain has a different id.
+        const target = await Brain.openSqlite(partialPath, { brainId: this.#brainId });
+        try {
+          await this._readSnapshot(async (source) => {
+            // The scope-id form record, read before the rows and again after
+            // them. A brain on one connection reads no snapshot, so a re-file
+            // another flow commits between two reads moves rows this pass has
+            // not read yet; the pass is then made again, and the file's record
+            // names the form its rows are in.
+            const encoded = await readScopeIdFormRecord(source, this.#brainId);
+            for (const table of PORTABLE_TABLES) {
+              const rows = await source.all<Record<string, unknown>>(
+                `SELECT * FROM ${table} WHERE brain_id = ?`,
+                [this.#brainId],
+              );
+              if (rows.length === 0) continue;
+
+              // Upsert so source rows override the brain_meta defaults
+              // (schema_version, created_at) seeded during target initialisation.
+              await this._bulkCopy(target, table, rows, this.#brainId, { upsert: true });
+            }
+            if ((await readScopeIdFormRecord(source, this.#brainId)) !== encoded) {
+              throw new ScopeIdFormChangedWhileCopied(
+                `Brain.exportToSqlite: this brain's scope-id form record changed while it was exported, on each of ` +
+                  `${SCOPE_ID_FORM_PASSES} passes`,
+              );
+            }
+          });
+          // Fold the write-ahead log into the file, so the one file moved into
+          // place holds every row.
+          const rollbackJournal = target._features.dialect.pragma('journal_mode', 'DELETE');
+          if (rollbackJournal) {
+            await target.exec(rollbackJournal);
+          }
+        } finally {
+          await target.close();
+        }
+        await publishWithoutReplacing(partialPath, targetPath);
+        break;
+      } catch (error) {
+        await Promise.all(
+          ['', '-wal', '-shm', '-journal'].map((suffix) =>
+            fs.rm(`${partialPath}${suffix}`, { force: true }).catch(() => undefined),
+          ),
+        );
+        if (!(error instanceof ScopeIdFormChangedWhileCopied) || pass >= SCOPE_ID_FORM_PASSES) throw error;
+      }
+    }
+
+    const stat = await fs.stat(targetPath);
+    return { bytesWritten: stat.size };
+  }
+
+  /**
+   * Run `read` against one consistent view of this brain's database, so that
+   * rows written while it reads are all in the view or all out of it.
+   *
+   * - Postgres: a `REPEATABLE READ, READ ONLY` transaction on a pooled
+   *   connection of its own; other connections' writes stay outside it.
+   * - A better-sqlite3 file in WAL mode (as `openSqlite` opens it): a read
+   *   transaction on a second, read-only connection to the file. WAL gives
+   *   it one snapshot, and the brain's own connection keeps writing.
+   * - Anything else (an in-memory database, another adapter, another
+   *   journal mode) has one connection that every call shares, so `read`
+   *   runs on the brain's adapter as it is.
+   *
+   * @param read - Reads the view; its result is returned.
+   */
+  private async _readSnapshot<T>(read: (source: StorageAdapter) => Promise<T>): Promise<T> {
+    if (this._features.dialect.name === 'postgres') {
+      return this._adapter.transaction(async (trx) => {
+        await trx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+        return read(trx);
+      });
+    }
+    if (this._adapter.kind !== 'better-sqlite3') {
+      return read(this._adapter);
+    }
+    const main = (await this._adapter.all<{ name: string; file: string }>('PRAGMA database_list')).find(
+      (database) => database.name === 'main',
+    );
+    const journal = await this._adapter.get<{ journal_mode: string }>('PRAGMA journal_mode');
+    if (!main?.file || journal?.journal_mode?.toLowerCase() !== 'wal') {
+      return read(this._adapter);
+    }
+    const reader = await resolveStorageAdapter({
+      filePath: main.file,
+      priority: ['better-sqlite3'],
+      openOptions: { readOnly: true },
+      quiet: true,
+    });
+    try {
+      return await reader.transaction(read);
+    } finally {
+      await reader.close();
+    }
+  }
+
+  /**
+   * Load a portable SQLite file into this Brain's adapter.
+   *
+   * Forking semantics: rows from the source file are written under the
+   * RECEIVING brain's `brainId`, not the brainId stored in the source
+   * file. This means importing an `alice` snapshot into a Brain opened
+   * with `brainId: 'alice-fork'` produces a fork with no shared identity.
+   *
+   * **CAVEAT:** importing from a file an older release wrote MUTATES the
+   * source file. Opening the source via `Brain.openSqlite` runs its pending
+   * migrations in place: v1 to v2 for a file from before 0.3.0, and v2 to v3,
+   * which adds `memory_traces.scope_id` and fills it, for a file from before
+   * 0.13.159. A release before 0.13.159 then fails to import the file into a
+   * table without the column, since its import copies every column it reads.
+   * The open also files the scope id of each source trace that a release
+   * older than the column wrote. To preserve the source unchanged, copy the
+   * file to a temp path before calling this method.
+   *
+   * A trace's episodic copy the file holds under another node id than its
+   * trace's key (a release older than keyed copies recorded it so) is filed
+   * under the key once the rows are in, with the relations that name it, so
+   * a delete by its trace id finds it (`keyTraceCopies`); a copy whose key the
+   * brain's own copy of the trace holds is deleted.
+   *
+   * A Brain a learning layer serves holds its plain `user` and `persona` scope
+   * ids in the encoded form and records it in `brain_meta` (`scope_id_form`;
+   * see `scopeIdForm.ts`). A source with the record whose `user` and
+   * `persona` scope ids, in its traces and its knowledge-graph copies, hold
+   * none of `/`, `%` and `:` reads the same in both forms and is taken as a
+   * plain one: its record is not copied, so a Brain without the record stays
+   * without it. A plain source goes into a Brain that holds the
+   * record with its ids encoded as they are written, each trace's
+   * knowledge-graph copy with it, merged or replaced. A source with the record
+   * goes into a Brain without it, which gets the record, unless the Brain
+   * holds a plain id the record would read as another, in a trace or a copy:
+   * then nothing is written and the call throws, naming the record. A replace
+   * empties the brain first, so only its form counts. The handshake and every
+   * write share one transaction, so a re-file or another import of the brain
+   * that commits first is followed (on Postgres the import waits for the
+   * brain's form lock); the source's record is read before the copy and again
+   * after it, and the copy is made again when a re-file of the source
+   * committed in between.
+   *
+   * @param sourcePath - Source SQLite file path (typically produced by
+   *   `Brain.exportToSqlite`).
+   * @param opts.strategy - `'merge'` (default) upserts on PK collision;
+   *   `'replace'` wipes all rows for the receiving `brainId` first.
+   * @returns Counts of rows imported per table.
+   * @throws When the source holds several brain ids, or when the scope-id
+   *   form handshake refuses it, naming the record (`scope_id_form`).
+   */
+  async importFromSqlite(
+    sourcePath: string,
+    opts: { strategy?: 'merge' | 'replace' } = {},
+  ): Promise<{ tablesImported: Record<string, number> }> {
+    const strategy = opts.strategy ?? 'merge';
+
+    // Peek at the source's brain_meta BEFORE opening it as a Brain. Opening
+    // via Brain.openSqlite without a brainId would derive one from the file
+    // path and pollute brain_meta with that synthetic id (via _seedMeta),
+    // breaking the single-brain check below. We use a raw adapter for the
+    // peek so we don't trigger any seeding.
+    const peekAdapter = await resolveStorageAdapter({
+      filePath: sourcePath,
+      priority: ['better-sqlite3', 'sqljs'],
+      quiet: true,
+    });
+    let sourceBrainIds: { brain_id: string }[] = [];
+    try {
+      // Check brain_meta has the brain_id column before querying it. v1
+      // schemas (pre-0.3.0) only have key/value columns; the SELECT would
+      // throw "no such column: brain_id" otherwise. When the column is
+      // missing, treat as a single-brain v1 source (the auto-migration on
+      // Brain.openSqlite below will add brain_id and namespace by the
+      // path-derived brainId, then importFromSqlite proceeds normally).
+      const cols = await peekAdapter.all<{ name: string }>(
+        `PRAGMA table_info(brain_meta)`,
+      );
+      const hasBrainIdColumn = cols.some((c) => c.name === 'brain_id');
+      if (hasBrainIdColumn) {
+        sourceBrainIds = await peekAdapter.all<{ brain_id: string }>(
+          `SELECT DISTINCT brain_id FROM brain_meta WHERE brain_id IS NOT NULL`,
+        );
+      }
+    } finally {
+      await peekAdapter.close();
+    }
+
+    if (sourceBrainIds.length > 1) {
+      const ids = sourceBrainIds.map((r) => r.brain_id).join(', ');
+      throw new Error(
+        `Brain.importFromSqlite: source contains multiple brain_ids (${ids}). ` +
+          `Imports must be from a single-brain export (use Brain.exportToSqlite).`,
+      );
+    }
+
+    // Open the source as a Brain with the peeked brainId (if any) to avoid
+    // _seedMeta polluting brain_meta with a path-derived id.
+    const sourceBrainId = sourceBrainIds[0]?.brain_id;
+    const source = sourceBrainId
+      ? await Brain.openSqlite(sourcePath, { brainId: sourceBrainId })
+      : await Brain.openSqlite(sourcePath);
+
+    let tablesImported: Record<string, number> = {};
+
+    try {
+      // One transaction holds the import: the handshake of this Brain's scope-id form (scopeIdForm.ts), read in it (on
+      // Postgres under the brain's form lock) so a re-file or another import that commits first is followed, and every
+      // write. The source's record is read before the copy and again after it; when a re-file of the source committed
+      // in between, the transaction rolls back and the copy is made again, so the rows are in the form the record
+      // names.
+      for (let pass = 1; ; pass += 1) {
+        try {
+          tablesImported = await this._adapter.transaction((trx) => this._importSource(trx, source, strategy));
+          break;
+        } catch (error) {
+          if (!(error instanceof ScopeIdFormChangedWhileCopied) || pass >= SCOPE_ID_FORM_PASSES) throw error;
+        }
+      }
+    } finally {
+      await source.close();
+      // The bulk copy writes memory_traces without syncing the full-text
+      // index. On SQLite its upsert rewrites a trace the brain holds in place,
+      // under a rowid whose postings hold the old words, and a 'replace'
+      // import hard-deletes rows first, so the imported traces can get reused
+      // rowids that still carry old postings. On Postgres the upsert's SET
+      // list leaves `_tsv` as it was: a re-imported trace keeps its old
+      // words, and a new one stays null until an open fills it. Rebuild so
+      // the index matches whatever the import left, a partial import that
+      // failed midway included. Best-effort: it never throws, so an import
+      // error still propagates unchanged.
+      await this._rebuildFullTextIndex();
+    }
+
+    return { tablesImported };
+  }
+
+  /**
+   * `importFromSqlite`'s copy, in the transaction it writes in. The handshake comes first: a replace empties this
+   * brain, so only its form counts there, and a Brain that holds the encoded form keeps it (the source's plain ids are
+   * encoded as they are written, each trace's knowledge-graph copy with them), whatever rows it held before. A source
+   * with the record goes into a Brain without it, which gets the record, unless the Brain holds a plain id the record
+   * would read as another; one whose `user` and `persona` scope ids read the same in both forms is taken as a plain
+   * one. Every row of each portable table of the file is then copied under this brain's id, the record but: the
+   * handshake writes it where this brain holds the encoded form once the copy is in.
+   *
+   * @returns The rows copied per table.
+   * @throws When the handshake refuses the source, naming the record; or {@link ScopeIdFormChangedWhileCopied} when
+   *   the source's record changed while the copy read it.
+   */
+  private async _importSource(
+    trx: StorageAdapter,
+    source: Brain,
+    strategy: 'merge' | 'replace',
+  ): Promise<Record<string, number>> {
+    const sourceRecord = await brainHoldsScopeIdFormRecord(source);
+    // The traces and the knowledge-graph nodes are read first: a source whose user and persona scope ids read the same
+    // in both forms is taken as a plain one, so a Brain without the record keeps its plain form.
+    const traceRows = await source.all<Record<string, unknown>>('SELECT * FROM memory_traces');
+    const nodeRows = await source.all<Record<string, unknown>>('SELECT * FROM knowledge_nodes');
+    const sourceEncoded = sourceRecord && holdsScopeIdsTheFormChanges(traceRows, nodeRows);
+    const decision = await importScopeIdFormDecision(
+      trx,
+      this,
+      { encoded: sourceEncoded },
+      { replacing: strategy === 'replace' },
+    );
+    if (decision.action === 'refuse') {
+      throw new Error(`Brain.importFromSqlite: ${SCOPE_ID_FORM_KEY}: ${decision.reason}`);
+    }
+
+    if (strategy === 'replace') {
+      // Wipe existing rows for the receiving brainId in every portable table.
+      // Order matters: child tables before parent tables to satisfy FKs.
+      for (const table of [...PORTABLE_TABLES].reverse()) {
+        await trx.run(`DELETE FROM ${table} WHERE brain_id = ?`, [this.#brainId]);
+      }
+    }
+
+    const tablesImported: Record<string, number> = {};
+    for (const table of PORTABLE_TABLES) {
+      // Read every row in the source file regardless of its stored brainId
+      // so we capture the full snapshot for re-insertion under our brainId.
+      const rows =
+        table === 'memory_traces'
+          ? traceRows
+          : table === 'knowledge_nodes'
+            ? nodeRows
+            : await source.all<Record<string, unknown>>(`SELECT * FROM ${table}`);
+      tablesImported[table] = rows.length;
+      if (rows.length === 0) continue;
+
+      // Always use upsert to gracefully handle the brain_meta rows seeded
+      // by `_seedMeta` during the receiving Brain's initialization (which
+      // would otherwise collide with the source's schema_version/created_at).
+      // The record is the handshake's to write, below.
+      const kept = table === 'brain_meta' ? rows.filter((row) => row.key !== SCOPE_ID_FORM_KEY) : rows;
+      const copied = decision.action === 'encode' ? encodedSourceRows(table, kept) : kept;
+      await this._bulkCopy(this, table, copied, this.#brainId, { upsert: true, db: trx });
+    }
+    // This brain holds the encoded form once the copy is in when the handshake encoded the source, gave this brain the
+    // source's record, or took an encoded source into an encoded brain; a replace deleted the record with this brain's
+    // other brain_meta rows.
+    if (decision.action === 'encode' || decision.action === 'record' || (decision.action === 'take' && sourceEncoded)) {
+      await writeScopeIdFormRecord(trx, this);
+    }
+    // A trace's copy is found by its trace's key: one the file holds under another node id gets the key here.
+    if ((tablesImported['knowledge_nodes'] ?? 0) > 0) await keyTraceCopies(trx, this.#brainId);
+    if ((await brainHoldsScopeIdFormRecord(source)) !== sourceRecord) {
+      throw new ScopeIdFormChangedWhileCopied(
+        `Brain.importFromSqlite: the source's scope-id form record changed while it was copied, on each of ` +
+          `${SCOPE_ID_FORM_PASSES} passes`,
+      );
+    }
+    return tablesImported;
+  }
+
+  /**
+   * Internal helper: bulk-insert `rows` into `target.<table>`, rewriting
+   * `brain_id` on each row to `targetBrainId`. When `opts.upsert` is true,
+   * uses `dialect.insertOrReplace` so PK collisions overwrite (idempotent).
+   * The rows go through `opts.db`, a transaction the caller holds on
+   * `target`'s adapter, when it is given; otherwise through a transaction of
+   * their own, one per table.
+   */
+  private async _bulkCopy(
+    target: Brain,
+    table: string,
+    rows: Record<string, unknown>[],
+    targetBrainId: string,
+    opts: { upsert?: boolean; db?: StorageAdapter } = {},
+  ): Promise<void> {
+    if (rows.length === 0) return;
+
+    // Postgres FTS (PostgresFts) adds a `_tsv` tsvector shadow column to the content
+    // table via `ALTER TABLE ... ADD COLUMN _tsv`. SQLite has no such column (it uses a
+    // separate FTS5 virtual table), and the value is regenerated from source columns by
+    // the receiving Brain's own FTS index — so it must never cross backends. Copying it
+    // verbatim fails with "table memory_traces has no column named _tsv" on a
+    // Postgres -> SQLite export. Strip it from the portable column set in both directions.
+    const columns = Object.keys(rows[0]!).filter((c) => c !== '_tsv');
+    const placeholders = columns.map(() => '?').join(', ');
+    const colList = columns.join(', ');
+
+    const stmt = opts.upsert
+      ? target._features.dialect.insertOrReplace(
+          table,
+          columns,
+          columns.map(() => '?'),
+          PORTABLE_TABLE_PRIMARY_KEYS[table] ?? 'brain_id, id',
+        )
+      : `INSERT INTO ${table} (${colList}) VALUES (${placeholders})`;
+
+    // Single transaction per table for bulk-insert performance + atomicity,
+    // unless the caller holds one. Either is a transaction from
+    // adapter.transaction() (not raw exec BEGIN/COMMIT), so all writes pin to
+    // one pooled connection on Postgres. Raw BEGIN against a pool connection
+    // would land each query on a different connection, breaking the
+    // transactional guarantee silently.
+    const write = async (db: StorageAdapter): Promise<void> => {
+      for (const row of rows) {
+        const values = columns.map((c) =>
+          c === 'brain_id' ? targetBrainId : row[c],
+        );
+        await db.run(stmt, values as never[]);
+      }
+    };
+    if (opts.db) {
+      await write(opts.db);
+    } else {
+      await target._adapter.transaction(write);
+    }
+  }
+
+  /**
+   * Close the database connection.
+   *
+   * Must be called when the agent shuts down to flush the WAL and release
+   * the file lock. Failing to close may leave the database in WAL mode with
+   * an unconsumed WAL file.
+   */
+  async close(): Promise<void> {
+    try {
+      await this._adapter.close();
+    } catch (err) {
+      // Adapter close failures (pool drain timeouts, lock-release races on
+      // shutdown) shouldn't propagate to callers who are themselves shutting
+      // down and can't usefully react. Log to stderr so CI artifacts capture
+      // the failure context if it ever indicates a real problem.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[Brain.close] adapter close failed: ${msg}\n`);
+    }
+  }
+}
+
+// PORTABLE_TABLES + PORTABLE_TABLE_PRIMARY_KEYS moved to ./portable-tables.ts
+// (single source of truth shared with v1-to-v2 migration + postgres test cleanup).

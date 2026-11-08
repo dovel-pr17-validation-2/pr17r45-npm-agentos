@@ -1,0 +1,804 @@
+/**
+ * @fileoverview Pre-GMI turn preparation pipeline.
+ *
+ * This class encapsulates the 12 pre-LLM-call phases of a turn:
+ * GMI acquisition, turn planning, capability discovery, adaptive execution
+ * policies, organization context resolution, long-term memory policy,
+ * inbound message persistence, rolling summary compaction, prompt profile
+ * routing, long-term memory retrieval, conversation history assembly,
+ * and metadata/memory-sink persistence.
+ *
+ * The pipeline produces a {@link PreparedTurnContext} that the orchestrator
+ * consumes to run the GMI tool-call loop and finalize the response.
+ *
+ * Extracted from AgentOSOrchestrator to reduce the size of
+ * `_processTurnInternal` and improve testability of the pre-LLM pipeline.
+ *
+ * @module backend/agentos/api/TurnExecutionPipeline
+ */
+
+import type { StreamId } from '../../core/streaming/StreamingManager';
+import type { StreamChunkEmitter } from './StreamChunkEmitter';
+import type { AgentOSOrchestratorDependencies } from '../types/OrchestratorConfig';
+import type { AgentOSInput } from '../types/AgentOSInput';
+import type { GMIChunkTransformer } from './GMIChunkTransformer';
+import type { TaskOutcomeTelemetryManager, AdaptiveExecutionDecision } from './TaskOutcomeTelemetryManager';
+import {
+  AgentOSResponseChunkType,
+} from '../types/AgentOSResponse';
+import type { ConversationContext } from '../../core/conversation/ConversationContext';
+import { MessageRole } from '../../core/conversation/ConversationMessage';
+import type {
+  IGMI,
+  GMITurnInput,
+} from '../../cognition/substrate/IGMI';
+import { GMIInteractionType } from '../../cognition/substrate/IGMI';
+import { GMIError, GMIErrorCode } from '../../core/utils/errors.js';
+import { withAgentOSSpan } from '../../safety/evaluation/observability/otel';
+import type { GuardrailToolCallGate } from '../../safety/guardrails/guardrailDispatcher';
+import type { TurnPlan } from '../../orchestration/turn-planner/TurnPlanner';
+import {
+  executeRollingSummaryPhase,
+  type RollingSummaryPhaseResult,
+} from './turn-phases/rolling-summary';
+import { executePromptProfilePhase } from './turn-phases/prompt-profile';
+import { executeLongTermMemoryPhase } from './turn-phases/long-term-memory';
+import { assembleConversationHistory } from './turn-phases/conversation-history';
+import type { RollingSummaryCompactionConfig, RollingSummaryCompactionResult } from '../../core/conversation/RollingSummaryCompactor';
+import type {
+  IRollingSummaryMemorySink,
+  RollingSummaryMemoryUpdate,
+} from '../../core/conversation/IRollingSummaryMemorySink';
+import {
+  DEFAULT_LONG_TERM_MEMORY_POLICY,
+  hasAnyLongTermMemoryScope,
+  LONG_TERM_MEMORY_POLICY_METADATA_KEY,
+  resolveLongTermMemoryPolicy,
+  type ResolvedLongTermMemoryPolicy,
+} from '../../core/conversation/LongTermMemoryPolicy';
+import type {
+  LongTermMemoryRecallProfile,
+  AgentOSLongTermMemoryRecallConfig,
+  AgentOSTenantRoutingConfig,
+} from '../types/OrchestratorConfig';
+import { turnContentText } from '../../cognition/substrate/turnContent';
+import {
+  explicitTurnUserOf,
+  turnLearningBeforePreparation,
+  type TurnLearningBeforePreparation,
+} from '../../cognition/learning/toolContext.js';
+
+/** The conversation metadata key that keeps the explicit users a conversation's compactions summarized. */
+const ROLLING_SUMMARY_CONTRIBUTORS_KEY = 'rollingSummaryContributors';
+
+/**
+ * The explicit user ids whose messages a conversation's compactions have summarized: those of its user messages up to
+ * the latest compaction's last message, added to the ones its metadata kept from earlier compactions, whose messages
+ * can have left the context. Writes the union back to the metadata.
+ */
+function rollingSummaryContributors(context: ConversationContext, uptoTimestamp: number | null | undefined): string[] {
+  const kept = context.getMetadata(ROLLING_SUMMARY_CONTRIBUTORS_KEY);
+  const ids = new Set<string>(Array.isArray(kept) ? kept.filter((id): id is string => typeof id === 'string') : []);
+  if (typeof uptoTimestamp === 'number') {
+    for (const message of context.getAllMessages()) {
+      if (message.role !== MessageRole.USER || message.timestamp > uptoTimestamp) continue;
+      const id = explicitTurnUserOf(message.name);
+      if (id) ids.add(id);
+    }
+  }
+  const contributors = [...ids].sort();
+  context.setMetadata(ROLLING_SUMMARY_CONTRIBUTORS_KEY, contributors);
+  return contributors;
+}
+
+/**
+ * Minimal stream context shape, matching the ActiveStreamContext used by
+ * the orchestrator and other extracted classes.
+ */
+export interface PipelineStreamContext {
+  gmi: IGMI;
+  userId: string;
+  sessionId: string;
+  personaId: string;
+  conversationId: string;
+  organizationId?: string;
+  conversationContext: ConversationContext;
+  userApiKeys?: Record<string, string>;
+  processingOptions?: { preferredModelId?: string; preferredProviderId?: string };
+  languageNegotiation?: any;
+  /**
+   * The output guardrails' tool-call gate the stream's turn runs with, when a guardrail evaluates tool calls; a
+   * continuation of the stream given no gate of its own is judged with it.
+   */
+  toolCallGate?: GuardrailToolCallGate;
+}
+
+/**
+ * Result of the pre-LLM turn preparation pipeline.
+ *
+ * Contains all the hydrated state that the orchestrator needs to run the
+ * GMI tool-call loop and finalize the turn.
+ */
+export interface PreparedTurnContext {
+  /** The GMI instance for this turn. */
+  gmi: IGMI;
+  /** The hydrated conversation context. */
+  conversationContext: ConversationContext;
+  /** The resolved persona ID from the GMI. */
+  currentPersonaId: string;
+  /** The GMI instance ID used for chunk attribution. */
+  gmiInstanceIdForChunks: string;
+  /** The constructed GMI input for this turn. */
+  gmiInput: GMITurnInput;
+  /** The active stream context (registered in the shared map). */
+  streamContext: PipelineStreamContext;
+  /** The resolved organization ID for memory scoping. */
+  organizationIdForMemory: string | undefined;
+  /** The resolved long-term memory policy for this turn. */
+  longTermMemoryPolicy: ResolvedLongTermMemoryPolicy | null;
+  /** Whether the turn was planned with a degraded/fallback path. */
+  lifecycleDegraded: boolean;
+  /** Long-term memory feedback payload (for recording feedback after the turn). */
+  longTermMemoryFeedbackPayload: any;
+  /** Long-term memory retrieval diagnostics. */
+  longTermMemoryRetrievalDiagnostics: any;
+  /** The user query text used for long-term memory retrieval. */
+  longTermMemoryQueryText: string | undefined;
+}
+
+/**
+ * Ends the pause a conversation holds when a new turn starts on it, once the runtime has accepted the turn and before
+ * the turn records its input (see `ExternalToolResultHandler.endPendingExternalToolRequestForNewTurn`). It never
+ * throws.
+ */
+export type EndSavedPauseCallback = (
+  conversationContext: ConversationContext | undefined,
+  agentOSStreamId: StreamId,
+) => Promise<unknown>;
+
+/**
+ * Resolved config shape consumed by the pipeline.
+ * Extracted from the orchestrator's full resolved config to avoid coupling.
+ */
+export interface TurnPipelineConfig {
+  enableConversationalPersistence: boolean;
+  maxToolCallIterations: number;
+  promptProfileConfig: any;
+  rollingSummaryCompactionConfig: RollingSummaryCompactionConfig | null;
+  rollingSummaryCompactionProfilesConfig: any;
+  rollingSummarySystemPrompt: string;
+  rollingSummaryStateKey: string;
+  longTermMemoryRecall: {
+    profile: LongTermMemoryRecallProfile;
+    cadenceTurns: number;
+    forceOnCompaction: boolean;
+    maxContextChars: number;
+    topKByScope: Record<'user' | 'persona' | 'organization', number>;
+  };
+  tenantRouting: {
+    mode: 'multi_tenant' | 'single_tenant';
+    defaultOrganizationId?: string;
+    strictOrganizationIsolation: boolean;
+  };
+  taskOutcomeTelemetry: any;
+  adaptiveExecution: any;
+}
+
+/**
+ * @class TurnExecutionPipeline
+ * @description
+ * Runs the 12 pre-LLM phases of a turn and produces a {@link PreparedTurnContext}.
+ *
+ * **Phase sequence:**
+ * 1. Validate input (selectedPersonaId required)
+ * 2. Organization resolution, then GMI acquisition via `getOrCreateGMIForSession` under that organization (the
+ *    resolver runs once per turn, before the GMI is acquired; an organization it refuses is raised at step 5)
+ * 3. Stream context registration
+ * 4. GMI input construction (delegates to {@link GMIChunkTransformer})
+ * 5. Turn planning via ITurnPlanner
+ * 6. Adaptive execution policy application
+ * 7. Long-term memory policy resolution, with the organization resolved at step 2
+ * 8. The end of a pause the conversation holds, then inbound message persistence
+ * 9. Rolling summary compaction
+ * 10. Prompt profile routing
+ * 11. Long-term memory retrieval (with a learning layer, under the turn's scope ids from the GMI's learner session,
+ *     asked before the GMI prepares the turn)
+ * 12. Conversation history assembly, metadata persistence, memory sink (with a learning layer, one recorded write
+ *     under the same scope ids), and metadata chunk emission
+ *
+ * The orchestrator calls `prepareTurn()` and then uses the returned context
+ * to drive the GMI streaming loop.
+ */
+export class TurnExecutionPipeline {
+  /**
+   * Creates a TurnExecutionPipeline.
+   *
+   * @param activeStreamContexts - Shared mutable map of active stream contexts.
+   * @param chunks - Delegate for assembling and emitting response chunks.
+   * @param dependencies - Injected service dependencies.
+   * @param config - Resolved orchestrator config for this pipeline's needs.
+   * @param chunkTransformer - For constructing GMI input and filtering turn plans.
+   * @param telemetry - For adaptive execution policy decisions.
+   * @param resolveOrganizationContext - Callback to resolve tenant org context. It runs once per turn, before the
+   *   GMI is acquired, and must have no side effects.
+   * @param endSavedPause - Ends the pause the turn's conversation holds, once the turn's organization and plan are
+   *   settled and before the turn records its input, so the turn's prompt holds no call of the pause without its
+   *   result and a turn refused before then leaves the pause as it was.
+   */
+  constructor(
+    private readonly activeStreamContexts: Map<string, PipelineStreamContext>,
+    private readonly chunks: StreamChunkEmitter,
+    private readonly dependencies: AgentOSOrchestratorDependencies,
+    private readonly config: TurnPipelineConfig,
+    private readonly chunkTransformer: GMIChunkTransformer,
+    private readonly telemetry: TaskOutcomeTelemetryManager,
+    private readonly resolveOrganizationContext: (inputOrganizationId: unknown) => string | undefined,
+    private readonly endSavedPause?: EndSavedPauseCallback,
+  ) {}
+
+  /**
+   * Executes the pre-LLM turn preparation pipeline.
+   *
+   * @param agentOSStreamId - The stream ID allocated for this turn.
+   * @param input - The AgentOS-level input for this turn.
+   * @returns A {@link PreparedTurnContext} containing everything the
+   *   orchestrator needs to drive the GMI streaming loop.
+   * @throws {GMIError} If validation fails, GMI acquisition fails, or
+   *   turn planning raises a fatal error.
+   */
+  async prepareTurn(
+    agentOSStreamId: StreamId,
+    input: AgentOSInput,
+  ): Promise<PreparedTurnContext> {
+    // -------------------------------------------------------------------
+    // Phase 1: Validate input
+    // -------------------------------------------------------------------
+    const selectedPersonaId = input.selectedPersonaId;
+    if (!selectedPersonaId) {
+      throw new GMIError(
+        'AgentOSOrchestrator requires a selectedPersonaId on AgentOSInput.',
+        GMIErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2: GMI acquisition
+    // -------------------------------------------------------------------
+    // The turn's organization, resolved before the GMI is acquired: a runtime with a learning layer binds a new GMI's
+    // learner session under it (docs/GMI.md, "Learning"). The resolver reads only the input and the config, and
+    // Phase 5 uses the same value; an organization it refuses is raised in Phase 5, after the stream context is
+    // registered and the turn announced.
+    let organizationResolution: { id: string | undefined } | { error: unknown };
+    try {
+      organizationResolution = { id: this.resolveOrganizationContext(input.organizationId) };
+    } catch (error) {
+      organizationResolution = { error };
+    }
+    const gmiResult = await withAgentOSSpan('agentos.gmi.get_or_create', async (span) => {
+      span?.setAttribute('agentos.user_id', input.userId);
+      span?.setAttribute('agentos.session_id', input.sessionId);
+      span?.setAttribute('agentos.persona_id', selectedPersonaId);
+      if (typeof input.conversationId === 'string' && input.conversationId.trim()) {
+        span?.setAttribute('agentos.conversation_id', input.conversationId.trim());
+      }
+      return this.dependencies.gmiManager.getOrCreateGMIForSession(
+        input.userId,
+        input.sessionId,
+        selectedPersonaId,
+        input.conversationId,
+        input.options?.preferredModelId,
+        input.options?.preferredProviderId,
+        input.userApiKeys,
+        undefined,
+        'id' in organizationResolution ? (organizationResolution.id ?? '') : undefined,
+      );
+    });
+    const gmi = gmiResult.gmi;
+    const conversationContext = gmiResult.conversationContext;
+    const currentPersonaId = gmi.getCurrentPrimaryPersonaId();
+    const gmiInstanceIdForChunks = gmi.getGMIId();
+
+    // -------------------------------------------------------------------
+    // Phase 3: Stream context registration
+    // -------------------------------------------------------------------
+    // eslint-disable-next-line prefer-const -- assigned in Phase 7, used in later phases
+    let organizationIdForMemory: string | undefined;
+    const streamContext: PipelineStreamContext = {
+      gmi,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      personaId: currentPersonaId,
+      organizationId: organizationIdForMemory,
+      conversationId: conversationContext.sessionId,
+      conversationContext,
+      userApiKeys: input.userApiKeys,
+      processingOptions: input.options,
+    };
+    this.activeStreamContexts.set(agentOSStreamId, streamContext);
+
+    await this.chunks.pushChunk(
+      agentOSStreamId,
+      AgentOSResponseChunkType.SYSTEM_PROGRESS,
+      gmiInstanceIdForChunks,
+      currentPersonaId,
+      false,
+      {
+        message: `Initializing persona ${currentPersonaId}... GMI: ${gmiInstanceIdForChunks}`,
+        progressPercentage: 10,
+      },
+    );
+
+    // -------------------------------------------------------------------
+    // Phase 4: GMI input construction
+    // -------------------------------------------------------------------
+    const gmiInput = this.chunkTransformer.constructGMITurnInput(agentOSStreamId, input, streamContext);
+
+    // -------------------------------------------------------------------
+    // Phase 5: Turn planning
+    // -------------------------------------------------------------------
+    let turnPlan: TurnPlan | null = null;
+    if ('error' in organizationResolution) throw organizationResolution.error;
+    const resolvedOrganizationId = organizationResolution.id;
+    streamContext.organizationId = resolvedOrganizationId;
+
+    if (this.dependencies.turnPlanner) {
+      const planningMessage =
+        gmiInput.type === GMIInteractionType.TEXT && typeof gmiInput.content === 'string'
+          ? gmiInput.content
+          : gmiInput.type === GMIInteractionType.MULTIMODAL_CONTENT
+            ? turnContentText(gmiInput.content)
+            : '';
+      try {
+        turnPlan = await this.dependencies.turnPlanner.planTurn({
+          userId: input.userId,
+          organizationId: resolvedOrganizationId,
+          sessionId: input.sessionId,
+          conversationId: input.conversationId,
+          persona: gmi.getPersona(),
+          userMessage: planningMessage,
+          options: input.options,
+          excludedCapabilityIds: input.disabledSessionSkillIds,
+        });
+      } catch (planningError: any) {
+        throw new GMIError(
+          `Turn planning failed before execution: ${planningError?.message || String(planningError)}`,
+          GMIErrorCode.PROCESSING_ERROR,
+          { streamId: agentOSStreamId, planningError },
+        );
+      }
+    }
+    turnPlan = this.chunkTransformer.filterTurnPlanForDisabledSessionSkills(turnPlan, input);
+
+    // -------------------------------------------------------------------
+    // Phase 6: Adaptive execution policies
+    // -------------------------------------------------------------------
+    const adaptiveExecution = this.telemetry.maybeApplyAdaptivePolicy({
+      turnPlan,
+      organizationId: resolvedOrganizationId,
+      personaId: currentPersonaId,
+      requestCustomFlags: input.options?.customFlags,
+    });
+    const adaptiveExecutionPayload =
+      adaptiveExecution.applied || adaptiveExecution.kpi || adaptiveExecution.actions
+        ? {
+            applied: adaptiveExecution.applied,
+            reason: adaptiveExecution.reason,
+            kpi: adaptiveExecution.kpi,
+            actions: adaptiveExecution.actions,
+          }
+        : undefined;
+
+    await this.chunks.emitLifecycleUpdate({
+      streamId: agentOSStreamId,
+      gmiInstanceId: gmiInstanceIdForChunks,
+      personaId: currentPersonaId,
+      phase: 'planned',
+      status: 'ok',
+      details: turnPlan
+        ? {
+            plannerVersion: turnPlan.policy.plannerVersion,
+            toolFailureMode: turnPlan.policy.toolFailureMode,
+            toolSelectionMode: turnPlan.policy.toolSelectionMode,
+            adaptiveExecution: adaptiveExecutionPayload,
+          }
+        : { plannerVersion: 'none' },
+    });
+
+    let lifecycleDegraded = false;
+    if (turnPlan?.capability.fallbackApplied || adaptiveExecution.applied) {
+      lifecycleDegraded = true;
+      await this.chunks.emitLifecycleUpdate({
+        streamId: agentOSStreamId,
+        gmiInstanceId: gmiInstanceIdForChunks,
+        personaId: currentPersonaId,
+        phase: 'degraded',
+        status: 'degraded',
+        details: {
+          reason:
+            turnPlan?.capability.fallbackReason || adaptiveExecution.reason || 'fallback applied',
+          discoveryAttempts: turnPlan?.diagnostics.discoveryAttempts,
+          adaptiveExecution: adaptiveExecutionPayload,
+        },
+      });
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 7: Organization context + long-term memory policy
+    // -------------------------------------------------------------------
+    organizationIdForMemory = resolvedOrganizationId;
+    let longTermMemoryPolicy: ResolvedLongTermMemoryPolicy | null = null;
+
+    if (conversationContext) {
+      const rawPrevPolicy = conversationContext.getMetadata(LONG_TERM_MEMORY_POLICY_METADATA_KEY);
+      const prevPolicy =
+        rawPrevPolicy && typeof rawPrevPolicy === 'object'
+          ? (rawPrevPolicy as ResolvedLongTermMemoryPolicy)
+          : null;
+      const inputPolicy = input.memoryControl?.longTermMemory ?? null;
+
+      longTermMemoryPolicy = resolveLongTermMemoryPolicy({
+        previous: prevPolicy,
+        input: inputPolicy,
+        defaults: DEFAULT_LONG_TERM_MEMORY_POLICY,
+      });
+
+      if (inputPolicy || !prevPolicy) {
+        conversationContext.setMetadata(
+          LONG_TERM_MEMORY_POLICY_METADATA_KEY,
+          longTermMemoryPolicy,
+        );
+      }
+    } else {
+      longTermMemoryPolicy = resolveLongTermMemoryPolicy({
+        defaults: DEFAULT_LONG_TERM_MEMORY_POLICY,
+      });
+    }
+
+    if (turnPlan) {
+      (gmiInput.metadata ??= {} as any).executionPolicy = turnPlan.policy;
+      (gmiInput.metadata as any).capabilityDiscovery = turnPlan.capability;
+    }
+
+    (gmiInput.metadata ??= {} as any).organizationId = organizationIdForMemory ?? null;
+    (gmiInput.metadata as any).longTermMemoryPolicy = longTermMemoryPolicy;
+
+    // -------------------------------------------------------------------
+    // Phase 8: Inbound message persistence
+    // -------------------------------------------------------------------
+    // The runtime has accepted the turn (an organization it refuses and a plan that fails are raised above), so the
+    // conversation moves on: a pause it still holds ends here, before the input is recorded, so each call of the pause
+    // is answered right after the message that requested it. A turn refused before this point leaves the pause as it
+    // was, for its result or a resume.
+    await this.endSavedPause?.(conversationContext, agentOSStreamId);
+    if (this.config.enableConversationalPersistence && conversationContext) {
+      const persistContext = conversationContext;
+      try {
+        if (gmiInput.type === GMIInteractionType.TEXT && typeof gmiInput.content === 'string') {
+          conversationContext.addMessage({
+            role: MessageRole.USER,
+            content: gmiInput.content,
+            name: input.userId,
+            metadata: { agentPersonaId: currentPersonaId, source: 'agentos_input' },
+          });
+        } else if (gmiInput.type === GMIInteractionType.MULTIMODAL_CONTENT) {
+          // Stored as its text: the conversation store keeps no image data.
+          conversationContext.addMessage({
+            role: MessageRole.USER,
+            content: turnContentText(gmiInput.content),
+            name: input.userId,
+            metadata: { agentPersonaId: currentPersonaId, source: 'agentos_input_multimodal' },
+          });
+        } else if (gmiInput.type === GMIInteractionType.SYSTEM_MESSAGE) {
+          conversationContext.addMessage({
+            role: MessageRole.SYSTEM,
+            content:
+              typeof gmiInput.content === 'string'
+                ? gmiInput.content
+                : JSON.stringify(gmiInput.content),
+            metadata: { agentPersonaId: currentPersonaId, source: 'agentos_input_system' },
+          });
+        }
+        await withAgentOSSpan('agentos.conversation.save', async (span) => {
+          span?.setAttribute('agentos.stage', 'inbound');
+          span?.setAttribute('agentos.stream_id', agentOSStreamId);
+          await this.dependencies.conversationManager.saveConversation(persistContext);
+        });
+      } catch (persistError: any) {
+        console.warn(
+          `AgentOSOrchestrator: Failed to persist inbound message to ConversationContext for stream ${agentOSStreamId}.`,
+          persistError,
+        );
+      }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 9: Rolling summary compaction
+    // -------------------------------------------------------------------
+    const modeForRouting =
+      typeof input.options?.customFlags?.mode === 'string' &&
+      input.options.customFlags.mode.trim()
+        ? input.options.customFlags.mode.trim()
+        : currentPersonaId;
+
+    const rollingSummaryPhase = await executeRollingSummaryPhase({
+      conversationContext,
+      modeForRouting,
+      streamId: agentOSStreamId,
+      rollingSummaryCompactionConfig: this.config.rollingSummaryCompactionConfig,
+      rollingSummaryCompactionProfilesConfig: this.config.rollingSummaryCompactionProfilesConfig,
+      rollingSummarySystemPrompt: this.config.rollingSummarySystemPrompt,
+      rollingSummaryStateKey: this.config.rollingSummaryStateKey,
+      modelProviderManager: this.dependencies.modelProviderManager,
+    });
+    const {
+      result: rollingSummaryResult,
+      profileId: rollingSummaryProfileId,
+      configForTurn: rollingSummaryConfigForTurn,
+    } = rollingSummaryPhase;
+    const rollingSummaryEnabled = rollingSummaryPhase.enabled;
+    const rollingSummaryText = rollingSummaryPhase.summaryText;
+
+    if (!gmiInput.metadata) {
+      gmiInput.metadata = {};
+    }
+    (gmiInput.metadata as any).rollingSummary =
+      rollingSummaryEnabled && rollingSummaryText
+        ? { text: rollingSummaryText, json: rollingSummaryResult?.summaryJson ?? undefined }
+        : null;
+
+    // -------------------------------------------------------------------
+    // Phase 10: Prompt-profile routing
+    // -------------------------------------------------------------------
+    const promptProfileSelection = executePromptProfilePhase({
+      conversationContext,
+      promptProfileConfig: this.config.promptProfileConfig,
+      modeForRouting,
+      gmiInput,
+      didCompact: Boolean(rollingSummaryResult?.didCompact),
+    });
+
+    (gmiInput.metadata as any).promptProfile = promptProfileSelection
+      ? {
+          id: promptProfileSelection.presetId,
+          systemInstructions: promptProfileSelection.systemInstructions,
+          reason: promptProfileSelection.reason,
+        }
+      : null;
+
+    // The turn's scope ids and recorder for the standalone retriever and the rolling-summary sink, from the GMI's
+    // learner session, asked once and before the GMI prepares the turn, by the session's own rule, so a turn of another
+    // user or organization reads the same here and in the GMI. Undefined on a GMI with no learner session, or one that
+    // names no scope ids: the retriever and the sink then read and file under the plain ids, as with no learning layer.
+    const turnLearning = this.turnLearningOf(gmi, input, gmiInput, organizationIdForMemory, streamContext.conversationId);
+
+    // -------------------------------------------------------------------
+    // Phase 11: Long-term memory retrieval
+    // -------------------------------------------------------------------
+    const longTermMemoryPhase = await executeLongTermMemoryPhase({
+      conversationContext,
+      longTermMemoryRetriever: this.dependencies.longTermMemoryRetriever,
+      longTermMemoryPolicy,
+      gmiInput,
+      streamId: agentOSStreamId,
+      userId: streamContext.userId,
+      organizationId: organizationIdForMemory,
+      conversationId: streamContext.conversationId,
+      personaId: currentPersonaId,
+      modeForRouting,
+      recallConfig: this.config.longTermMemoryRecall,
+      didCompact: Boolean(rollingSummaryResult?.didCompact),
+      turnScopes: turnLearning?.scopes,
+    });
+    const longTermMemoryContextText = longTermMemoryPhase.contextText;
+    const longTermMemoryRetrievalDiagnostics = longTermMemoryPhase.diagnostics;
+    const longTermMemoryFeedbackPayload = longTermMemoryPhase.feedbackPayload;
+    const longTermMemoryShouldReview = longTermMemoryPhase.shouldReview;
+    const longTermMemoryReviewReason = longTermMemoryPhase.reviewReason;
+
+    (gmiInput.metadata as any).longTermMemoryContext =
+      typeof longTermMemoryContextText === 'string' && longTermMemoryContextText.length > 0
+        ? longTermMemoryContextText
+        : null;
+
+    // --- Conversation history assembly ---
+    const historyForPrompt = assembleConversationHistory({
+      conversationContext,
+      gmiInput,
+      rollingSummaryEnabled,
+      rollingSummaryResult,
+      rollingSummaryText,
+      rollingSummaryConfigForTurn,
+    });
+    if (historyForPrompt) {
+      (gmiInput.metadata as any).conversationHistoryForPrompt = historyForPrompt;
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 12: Metadata persistence, memory sink, metadata chunk emission
+    // -------------------------------------------------------------------
+
+    // With a learning layer, a compaction's contributors: the explicit users whose messages it summarized, with those
+    // of the conversation's earlier compactions, kept in its metadata so the save below persists them.
+    const compactionContributors =
+      turnLearning &&
+      this.dependencies.rollingSummaryMemorySink &&
+      rollingSummaryEnabled &&
+      rollingSummaryResult?.didCompact &&
+      conversationContext
+        ? rollingSummaryContributors(conversationContext, rollingSummaryResult.summaryUptoTimestamp)
+        : undefined;
+
+    // Persist compaction/router metadata updates prior to the main LLM call.
+    if (this.config.enableConversationalPersistence && conversationContext) {
+      const persistContext = conversationContext;
+      try {
+        await withAgentOSSpan('agentos.conversation.save', async (span) => {
+          span?.setAttribute('agentos.stage', 'metadata');
+          span?.setAttribute('agentos.stream_id', agentOSStreamId);
+          await this.dependencies.conversationManager.saveConversation(persistContext);
+        });
+      } catch (metadataPersistError: any) {
+        console.warn(
+          `AgentOSOrchestrator: Failed to persist conversation metadata updates for stream ${agentOSStreamId}.`,
+          metadataPersistError,
+        );
+      }
+    }
+
+    // Best-effort: persist structured rolling memory to an external store.
+    if (
+      rollingSummaryEnabled &&
+      rollingSummaryResult?.didCompact &&
+      typeof rollingSummaryResult.summaryText === 'string' &&
+      this.dependencies.rollingSummaryMemorySink &&
+      Boolean(longTermMemoryPolicy?.enabled) &&
+      hasAnyLongTermMemoryScope(longTermMemoryPolicy ?? DEFAULT_LONG_TERM_MEMORY_POLICY)
+    ) {
+      const update: RollingSummaryMemoryUpdate = {
+        userId: streamContext.userId,
+        organizationId: organizationIdForMemory,
+        sessionId: streamContext.sessionId,
+        conversationId: streamContext.conversationId,
+        personaId: currentPersonaId,
+        mode: modeForRouting,
+        profileId: rollingSummaryProfileId,
+        memoryPolicy: longTermMemoryPolicy ?? undefined,
+        summaryText: rollingSummaryResult.summaryText,
+        summaryJson: rollingSummaryResult.summaryJson ?? null,
+        summaryUptoTimestamp: rollingSummaryResult.summaryUptoTimestamp ?? null,
+        summaryUpdatedAt: rollingSummaryResult.summaryUpdatedAt ?? null,
+        ...(turnLearning
+          ? {
+              turnScopes: turnLearning.scopes,
+              ...(turnLearning.recordSelfChange ? { recordSelfChange: turnLearning.recordSelfChange } : {}),
+              contributorIds: compactionContributors ?? [],
+            }
+          : {}),
+      };
+      void this.dependencies.rollingSummaryMemorySink
+        .upsertRollingSummaryMemory(update)
+        .catch((error: any) => {
+          console.warn(
+            `AgentOSOrchestrator: Rolling summary sink failed for stream ${agentOSStreamId} (continuing).`,
+            error,
+          );
+        });
+    }
+
+    // Emit routing + memory metadata as a first-class chunk for clients.
+    await this.chunks.pushChunk(
+      agentOSStreamId,
+      AgentOSResponseChunkType.METADATA_UPDATE,
+      gmiInstanceIdForChunks,
+      currentPersonaId,
+      false,
+      {
+        updates: {
+          promptProfile: promptProfileSelection,
+          organizationId: organizationIdForMemory ?? null,
+          tenantRouting: {
+            mode: this.config.tenantRouting.mode,
+            strictOrganizationIsolation: this.config.tenantRouting.strictOrganizationIsolation,
+            defaultOrganizationId: this.config.tenantRouting.defaultOrganizationId ?? null,
+          },
+          longTermMemoryPolicy,
+          longTermMemoryRecall: this.config.longTermMemoryRecall,
+          taskOutcomeTelemetry: this.config.taskOutcomeTelemetry,
+          adaptiveExecution: this.config.adaptiveExecution,
+          turnPlanning: turnPlan
+            ? {
+                policy: turnPlan.policy,
+                diagnostics: turnPlan.diagnostics,
+                adaptiveExecution: adaptiveExecutionPayload ?? null,
+                discovery: {
+                  enabled: turnPlan.capability.enabled,
+                  kind: turnPlan.capability.kind,
+                  selectedToolNames: turnPlan.capability.selectedToolNames,
+                  fallbackApplied: turnPlan.capability.fallbackApplied,
+                  fallbackReason: turnPlan.capability.fallbackReason,
+                  tokenEstimate: turnPlan.capability.result?.tokenEstimate,
+                  diagnostics: turnPlan.capability.result?.diagnostics,
+                },
+              }
+            : null,
+          longTermMemoryRetrieval: longTermMemoryContextText
+            ? {
+                shouldReview: longTermMemoryShouldReview,
+                reviewReason: longTermMemoryReviewReason,
+                didRetrieve: true,
+                contextChars: longTermMemoryContextText.length,
+                diagnostics: longTermMemoryRetrievalDiagnostics,
+              }
+            : {
+                shouldReview: longTermMemoryShouldReview,
+                reviewReason: longTermMemoryReviewReason,
+                didRetrieve: false,
+              },
+          rollingSummary: rollingSummaryResult
+            ? {
+                profileId: rollingSummaryProfileId,
+                enabled: rollingSummaryResult.enabled,
+                didCompact: rollingSummaryResult.didCompact,
+                summaryText: rollingSummaryResult.summaryText,
+                summaryJson: rollingSummaryResult.summaryJson,
+                summaryUptoTimestamp: rollingSummaryResult.summaryUptoTimestamp,
+                summaryUpdatedAt: rollingSummaryResult.summaryUpdatedAt,
+                reason: rollingSummaryResult.reason,
+              }
+            : null,
+        },
+      },
+    );
+
+    return {
+      gmi,
+      conversationContext,
+      currentPersonaId,
+      gmiInstanceIdForChunks,
+      gmiInput,
+      streamContext,
+      organizationIdForMemory,
+      longTermMemoryPolicy,
+      lifecycleDegraded,
+      longTermMemoryFeedbackPayload,
+      longTermMemoryRetrievalDiagnostics,
+      // The text the retrieval read when the retriever reports none: a
+      // multimodal turn as its text, with no image data.
+      longTermMemoryQueryText:
+        typeof (longTermMemoryRetrievalDiagnostics as any)?.queryText === 'string'
+          ? ((longTermMemoryRetrievalDiagnostics as any).queryText as string)
+          : turnContentText(gmiInput.content),
+    };
+  }
+
+  /**
+   * The turn's learning for the standalone retriever and the rolling-summary sink: undefined on a GMI with no learner
+   * session, or one whose session names no scope ids. A session that throws is traced, and the turn reads and files as
+   * with no learning layer, as the GMI's own filing does then.
+   */
+  private turnLearningOf(
+    gmi: IGMI,
+    input: AgentOSInput,
+    gmiInput: GMITurnInput,
+    organizationId: string | undefined,
+    conversationId: string,
+  ): TurnLearningBeforePreparation | undefined {
+    const session = gmi.getLearnerSession?.();
+    if (!session) return undefined;
+    try {
+      return turnLearningBeforePreparation(session, {
+        userId: typeof input.userId === 'string' && input.userId !== '' ? input.userId : null,
+        // The GMI reads the turn's organization trimmed (`metadata.organizationId`), and so does its session's open.
+        namespace: (organizationId ?? '').trim(),
+        workflowSeat: Boolean((gmiInput.metadata as { workflowId?: unknown } | undefined)?.workflowId),
+        conversationId,
+      });
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[agentos] learning: the learner session did not name this turn's scope ids (${why}); the standalone retriever and sink read and file as with no learning layer.`,
+      );
+      return undefined;
+    }
+  }
+}

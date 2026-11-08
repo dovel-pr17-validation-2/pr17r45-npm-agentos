@@ -1,0 +1,262 @@
+/**
+ * @module vision
+ *
+ * Unified vision pipeline with progressive enhancement for AgentOS.
+ *
+ * Processes images through three configurable tiers:
+ *
+ * 1. **Local OCR** (PaddleOCR / Tesseract.js) — fast, free, offline
+ * 2. **Local Vision Models** (TrOCR / Florence-2 / CLIP) — offline, richer
+ * 3. **Cloud Vision LLMs** (GPT-4o / Claude / Gemini) — best quality
+ *
+ * The {@link createVisionPipeline} factory auto-detects which providers
+ * are installed and builds a pipeline with sensible defaults.
+ *
+ * @example
+ * ```typescript
+ * import {
+ *   createVisionPipeline,
+ *   VisionPipeline,
+ *   type VisionPipelineConfig,
+ *   type VisionResult,
+ * } from '@framers/agentos/io/vision';
+ *
+ * // Auto-detect available providers
+ * const pipeline = await createVisionPipeline();
+ * const result = await pipeline.process(imageBuffer);
+ *
+ * // Or configure explicitly
+ * const custom = await createVisionPipeline({
+ *   strategy: 'progressive',
+ *   ocr: 'paddle',
+ *   embedding: true,
+ *   cloudProvider: 'openai',
+ * });
+ * ```
+ *
+ * @see {@link VisionPipeline} for the main pipeline class.
+ * @see {@link VisionPipelineConfig} for configuration options.
+ * @see {@link LLMVisionProvider} for a simple cloud-only vision provider.
+ * @see {@link PipelineVisionProvider} for wrapping the pipeline as IVisionProvider.
+ */
+
+export { VisionPipeline } from './VisionPipeline.js';
+export { LLMVisionProvider } from './providers/LLMVisionProvider.js';
+export type { LLMVisionProviderConfig } from './providers/LLMVisionProvider.js';
+export { PipelineVisionProvider } from './providers/PipelineVisionProvider.js';
+
+export type {
+  VisionPipelineConfig,
+  VisionResult,
+  VisionStrategy,
+  VisionTier,
+  VisionCloudTask,
+  ContentCategory,
+  TierResult,
+  FailedTier,
+  TextRegion,
+  DocumentLayout,
+  DocumentPage,
+  LayoutBlock,
+  VisionPreprocessingConfig,
+  // Scene detection types (used by video analysis pipeline)
+  Frame,
+  SceneBoundary,
+  SceneDetectorConfig,
+  SceneDetectionMethod,
+} from './types.js';
+
+export { SceneDetector } from './SceneDetector.js';
+
+// ---------------------------------------------------------------------------
+// Provider availability probes
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a module is importable without actually loading it.
+ * Uses a dynamic import wrapped in try/catch — the module is loaded
+ * then immediately discarded, so the overhead is minimal on first probe
+ * but cached by the runtime on subsequent probes.
+ *
+ * @param moduleId - npm package name to probe.
+ * @returns True if the module can be imported.
+ */
+async function isModuleAvailable(moduleId: string): Promise<boolean> {
+  try {
+    await import(moduleId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect which cloud vision provider is available based on environment
+ * variables. Returns the first provider that has an API key set, as the
+ * provider id `generateText()` takes, and the key to pass when the provider
+ * would not find it: the `gemini` provider reads `GEMINI_API_KEY`, so a
+ * `GOOGLE_API_KEY` alone is passed as the pipeline's key.
+ *
+ * @returns The provider and, for a GOOGLE_API_KEY, the key; or undefined if
+ *   no API keys are found.
+ */
+function detectCloudProvider(): { provider: string; apiKey?: string } | undefined {
+  // Check common vision-capable provider API keys in preference order.
+  // GPT-4o is the most widely used vision LLM, so we prefer OpenAI first.
+  if (process.env.OPENAI_API_KEY) return { provider: 'openai' };
+  if (process.env.ANTHROPIC_API_KEY) return { provider: 'anthropic' };
+  if (process.env.GEMINI_API_KEY) return { provider: 'gemini' };
+  if (process.env.GOOGLE_API_KEY) return { provider: 'gemini', apiKey: process.env.GOOGLE_API_KEY };
+  if (process.env.OPENROUTER_API_KEY) return { provider: 'openrouter' };
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a vision pipeline with sensible defaults by auto-detecting
+ * which providers are installed in the current environment.
+ *
+ * The factory probes for optional peer dependencies (ppu-paddle-ocr,
+ * tesseract.js, \@huggingface/transformers) and cloud API keys in
+ * environment variables, then configures the pipeline accordingly.
+ *
+ * ## Auto-detection logic
+ *
+ * | Check | Result |
+ * |-------|--------|
+ * | `ppu-paddle-ocr` importable | `ocr: 'paddle'` |
+ * | `tesseract.js` importable (paddle missing) | `ocr: 'tesseract'` |
+ * | Neither importable | `ocr: 'none'` |
+ * | `@huggingface/transformers` importable | `handwriting: true`, `documentAI: true`, `embedding: true` |
+ * | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / etc. set | `cloudProvider` configured |
+ *
+ * Caller-supplied config overrides always take precedence over
+ * auto-detected values.
+ *
+ * @param config - Optional partial configuration. Fields that are set
+ *   override auto-detected values. Fields that are omitted are filled
+ *   by the auto-detection logic.
+ * @returns A configured and ready-to-use VisionPipeline instance.
+ *
+ * @example
+ * ```typescript
+ * // Full auto-detection
+ * const pipeline = await createVisionPipeline();
+ *
+ * // Override strategy but auto-detect everything else
+ * const localOnly = await createVisionPipeline({
+ *   strategy: 'local-only',
+ * });
+ *
+ * // Explicit full config (no auto-detection)
+ * const explicit = await createVisionPipeline({
+ *   strategy: 'progressive',
+ *   ocr: 'tesseract',
+ *   handwriting: true,
+ *   documentAI: false,
+ *   embedding: true,
+ *   cloudProvider: 'openai',
+ *   cloudModel: 'gpt-4o',
+ *   confidenceThreshold: 0.85,
+ * });
+ * ```
+ */
+export async function createVisionPipeline(
+  config?: Partial<import('./types.js').VisionPipelineConfig>,
+): Promise<import('./VisionPipeline.js').VisionPipeline> {
+  // Probe available OCR engines in parallel for speed
+  const [hasPaddle, hasTesseract, hasTransformers] = await Promise.all([
+    // Only probe if caller didn't explicitly set the OCR engine
+    config?.ocr !== undefined ? Promise.resolve(false) : isModuleAvailable('ppu-paddle-ocr'),
+    config?.ocr !== undefined ? Promise.resolve(false) : isModuleAvailable('tesseract.js'),
+    // Only probe if caller didn't explicitly set all HF-dependent flags
+    (config?.handwriting !== undefined && config?.documentAI !== undefined && config?.embedding !== undefined)
+      ? Promise.resolve(false)
+      : isModuleAvailable('@huggingface/transformers'),
+  ]);
+
+  // Resolve OCR engine: caller override > paddle > tesseract > none
+  let ocr = config?.ocr;
+  if (ocr === undefined) {
+    if (hasPaddle) {
+      ocr = 'paddle';
+    } else if (hasTesseract) {
+      ocr = 'tesseract';
+    } else {
+      ocr = 'none';
+    }
+  }
+
+  // Resolve HuggingFace-dependent features: caller override > auto-detect
+  const handwriting = config?.handwriting ?? (hasTransformers ? true : false);
+  const documentAI = config?.documentAI ?? (hasTransformers ? true : false);
+  const embedding = config?.embedding ?? (hasTransformers ? true : false);
+
+  // Resolve cloud provider: the one the caller names (cloudProvider, or the
+  // provider a cloudModel prefix names, which generateText follows) > env
+  // var auto-detect. A key or a base URL the caller gives goes only to a
+  // provider the caller named: with none named, detection would pick one
+  // from the environment and send it there. An empty or whitespace-only
+  // cloudBaseUrl is unset, as generateText reads it (baseUrlIfSet in
+  // model.ts): it names no endpoint, so it needs no provider.
+  const { baseUrlIfSet } = await import('../../api/model.js');
+  const keyed = config?.cloudApiKey !== undefined || baseUrlIfSet(config?.cloudBaseUrl) !== undefined;
+  let named = config?.cloudProvider;
+  let cloudModel = config?.cloudModel;
+  if (config?.cloudModel) {
+    const { knownProviderPrefixOf, routedProviderOf } = await import('../../api/model.js');
+    named = routedProviderOf({ provider: config.cloudProvider, model: config.cloudModel });
+    if (keyed && config.cloudProvider && named !== config.cloudProvider) {
+      throw new Error(
+        `createVisionPipeline: cloudModel '${config.cloudModel}' names provider '${named}', not cloudProvider ` +
+          `'${config.cloudProvider}'; the cloudApiKey or cloudBaseUrl given for one would go to the other.`,
+      );
+    }
+    // A `provider:` prefix that names the provider is sent without it, as
+    // generateText splits it: under provider 'ollama' a colon is never split,
+    // so 'ollama:llava' would ask Ollama for a model of that name. A tag of a
+    // model the caller sent to 'ollama' itself ('llava:7b') stays whole.
+    const prefix = config.cloudProvider === 'ollama' ? undefined : knownProviderPrefixOf(config.cloudModel);
+    if (prefix && prefix === named) cloudModel = config.cloudModel.slice(prefix.length + 1);
+  }
+  if (keyed && !named) {
+    throw new Error(
+      'createVisionPipeline: cloudApiKey and cloudBaseUrl need cloudProvider (or a cloudModel such as ' +
+        "'openai:gpt-4o'): without one, the key would go to whichever provider the environment names.",
+    );
+  }
+  const detected = named ? undefined : detectCloudProvider();
+  const cloudProvider = named ?? detected?.provider;
+  // The gemini provider reads GEMINI_API_KEY alone, so a GOOGLE_API_KEY is
+  // passed as the tier's key, as detection passes it, also when the caller
+  // named gemini. Not over a key the caller or the global default gives.
+  let googleKey: string | undefined;
+  if (cloudProvider === 'gemini' && !detected && config?.cloudApiKey === undefined && !process.env.GEMINI_API_KEY) {
+    const { getDefaultProvider } = await import('../../api/runtime/global-default.js');
+    const def = getDefaultProvider();
+    const defaultKey = def?.apiKey && (!def.provider || def.provider === 'gemini');
+    if (!defaultKey) googleKey = process.env.GOOGLE_API_KEY || undefined;
+  }
+
+  // Build the final resolved config
+  const resolvedConfig: import('./types.js').VisionPipelineConfig = {
+    strategy: config?.strategy ?? 'progressive',
+    ocr,
+    handwriting,
+    documentAI,
+    embedding,
+    cloudProvider,
+    cloudModel,
+    cloudApiKey: config?.cloudApiKey ?? detected?.apiKey ?? googleKey,
+    cloudBaseUrl: config?.cloudBaseUrl,
+    cloudFallbackProviders: config?.cloudFallbackProviders,
+    confidenceThreshold: config?.confidenceThreshold,
+    preprocessing: config?.preprocessing,
+  };
+
+  const { VisionPipeline } = await import('./VisionPipeline.js');
+  return new VisionPipeline(resolvedConfig);
+}

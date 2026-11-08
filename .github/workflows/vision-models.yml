@@ -1,0 +1,67 @@
+name: Vision models
+
+# The vision pipeline's local tiers end to end: the built package runs both
+# OCR engines (ppu-paddle-ocr and tesseract.js, installed as peers) and loads
+# each Hugging Face Hub model the model tiers name (TrOCR, Florence-2, CLIP),
+# on sample images. The unit suite mocks those packages, so a result shape the
+# code does not read, a model id that does not load, or a call a model does
+# not take shows up here and nowhere else. Each run downloads about 3 GB of
+# models.
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'src/io/vision/**'
+      - 'src/io/media/images/**'
+      - 'src/core/types/vendor.d.ts'
+      - 'scripts/vision-models-check.mjs'
+      - '.github/workflows/vision-models.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+  schedule:
+    # Weekly: a Hub repository can change under a model id.
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Off master (a pull request, or a manual run on another branch) a newer run
+# cancels the one it supersedes. On master (the weekly run and a manual run
+# there) a run queued during another waits for it to finish, so a later run
+# never cancels the run in progress. At most one run waits: a run that starts
+# waiting cancels the one already waiting, which shows as cancelled without
+# having run. A re-run keys a group of its own, its run id, so re-running an
+# older commit's run never cancels the newest one.
+concurrency:
+  group: vision-models-${{ github.run_attempt == '1' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  models:
+    name: Local vision tiers load and run
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build
+        run: pnpm run build
+
+      - name: OCR, TrOCR, Florence-2 and CLIP from the built package
+        run: node scripts/vision-models-check.mjs

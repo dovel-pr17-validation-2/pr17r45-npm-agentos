@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2020",
+    "lib": ["ES2020", "ES2021"],
+    "esModuleInterop": true,
+    "strict": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "@framers/agentos/*": ["./*"],
+      "@prisma/client": ["./stubs/prismaClient.ts"],
+      "dompurify": ["./stubs/dompurify.d.ts"],
+      "@framers/sql-storage-adapter": ["../../sql-storage-adapter/dist/index.d.ts"],
+      "@framers/sql-storage-adapter/*": ["../../sql-storage-adapter/dist/*"]
+    }
+  },
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ]
+}

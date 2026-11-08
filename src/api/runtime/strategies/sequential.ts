@@ -1,0 +1,387 @@
+/**
+ * @file sequential.ts
+ * Sequential strategy compiler for the Agency API.
+ *
+ * ## Execution model
+ *
+ * Iterates agents in declaration order. Each agent receives the previous
+ * agent's output as context, forming a chain where the final agent's response
+ * is the overall result. Token usage is aggregated across all agent calls.
+ *
+ * This is the simplest and most common strategy -- ideal for pipelines like
+ * `researcher -> editor -> reviewer` where each step builds on the previous.
+ *
+ * ## HITL integration
+ *
+ * Each agent is gated by {@link checkBeforeAgentInput} before invocation. If
+ * the HITL handler rejects an agent, or the post-approval check blocks the
+ * input it would receive (the approver's instructions included), it is
+ * skipped and the chain continues with the next agent using the same context
+ * (the rejected agent's contribution is simply omitted). After the first
+ * agent the input writes the previous agent's output after the task, so the
+ * check also reads the task and that output each on its own. An agent's call
+ * record holds the input it was sent.
+ *
+ * @see {@link compileStrategy} -- the dispatcher that selects this compiler.
+ * @see {@link checkBeforeAgentInput} -- the HITL gate applied before each agent.
+ */
+import { agent as createAgent } from '../agent.js';
+import type {
+  AgencyOptions,
+  CompiledStrategy,
+  Agent,
+  BaseAgentConfig,
+  AgentCallRecord,
+  AgencyStreamPart,
+} from '../types.js';
+import type { FallbackSignal } from '../generateText.js';
+import { createBufferedAsyncReplay } from '../streamBuffer.js';
+import {
+  isAgent,
+  mergeDefaults,
+  checkBeforeAgentInput,
+  accumulateExtraUsage,
+  buildAgentCallUsage,
+  callRecordExtras,
+  nestedRunUnanswered,
+  nestedStreamUnanswered,
+} from './shared.js';
+
+type StrategyTotalUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUSD?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  cacheCreationExtendedTokens?: number;
+};
+
+/**
+ * Compiles a sequential execution strategy.
+ *
+ * Agents are invoked one-by-one in their declared iteration order. Each agent
+ * after the first receives a prompt that includes both the original task and
+ * the preceding agent's output, enabling progressive refinement chains such as
+ * `researcher -> editor -> reviewer`.
+ *
+ * @param agents - Named roster of agent configs or pre-built `Agent` instances.
+ *                 Iteration order of `Object.entries()` determines execution order.
+ * @param agencyConfig - Agency-level configuration providing fallback model/provider/tools.
+ * @returns A {@link CompiledStrategy} with `execute` and `stream` methods.
+ *
+ * @example
+ * ```ts
+ * const strategy = compileSequential(
+ *   { researcher: { instructions: 'Find info.' }, writer: { instructions: 'Write summary.' } },
+ *   agencyConfig,
+ * );
+ * const result = await strategy.execute('Summarise recent AI research.');
+ * ```
+ */
+export function compileSequential(
+  agents: Record<string, BaseAgentConfig | Agent>,
+  agencyConfig: AgencyOptions,
+): CompiledStrategy {
+  return {
+    async execute(prompt, opts) {
+      const agentCalls: AgentCallRecord[] = [];
+      let context = prompt;
+      // The output the next agent's input writes after the task: none before the first agent has answered.
+      let previousOutput = '';
+      let lastResult: Record<string, unknown> | null = null;
+      const totalUsage: StrategyTotalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+      for (const [name, agentOrConfig] of Object.entries(agents)) {
+        // HITL: check beforeAgent gate before invoking this agent. The
+        // decision is null when no gate applies. The input carries the
+        // approver's instructions, if any, and the post-approval check read
+        // it, instructions included, and the task and the previous agent's
+        // output each on its own, since the input puts more text after the
+        // task.
+        const gate = await checkBeforeAgentInput(name, context, agentCalls, agencyConfig, [prompt, previousOutput]);
+        if (gate.decision && !gate.decision.approved) {
+          // Agent was rejected by HITL -- skip and continue to the next
+          // agent in the chain. The context remains unchanged.
+          continue;
+        }
+
+        const a: Agent = isAgent(agentOrConfig)
+          ? agentOrConfig
+          : createAgent({ ...mergeDefaults(agentOrConfig, agencyConfig) });
+
+        // The approval's instructions, if any, ride on the input without
+        // changing the original prompt.
+        const effectiveContext = gate.input;
+
+        const start = Date.now();
+        const result = (await a.generate(effectiveContext, opts)) as Record<string, unknown>;
+        const durationMs = Date.now() - start;
+        // A nested agency that no seat of its own answered gave no answer, as
+        // a rejected agent gives none: it adds no record, and the next agent's
+        // input and the run's text stay as they were.
+        if (nestedRunUnanswered(result)) continue;
+
+        const resultText = (result.text as string) ?? '';
+        const resultUsage = (result.usage as {
+          promptTokens?: number;
+          completionTokens?: number;
+          totalTokens?: number;
+          costUSD?: number;
+          cacheReadTokens?: number;
+          cacheCreationTokens?: number;
+          cacheCreationExtendedTokens?: number;
+        }) ?? {};
+        const resultToolCalls = (result.toolCalls as Array<{ name: string; args: unknown; result?: unknown; error?: string }>) ?? [];
+
+        agentCalls.push({
+          agent: name,
+          input: effectiveContext,
+          output: resultText,
+          toolCalls: resultToolCalls,
+          usage: buildAgentCallUsage(resultUsage),
+          durationMs,
+          ...callRecordExtras(result),
+        });
+
+        totalUsage.promptTokens += resultUsage.promptTokens ?? 0;
+        totalUsage.completionTokens += resultUsage.completionTokens ?? 0;
+        totalUsage.totalTokens += resultUsage.totalTokens ?? 0;
+        accumulateExtraUsage(totalUsage, resultUsage);
+
+        // Chain: subsequent agents see the original task plus previous output.
+        // This ensures each agent has full context without losing the original prompt.
+        context = `Original task: ${prompt}\n\nPrevious agent (${name}) output:\n${resultText}`;
+        previousOutput = resultText;
+        lastResult = result;
+      }
+
+      return { ...lastResult, agentCalls, usage: totalUsage };
+    },
+
+    stream(prompt, opts) {
+      /**
+       * Real streaming for the sequential strategy: yields per-agent
+       * `agent-start` and `agent-end` events bracketing each agent's text
+       * tokens, plus agency-level start/end events wrapping the whole run.
+       *
+       * `fullStream` emits the full {@link AgencyStreamPart} union so callers
+       * can observe every agent transition. `textStream` filters to just the
+       * `text` parts so the result stays compatible with `StreamTextResult`.
+       *
+       * Usage accounting is collected per-agent and summed into a final total.
+       * All promises resolve once the generator has been fully consumed.
+       */
+      const startMs = Date.now();
+      const totalUsage: StrategyTotalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      const agentCalls: AgentCallRecord[] = [];
+
+      /**
+       * Internal generator that drives the sequential run and yields
+       * structured {@link AgencyStreamPart} events.
+       */
+      async function* streamGenerator(): AsyncGenerator<AgencyStreamPart> {
+        let currentPrompt = prompt;
+        // The output the next agent's input writes after the task, as under execute().
+        let previousOutput = '';
+        let finalText = '';
+
+        yield { type: 'agent-start' as const, agent: '__agency__', input: prompt };
+
+        for (const [name, agentOrConfig] of Object.entries(agents)) {
+          const gate = await checkBeforeAgentInput(name, currentPrompt, agentCalls, agencyConfig, [prompt, previousOutput]);
+          if (gate.decision && !gate.decision.approved) {
+            continue;
+          }
+
+          const effectivePrompt = gate.input;
+          const agentStart = Date.now();
+
+          yield { type: 'agent-start' as const, agent: name, input: effectivePrompt };
+
+          // Resolve agent instance (pre-built or config-based).
+          const a: Agent = isAgent(agentOrConfig)
+            ? agentOrConfig
+            : createAgent({ ...mergeDefaults(agentOrConfig as BaseAgentConfig, agencyConfig) });
+
+          // Delegate to the agent's stream if available, otherwise use generate().
+          let agentText = '';
+          let resultUsage: {
+            promptTokens?: number;
+            completionTokens?: number;
+            totalTokens?: number;
+            costUSD?: number;
+            cacheReadTokens?: number;
+            cacheCreationTokens?: number;
+            cacheCreationExtendedTokens?: number;
+          } = {};
+          let resultToolCalls: Array<{ name: string; args: unknown; result?: unknown; error?: string }> = [];
+          let recordExtras: ReturnType<typeof callRecordExtras>;
+          // The error the seat's stream ended on, when it reported one as a part.
+          let seatError: Error | undefined;
+          // A nested agency that no seat of its own answered, as under execute().
+          let unanswered = false;
+          try {
+            const agentStream = a.stream(effectivePrompt, opts) as {
+              textStream?: AsyncIterable<string>;
+              fullStream?: AsyncIterable<{ type: string; text?: unknown; error?: unknown }>;
+              text?: Promise<string>;
+              usage?: Promise<{
+                promptTokens?: number;
+                completionTokens?: number;
+                totalTokens?: number;
+                costUSD?: number;
+                cacheReadTokens?: number;
+                cacheCreationTokens?: number;
+                cacheCreationExtendedTokens?: number;
+              }>;
+              toolCalls?: Promise<Array<{ name: string; args: unknown; result?: unknown; error?: string }>>;
+              provider?: Promise<string>;
+              model?: Promise<string>;
+              finishReason?: Promise<string>;
+              fallback?: Promise<FallbackSignal | undefined>;
+              agentCalls?: Promise<unknown>;
+            } | null;
+
+            if (agentStream?.textStream) {
+              // streamText reports a failed call as an error part of
+              // `fullStream`, which `textStream` leaves out. A result that
+              // carries `fallback` is streamText's own (it always sets it), so
+              // its parts are read there: the text as before, and the error
+              // the stream ended on. Any other seat's stream is read as text.
+              if (agentStream.fallback !== undefined && agentStream.fullStream) {
+                for await (const part of agentStream.fullStream) {
+                  if (part.type === 'text' && typeof part.text === 'string') {
+                    yield { type: 'text' as const, text: part.text, agent: name };
+                    agentText += part.text;
+                  } else if (part.type === 'error') {
+                    seatError = part.error instanceof Error ? part.error : new Error(String(part.error));
+                  }
+                }
+              } else {
+                for await (const chunk of agentStream.textStream) {
+                  yield { type: 'text' as const, text: chunk, agent: name };
+                  agentText += chunk;
+                }
+              }
+              // If textStream didn't give us the full text, resolve the promise.
+              if (!agentText && agentStream.text) {
+                agentText = await agentStream.text;
+                if (agentText) {
+                  yield { type: 'text' as const, text: agentText, agent: name };
+                }
+              }
+              resultUsage = (await Promise.resolve(agentStream.usage)) ?? {};
+              resultToolCalls = (await Promise.resolve(agentStream.toolCalls)) ?? [];
+              // Who answered: the leg that served when the seat's chain fired.
+              const [streamProvider, streamModel, streamFinish, streamFallback] = await Promise.all([
+                Promise.resolve(agentStream.provider),
+                Promise.resolve(agentStream.model),
+                Promise.resolve(agentStream.finishReason),
+                Promise.resolve(agentStream.fallback),
+              ]);
+              recordExtras = callRecordExtras({
+                provider: streamFallback?.finalProvider ?? streamProvider,
+                model: streamFallback?.finalModel ?? streamModel,
+                finishReason: streamFinish,
+                fallback: streamFallback,
+              });
+              unanswered = await nestedStreamUnanswered(agentStream, agentText, resultUsage, streamFinish);
+            } else {
+              // Fallback: non-streaming generate() call.
+              const result = (await a.generate(effectivePrompt, opts)) as Record<string, unknown>;
+              agentText = (result.text as string) ?? '';
+              if (agentText) {
+                yield { type: 'text' as const, text: agentText, agent: name };
+              }
+              resultUsage = (result.usage as typeof resultUsage) ?? {};
+              resultToolCalls = (result.toolCalls as Array<{ name: string; args: unknown; result?: unknown; error?: string }>) ?? [];
+              recordExtras = callRecordExtras(result);
+              unanswered = nestedRunUnanswered(result);
+            }
+
+            if (!unanswered) {
+              agentCalls.push({
+                agent: name,
+                input: effectivePrompt,
+                output: agentText,
+                toolCalls: resultToolCalls,
+                usage: buildAgentCallUsage(resultUsage),
+                durationMs: Date.now() - agentStart,
+                ...recordExtras,
+              });
+
+              totalUsage.promptTokens += resultUsage.promptTokens ?? 0;
+              totalUsage.completionTokens += resultUsage.completionTokens ?? 0;
+              totalUsage.totalTokens += resultUsage.totalTokens ?? 0;
+              accumulateExtraUsage(totalUsage, resultUsage);
+            }
+
+            // A seat whose stream ended on an error: the error is a part of
+            // this stream too, and the run goes on to the next seat, as it
+            // does for an error a seat throws.
+            if (seatError) {
+              yield { type: 'error' as const, error: seatError, agent: name };
+            }
+          } catch (err) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            yield { type: 'error' as const, error, agent: name };
+          }
+
+          const durationMs = Date.now() - agentStart;
+          yield { type: 'agent-end' as const, agent: name, output: agentText, durationMs };
+          if (unanswered) continue;
+
+          finalText = agentText;
+          currentPrompt = `Original task: ${prompt}\n\nPrevious agent (${name}) output:\n${agentText}`;
+          previousOutput = agentText;
+        }
+
+        const totalDurationMs = Date.now() - startMs;
+        yield {
+          type: 'agent-end' as const,
+          agent: '__agency__',
+          output: finalText,
+          durationMs: totalDurationMs,
+        };
+      }
+
+      /**
+       * Because an `AsyncGenerator` can only be iterated once, we materialise
+       * a single generator and share it between `fullStream`, `textStream`,
+       * `text`, and `usage` by buffering all events.
+       */
+      const replay = createBufferedAsyncReplay(streamGenerator());
+
+      /** Resolves with the concatenated final text. */
+      const textPromise: Promise<string> = replay.ensureDraining().then(() =>
+        replay
+          .getBuffered()
+          .filter((p): p is { type: 'text'; text: string; agent?: string } => p.type === 'text')
+          .map((p) => p.text)
+          .join(''),
+      );
+
+      const usagePromise: Promise<StrategyTotalUsage> =
+        replay.ensureDraining().then(() => ({ ...totalUsage }));
+
+      const agentCallsPromise: Promise<AgentCallRecord[]> =
+        replay.ensureDraining().then(() => [...agentCalls]);
+
+      return {
+        textStream: (async function* () {
+          for await (const part of replay.iterable) {
+            if (part.type === 'text') {
+              yield part.text;
+            }
+          }
+        })(),
+        fullStream: replay.iterable,
+        text: textPromise,
+        usage: usagePromise,
+        agentCalls: agentCallsPromise,
+        toolCalls: Promise.resolve([]),
+      };
+    },
+  };
+}

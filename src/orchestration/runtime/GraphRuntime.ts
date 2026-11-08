@@ -1,0 +1,1604 @@
+/**
+ * @file GraphRuntime.ts
+ * @description Main execution engine for the AgentOS Unified Orchestration Layer.
+ *
+ * `GraphRuntime` ties together the `StateManager`, `NodeScheduler`, `NodeExecutor`,
+ * and `ICheckpointStore` subsystems into a single runnable unit. It supports three
+ * execution modes:
+ *
+ * - **`invoke()`** — execute a graph to completion and return final artifacts.
+ * - **`stream()`** — execute a graph while yielding `GraphEvent` values at every step.
+ * - **`resume()`** — restore a previously interrupted run from its latest checkpoint.
+ *
+ * Design principles:
+ * - No mutable instance state beyond the injected config; each `invoke`/`stream`/`resume`
+ *   call is fully isolated.
+ * - All state lives in `GraphState`; `StateManager` is the sole authority for mutations.
+ * - Checkpointing is always delegated to the injected `ICheckpointStore`.
+ * - Edge evaluation is a pure function of `GraphEdge[]`, `GraphState`, and `NodeExecutionResult`.
+ */
+
+import type { CompiledExecutionGraph, EffectClass, GraphEdge, GraphNode, GraphState } from '../ir/types.js';
+import { END } from '../ir/types.js';
+import type {
+  GraphEvent,
+  MissionExpansionTrigger,
+  MissionGraphPatch,
+} from '../events/GraphEvent.js';
+import type { ICheckpointStore, Checkpoint } from '../checkpoint/ICheckpointStore.js';
+import { StateManager, type ParallelBranchWrites } from './StateManager.js';
+import { NodeScheduler } from './NodeScheduler.js';
+import { NodeExecutor, type NodeExecutionResult } from './NodeExecutor.js';
+import { safeEvaluateExpression } from './safeExpressionEvaluator.js';
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Dependencies required to construct a `GraphRuntime`.
+ *
+ * @property checkpointStore - Persistence backend for checkpoint snapshots.
+ * @property nodeExecutor    - Dispatcher that runs individual graph nodes.
+ */
+export interface GraphRuntimeConfig {
+  /** Persistence backend for checkpoint snapshots. */
+  checkpointStore: ICheckpointStore;
+  /** Dispatcher that executes individual `GraphNode` instances. */
+  nodeExecutor: NodeExecutor;
+  /** Optional mission graph expansion hook applied between node executions. */
+  expansionHandler?: GraphExpansionHandler;
+  /** Optional periodic planner reevaluation cadence, in completed nodes. */
+  reevalInterval?: number;
+  /**
+   * Optional discovery engine for `discovery`-type edge routing.
+   * When present and an edge has a `discoveryQuery`, the engine is called to
+   * resolve the target dynamically. Falls back to `discoveryFallback` when absent.
+   */
+  discoveryEngine?: {
+    discover(query: string, options?: unknown): Promise<{ results?: Array<{ id?: string; name?: string }> }>;
+  };
+  /**
+   * Optional persona trait values for `personality`-type edge routing.
+   * Keys are trait names (e.g. `'openness'`), values are 0–1 floats.
+   * When absent, traits are read from `state.scratch._personaTraits` or default to 0.5.
+   */
+  personaTraits?: Record<string, number>;
+}
+
+export interface GraphExpansionRequest {
+  trigger: MissionExpansionTrigger;
+  reason: string;
+  request: unknown;
+  patch?: MissionGraphPatch;
+}
+
+export interface GraphExpansionContext {
+  graph: CompiledExecutionGraph;
+  runId: string;
+  nodeId: string;
+  state: GraphState;
+  request: GraphExpansionRequest;
+  /**
+   * The checkpoint the runtime saved after the node and before it handed any of
+   * this step's expansion requests to the handler. The node's edges are decided
+   * after the expansion, on the graph it leaves, so the checkpoint does not list
+   * the node in `visitedNodes`, and a resume from it routes the node once by its
+   * edges. A `write`, `external` or `human` node keeps its result and what it
+   * wrote, and a resume marks it complete with its recorded output; a `pure` or
+   * `read` node is saved as it was before it ran, and a resume runs it again.
+   * After a parallel batch, whose nodes' edges are decided before the expansion,
+   * the checkpoint lists every node of the batch.
+   */
+  checkpointIdBefore?: string;
+  completedNodes: string[];
+  skippedNodes: string[];
+  nodeResults: Record<string, {
+    effectClass: EffectClass;
+    output: unknown;
+    durationMs: number;
+  }>;
+}
+
+export interface GraphExpansionResult {
+  graph?: CompiledExecutionGraph;
+  events?: GraphEvent[];
+}
+
+export interface GraphExpansionHandler {
+  handle(context: GraphExpansionContext): Promise<GraphExpansionResult | null>;
+}
+
+function shouldTriggerPlannerReevaluation(
+  reevalInterval: number | undefined,
+  completedNodeCount: number,
+): boolean {
+  return typeof reevalInterval === 'number'
+    && Number.isFinite(reevalInterval)
+    && reevalInterval > 0
+    && completedNodeCount > 0
+    && completedNodeCount % reevalInterval === 0;
+}
+
+function getParallelBatchSizeBeforePlannerReevaluation(
+  reevalInterval: number | undefined,
+  completedNodeCountBeforeBatch: number,
+  readyNodeCount: number,
+): number {
+  if (
+    typeof reevalInterval !== 'number'
+    || !Number.isFinite(reevalInterval)
+    || reevalInterval <= 0
+    || readyNodeCount <= 0
+  ) {
+    return readyNodeCount;
+  }
+
+  const completedSinceLastBoundary = completedNodeCountBeforeBatch % reevalInterval;
+  const remainingUntilBoundary =
+    completedSinceLastBoundary === 0
+      ? reevalInterval
+      : reevalInterval - completedSinceLastBoundary;
+
+  return Math.min(readyNodeCount, remainingUntilBoundary);
+}
+
+// ---------------------------------------------------------------------------
+// GraphRuntime
+// ---------------------------------------------------------------------------
+
+/**
+ * Main execution engine for compiled AgentOS graphs.
+ *
+ * Instantiate once and reuse across multiple runs — the runtime itself is stateless
+ * between calls. Each `invoke()` / `stream()` / `resume()` call creates isolated local
+ * state tracked via closures.
+ *
+ * @example
+ * ```ts
+ * const runtime = new GraphRuntime({ checkpointStore, nodeExecutor });
+ * const result = await runtime.invoke(compiledGraph, { query: 'hello' });
+ * ```
+ */
+export class GraphRuntime {
+  /**
+   * @param config - Injected dependencies shared across all runs handled by this instance.
+   */
+  constructor(private readonly config: GraphRuntimeConfig) {}
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Execute the graph to completion and return the final `artifacts` payload.
+   *
+   * This is a convenience wrapper around `stream()` that discards intermediate events
+   * and awaits the terminal `run_end` event.
+   *
+   * @param graph - Compiled execution graph to run.
+   * @param input - Initial user-provided input; frozen into `GraphState.input`.
+   * @returns The `GraphState.artifacts` value after the last node completes.
+   * @throws The error of a checkpoint save the store refuses, or of a conditional
+   *   edge's function that throws, as {@link stream()} throws it.
+   */
+  async invoke(graph: CompiledExecutionGraph, input: unknown): Promise<unknown> {
+    let finalOutput: unknown;
+    for await (const event of this.stream(graph, input)) {
+      if (event.type === 'run_end') finalOutput = event.finalOutput;
+    }
+    return finalOutput;
+  }
+
+  /**
+   * Execute the graph while yielding `GraphEvent` values at each significant step.
+   *
+   * Events are emitted in strict causal order:
+   * `run_start` → (`node_start` → `node_end` → `edge_transition`?)+ → `run_end`
+   *
+   * The events of a parallel batch are yielded once every node of it has run, in
+   * the order the nodes are declared. When a node of the batch interrupts or fails,
+   * the nodes of the batch that completed come first and the halting node last.
+   *
+   * Checkpoints are saved according to both the graph-wide `checkpointPolicy` and
+   * per-node `checkpoint` settings. An `interrupt` event causes immediate suspension
+   * followed by a terminal `run_end`. When a node interrupts or fails, the checkpoint
+   * the run resumes from is saved before any event that reports the node's result is
+   * yielded, so a consumer may stop iterating at `interrupt` or `error` and still
+   * resume the run. The `checkpoint_saved` event for that checkpoint comes after
+   * `interrupt` or `error`, so such a consumer resumes by the `runId` of `run_start`.
+   *
+   * A checkpoint save the store refuses (its `save()` rejects) or a function on a
+   * conditional edge that throws ends the run: the generator throws that error where
+   * the runtime asked for the checkpoint or evaluated the edge. The checkpoint of a
+   * node that interrupts or fails is saved before the node's events, so when the
+   * store refuses it the error comes before them. In a parallel batch, every other
+   * node of the batch runs to the end first, none of the batch's events is yielded,
+   * and the error is the first in the order the nodes are declared; a node of the
+   * batch counts as completed only once its edges are decided, so a node whose edges
+   * threw is in no checkpoint as completed. The checkpoint saved before an expansion
+   * does not list the node the expansion came after as completed either (see
+   * {@link GraphExpansionContext.checkpointIdBefore}). A resume by the `runId` of
+   * `run_start` continues from the last checkpoint the store saved.
+   *
+   * @param graph - Compiled execution graph to run.
+   * @param input - Initial user-provided input; frozen into `GraphState.input`.
+   * @yields {GraphEvent} Runtime events in causal order.
+   * @throws The error of a checkpoint save the store refuses, or of a conditional
+   *   edge's function that throws.
+   */
+  async *stream(graph: CompiledExecutionGraph, input: unknown): AsyncGenerator<GraphEvent> {
+    const runId = crypto.randomUUID();
+    const stateManager = new StateManager(graph.reducers);
+    let activeGraph = graph;
+
+    let state = stateManager.initialize(input);
+    const startTime = Date.now();
+
+    /** Node ids whose execution has fully completed in this run. */
+    const completedNodes: string[] = [];
+    /** Node ids that were bypassed due to conditional routing. */
+    const skippedNodes: string[] = [];
+    /** Per-node execution results accumulated for checkpoint persistence. */
+    const nodeResults: Record<string, RecordedResult> = {};
+
+    yield { type: 'run_start', runId, graphId: graph.id };
+
+    while (true) {
+      const scheduler = new NodeScheduler(activeGraph.nodes, activeGraph.edges);
+      const readyNodes = scheduler.getReadyNodes(completedNodes, skippedNodes);
+      if (readyNodes.length === 0) break; // All work is done (or no START edge).
+
+      // ── Parallel execution ───────────────────────────────────────────────
+      // When multiple nodes are ready simultaneously (e.g. fan-out from START),
+      // execute them in parallel via Promise.allSettled and merge what they
+      // write to scratch and artifacts using StateManager.mergeParallelBranches().
+      // This is the key optimisation that makes fan-out/fan-in graphs like the
+      // parallel agency strategy actually run concurrently instead of
+      // sequentially.
+      //
+      // A batch of one node takes the sequential path below.
+      const parallelBatchSize =
+        readyNodes.length > 1
+          ? (
+            this.config.expansionHandler
+              ? getParallelBatchSizeBeforePlannerReevaluation(
+                  this.config.reevalInterval,
+                  completedNodes.length,
+                  readyNodes.length,
+                )
+              : readyNodes.length
+          )
+          : readyNodes.length;
+      if (parallelBatchSize > 1) {
+        const parallelReadyNodes = readyNodes.slice(0, parallelBatchSize);
+        // Snapshot the state before fan-out so each branch starts from the
+        // same baseline. After all branches complete, we merge what each one
+        // wrote to scratch and artifacts back into this baseline.
+        const baseState = state;
+
+        // Collect events from parallel branches so we can yield them in order
+        // after all branches complete. We cannot yield from inside the branches
+        // because async generators do not support concurrent yields.
+        const branchResults: Array<{
+          nodeId: string;
+          events: GraphEvent[];
+          branchState: GraphState;
+          expansionRequests?: GraphExpansionRequest[];
+          earlyTermination?: {
+            type: 'interrupt' | 'error';
+            events: GraphEvent[];
+          };
+        }> = [];
+        // What each branch that has completed wrote, at its place in the batch,
+        // for the checkpoints the branches save while the batch runs.
+        const completedInBatch: Array<CompletedBranch | undefined> = [];
+
+        // Every branch runs to the end before the run goes on or ends, the
+        // branches beside one that threw included. A branch throws when the
+        // store refuses a checkpoint it saves or a function on one of its
+        // edges throws, and the run then ends with the first such error in
+        // batch order once the others have finished: a branch still running
+        // after stream() has thrown would go on calling its model and saving
+        // checkpoints with nobody reading it, and a host that resumed the run
+        // on the error would run it again beside it.
+        const settledBranches = await Promise.allSettled(
+          parallelReadyNodes.map(async (nodeId, batchIndex) => {
+            const node = activeGraph.nodes.find(n => n.id === nodeId);
+            if (!node) {
+              skippedNodes.push(nodeId);
+              return null;
+            }
+
+            const events: GraphEvent[] = [];
+            let branchState = stateManager.recordNodeVisit(baseState, nodeId);
+
+            // Checkpoint BEFORE (parallel branch).
+            if (node.checkpoint === 'before' || node.checkpoint === 'both') {
+              const checkpointId = await this.saveCheckpoint(
+                activeGraph, runId, nodeId, branchState, nodeResults,
+                completedNodes, skippedNodes, [],
+              );
+              branchState = this.attachCheckpointMetadata(branchState, checkpointId);
+              events.push({ type: 'checkpoint_saved', checkpointId, nodeId });
+            }
+
+            events.push({ type: 'node_start', nodeId, state: { input: branchState.input, scratch: branchState.scratch } });
+            const nodeStart = Date.now();
+
+            let result = await this.config.nodeExecutor.execute(node, branchState);
+            let durationMs = Date.now() - nodeStart;
+
+            // Retry logic (same as sequential path).
+            if (!result.success && !result.interrupt && node.retryPolicy) {
+              const policy = node.retryPolicy;
+              let attempt = 1;
+              while (attempt < policy.maxAttempts && shouldRetry(policy, result.error)) {
+                attempt++;
+                await sleep(calculateBackoff(policy, attempt - 1));
+                events.push({ type: 'node_start', nodeId, state: { input: branchState.input, scratch: branchState.scratch } });
+                const retryStart = Date.now();
+                result = await this.config.nodeExecutor.execute(node, branchState);
+                durationMs = Date.now() - retryStart;
+                if (result.success || result.interrupt) break;
+              }
+            }
+
+            // As outside a batch, a node that fails writes nothing and leaves
+            // no result, so a resume executes it again.
+            const failed = !result.success && !result.interrupt;
+            if (!failed) {
+              nodeResults[nodeId] = recordedResult(node, result, durationMs);
+            }
+
+            const scratchWrite = failed ? undefined : result.scratchUpdate;
+            if (scratchWrite) {
+              branchState = stateManager.updateScratch(branchState, scratchWrite);
+            }
+            let artifactsWrite: Record<string, unknown> | undefined = failed ? undefined : result.artifactsUpdate;
+            if (!artifactsWrite && result.success && result.output !== undefined && !result.routeTarget) {
+              // Same default artifact promotion as the sequential path —
+              // see the comment at the matching block below for context.
+              const artifactKey =
+                typeof node.metadata?.outputAs === 'string' && node.metadata.outputAs.length > 0
+                  ? node.metadata.outputAs
+                  : nodeId;
+              artifactsWrite = { [artifactKey]: result.output };
+            }
+            if (artifactsWrite) {
+              branchState = stateManager.updateArtifacts(branchState, artifactsWrite);
+            }
+            // What this branch wrote: the merge after the batch takes these
+            // keys from its state, and none it only carried from `baseState`.
+            const writes: ParallelBranchWrites = { scratch: scratchWrite, artifacts: artifactsWrite };
+            events.push(...getResultEvents(result));
+
+            // Check for interrupt / error in the parallel branch.
+            if (result.interrupt) {
+              events.push({ type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata });
+              const terminationEvents: GraphEvent[] = [
+                { type: 'interrupt', nodeId, reason: 'human_approval' },
+              ];
+              return { nodeId, events, branchState, writes, earlyTermination: { type: 'interrupt' as const, events: terminationEvents } };
+            }
+
+            if (!result.success) {
+              const errorMessage = result.error ?? `Node ${nodeId} failed`;
+              const timeoutMs = this.extractTimeoutMs(errorMessage);
+              const terminationEvents: GraphEvent[] = [];
+              if (timeoutMs !== null) {
+                terminationEvents.push({ type: 'node_timeout', nodeId, timeoutMs });
+              }
+              terminationEvents.push({
+                type: 'error', nodeId,
+                error: { code: timeoutMs !== null ? 'NODE_TIMEOUT' : 'NODE_EXECUTION_FAILED', message: errorMessage },
+              });
+              // The reason the run stops for, read from the node that ran: a
+              // node an expansion added is not in the graph the run started with.
+              const reason = node.type === 'guardrail' ? 'guardrail_violation' as const : 'error' as const;
+              return { nodeId, events, branchState, writes, earlyTermination: { type: 'error' as const, events: terminationEvents, reason } };
+            }
+
+            events.push({ type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata });
+
+            // Edge routing for this parallel branch. The node counts as
+            // completed once its edges are decided, with the targets it did not
+            // pick skipped: a checkpoint another branch saves before then,
+            // while the edges are evaluated or after a function on one of them
+            // threw, leaves the node out, so a resume from it runs the node
+            // again and follows the edges it picks then, never every target.
+            const outEdges = activeGraph.edges.filter(e => e.source === nodeId);
+            const targets = await this.evaluateEdges(outEdges, branchState, result);
+
+            for (const potentialTarget of outEdges.map(e => e.target)) {
+              if (!targets.includes(potentialTarget) && !completedNodes.includes(potentialTarget) && !skippedNodes.includes(potentialTarget)) {
+                skippedNodes.push(potentialTarget);
+              }
+            }
+            completedNodes.push(nodeId);
+            completedInBatch[batchIndex] = { state: stateAsWritten(branchState, writes), writes };
+
+            for (const target of targets) {
+              if (target !== END) {
+                const edgeType = outEdges.find(e => e.target === target)?.type ?? 'static';
+                events.push({ type: 'edge_transition', sourceId: nodeId, targetId: target, edgeType });
+              }
+            }
+
+            // Checkpoint AFTER (parallel branch).
+            const pendingEdges = this.resolvePendingEdgeIds(outEdges, targets);
+            let checkpointedAfter = false;
+            if (node.checkpoint === 'after' || node.checkpoint === 'both' || graph.checkpointPolicy === 'every_node') {
+              // The nodes completed so far can include siblings that finished
+              // before this one. The checkpoint holds what each of them wrote,
+              // merged in batch order as after the batch, and their results
+              // alone, so a resume from it skips them and loses nothing, and
+              // runs again a sibling that has not completed: one that waits
+              // for a person asks when the run resumes.
+              const completedSoFar = completedInBatch.filter(
+                (branch): branch is CompletedBranch => branch !== undefined,
+              );
+              const completedState = stateManager.mergeParallelBranches(
+                baseState,
+                completedSoFar.map((branch) => branch.state),
+                completedSoFar.map((branch) => branch.writes),
+              );
+              const checkpointId = await this.saveCheckpoint(
+                activeGraph, runId, nodeId,
+                { ...branchState, scratch: completedState.scratch, artifacts: completedState.artifacts },
+                resultsOf(nodeResults, completedNodes),
+                completedNodes, skippedNodes, pendingEdges,
+              );
+              branchState = this.attachCheckpointMetadata(branchState, checkpointId);
+              events.push({ type: 'checkpoint_saved', checkpointId, nodeId });
+              checkpointedAfter = true;
+            }
+
+            return {
+              nodeId,
+              events,
+              branchState,
+              writes,
+              pendingEdges,
+              checkpointedAfter,
+              expansionRequests: [...(result.expansionRequests ?? [])],
+            };
+          }),
+        );
+        const parallelOutcomes = settledBranches.map((settled) => {
+          if (settled.status === 'rejected') throw settled.reason;
+          return settled.value;
+        });
+
+        // A branch that interrupted or failed stops the run, and the first one
+        // in batch order is the one the run reports. Every branch has run, so
+        // save the checkpoint the run resumes from before yielding any of the
+        // batch's events: a consumer that stops iterating at one of them
+        // (`interrupt`, `error`) closes this generator at that `yield`, and
+        // the code after it never runs. The branches that completed are in
+        // `completedNodes`, so a resume does not run them again: the
+        // checkpoint holds what they wrote, merged with what the halting
+        // branch wrote, in batch order (a branch that failed wrote nothing).
+        const haltingOutcome = parallelOutcomes.find((outcome) => outcome?.earlyTermination);
+        if (haltingOutcome) {
+          const haltedBatch = parallelOutcomes.filter(
+            (outcome) => !!outcome && (!outcome.earlyTermination || outcome === haltingOutcome),
+          ) as Array<NonNullable<typeof haltingOutcome>>;
+          const merged = stateManager.mergeParallelBranches(
+            baseState,
+            haltedBatch.map((outcome) => stateAsWritten(outcome.branchState, outcome.writes)),
+            haltedBatch.map((outcome) => outcome.writes),
+          );
+          const haltState: GraphState = {
+            ...haltingOutcome.branchState,
+            scratch: merged.scratch,
+            artifacts: merged.artifacts,
+          };
+          // Another branch that interrupted waits for an answer nobody has
+          // been asked for, since the run reports the halting branch alone.
+          // A resume marks a `human`, `write` or `external` node complete
+          // from its recorded result, so the checkpoint leaves that branch's
+          // result out: the resumed run executes it again, and it interrupts.
+          const unanswered = new Set(
+            parallelOutcomes
+              .filter((outcome) => outcome?.earlyTermination?.type === 'interrupt' && outcome !== haltingOutcome)
+              .map((outcome) => outcome!.nodeId),
+          );
+          const haltNodeResults = Object.fromEntries(
+            Object.entries(nodeResults).filter(([resultNodeId]) => !unanswered.has(resultNodeId)),
+          );
+          const haltCheckpointId = await this.saveCheckpoint(
+            activeGraph, runId, haltingOutcome.nodeId, haltState,
+            haltNodeResults, completedNodes, skippedNodes, [],
+          );
+
+          // Report every branch that completed, in batch order, the ones
+          // declared after the halting branch included, then the halting
+          // branch and the stop, as a node outside a batch reports them. The
+          // other branches that halted are not reported: a resume runs them
+          // again.
+          for (const outcome of parallelOutcomes) {
+            if (!outcome || outcome.earlyTermination) continue;
+            for (const event of outcome.events) {
+              yield event;
+            }
+          }
+          const termination = haltingOutcome.earlyTermination!;
+          for (const event of [...haltingOutcome.events, ...termination.events]) {
+            yield event;
+          }
+          state = this.attachCheckpointMetadata(haltState, haltCheckpointId);
+          yield { type: 'checkpoint_saved', checkpointId: haltCheckpointId, nodeId: haltingOutcome.nodeId };
+          // An interrupting branch's termination events already hold its
+          // `interrupt`. A failing branch's hold its `error`, and the
+          // `interrupt` that stops the run follows the checkpoint, as for a
+          // node outside a batch.
+          if (termination.type === 'error') {
+            yield { type: 'interrupt', nodeId: haltingOutcome.nodeId, reason: termination.reason };
+          }
+          yield { type: 'run_end', runId, finalOutput: state.artifacts, totalDurationMs: Date.now() - startTime };
+          return;
+        }
+
+        // Every branch completed. Merge what each wrote back into the
+        // baseline: each branch contributes the scratch and artifacts keys it
+        // wrote, in batch order, and the reducer configuration determines how
+        // writes to the same key combine.
+        const successfulBranches = parallelOutcomes.filter(
+          (outcome): outcome is NonNullable<typeof outcome> => !!outcome,
+        );
+        let batchCheckpoint: { checkpointId: string; nodeId: string } | undefined;
+        if (successfulBranches.length > 0) {
+          state = stateManager.mergeParallelBranches(
+            baseState,
+            successfulBranches.map((branch) => stateAsWritten(branch.branchState, branch.writes)),
+            successfulBranches.map((branch) => branch.writes),
+          );
+
+          // A branch that saved a checkpoint after it ran saved what the
+          // branches completed by then wrote. Save the merged state as well, so
+          // the last checkpoint of the batch holds what every branch wrote, and
+          // save it before yielding the batch's events, as the checkpoint of a
+          // batch that halts is saved: a consumer that stops reading during
+          // them, or a process that stops there, leaves it the latest.
+          if (successfulBranches.some((branch) => branch.checkpointedAfter)) {
+            const checkpointNodeId = successfulBranches[successfulBranches.length - 1]!.nodeId;
+            const checkpointId = await this.saveCheckpoint(
+              activeGraph, runId, checkpointNodeId, state, nodeResults,
+              completedNodes, skippedNodes,
+              successfulBranches.flatMap((branch) => branch.pendingEdges ?? []),
+            );
+            state = this.attachCheckpointMetadata(state, checkpointId);
+            batchCheckpoint = { checkpointId, nodeId: checkpointNodeId };
+          }
+        }
+
+        for (const outcome of successfulBranches) {
+          for (const event of outcome.events) {
+            yield event;
+          }
+        }
+        if (batchCheckpoint) {
+          yield { type: 'checkpoint_saved', ...batchCheckpoint };
+        }
+
+        if (this.config.expansionHandler) {
+          const expansionQueue: Array<{
+            nodeId: string;
+            request: GraphExpansionRequest;
+          }> = [];
+
+          for (const outcome of parallelOutcomes) {
+            if (!outcome || outcome.earlyTermination || !outcome.expansionRequests?.length) continue;
+
+            for (const request of outcome.expansionRequests) {
+              expansionQueue.push({
+                nodeId: outcome.nodeId,
+                request,
+              });
+            }
+          }
+
+          if (shouldTriggerPlannerReevaluation(this.config.reevalInterval, completedNodes.length)) {
+            const lastCompletedNodeId = parallelReadyNodes[parallelReadyNodes.length - 1]!;
+            expansionQueue.push({
+              nodeId: lastCompletedNodeId,
+              request: {
+                trigger: 'planner_reeval',
+                reason: `Periodic reevaluation after ${completedNodes.length} completed nodes`,
+                request: {
+                  completedNodeCount: completedNodes.length,
+                  lastCompletedNodeId,
+                },
+              },
+            });
+          }
+
+          if (expansionQueue.length > 0) {
+            const checkpointNodeId = expansionQueue[expansionQueue.length - 1]!.nodeId;
+            const checkpointIdBefore = await this.saveCheckpoint(
+              activeGraph,
+              runId,
+              checkpointNodeId,
+              state,
+              nodeResults,
+              completedNodes,
+              skippedNodes,
+              [],
+            );
+            state = this.attachCheckpointMetadata(state, checkpointIdBefore);
+            yield { type: 'checkpoint_saved', checkpointId: checkpointIdBefore, nodeId: checkpointNodeId };
+            yield { type: 'mission:checkpoint_saved', checkpointId: checkpointIdBefore, nodeId: checkpointNodeId };
+
+            for (const { nodeId, request } of expansionQueue) {
+              const expansionOutcome = await this.config.expansionHandler.handle({
+                graph: activeGraph,
+                runId,
+                nodeId,
+                state,
+                request,
+                checkpointIdBefore,
+                completedNodes: [...completedNodes],
+                skippedNodes: [...skippedNodes],
+                nodeResults: nodeResults as GraphExpansionContext['nodeResults'],
+              });
+
+              for (const event of expansionOutcome?.events ?? []) {
+                yield event;
+              }
+
+              if (expansionOutcome?.graph) {
+                activeGraph = expansionOutcome.graph;
+              }
+            }
+          }
+        }
+      } else {
+        // ── Sequential execution (single ready node) ─────────────────────────
+        // Original single-node path preserved for simplicity and to avoid
+        // the overhead of Promise.allSettled for the common single-node case.
+        const nodeId = readyNodes[0];
+        const node = activeGraph.nodes.find(n => n.id === nodeId);
+        if (!node) {
+          // Node declared in edges but missing from nodes array — skip defensively.
+          skippedNodes.push(nodeId);
+          continue;
+        }
+
+        state = stateManager.recordNodeVisit(state, nodeId);
+
+        // ── Checkpoint BEFORE ────────────────────────────────────────────────
+        if (node.checkpoint === 'before' || node.checkpoint === 'both') {
+          const checkpointId = await this.saveCheckpoint(
+            activeGraph,
+            runId,
+            nodeId,
+            state,
+            nodeResults,
+            completedNodes,
+            skippedNodes,
+            [],
+          );
+          state = this.attachCheckpointMetadata(state, checkpointId);
+          yield { type: 'checkpoint_saved', checkpointId, nodeId };
+        }
+
+        yield { type: 'node_start', nodeId, state: { input: state.input, scratch: state.scratch } };
+        const nodeStart = Date.now();
+
+        // ── Execute (with retry) ─────────────────────────────────────────────
+        let result = await this.config.nodeExecutor.execute(node, state);
+        let durationMs = Date.now() - nodeStart;
+
+        if (!result.success && !result.interrupt && node.retryPolicy) {
+          const policy = node.retryPolicy;
+          let attempt = 1;
+          while (attempt < policy.maxAttempts && shouldRetry(policy, result.error)) {
+            attempt++;
+            await sleep(calculateBackoff(policy, attempt - 1));
+            yield { type: 'node_start', nodeId, state: { input: state.input, scratch: state.scratch } };
+            const retryStart = Date.now();
+            result = await this.config.nodeExecutor.execute(node, state);
+            durationMs = Date.now() - retryStart;
+            if (result.success || result.interrupt) break;
+          }
+        }
+
+        // A node that fails writes nothing and leaves no result, as an attempt
+        // its retry policy runs again does: the checkpoint the run resumes
+        // from holds the state the node ran on, and a resume executes the
+        // node again, whatever its effect class.
+        const failed = !result.success && !result.interrupt;
+        if (!failed) {
+          nodeResults[nodeId] = recordedResult(node, result, durationMs);
+        }
+        // The state the node ran on, for the checkpoint saved before an expansion.
+        const stateBeforeWrites = state;
+
+        // Apply state patches produced by the node.
+        if (result.scratchUpdate && !failed) {
+          state = stateManager.updateScratch(state, result.scratchUpdate);
+        }
+        if (result.artifactsUpdate && !failed) {
+          state = stateManager.updateArtifacts(state, result.artifactsUpdate);
+        } else if (result.success && result.output !== undefined && !result.routeTarget) {
+          // Default artifact promotion: when the node ran successfully and the
+          // executor did not produce its own `artifactsUpdate`, promote
+          // `result.output` into `state.artifacts` under the key declared on
+          // `node.metadata.outputAs` (set by builders like workflow()'s
+          // `step('id', { outputAs: 'foo' })`), or fall back to `node.id`.
+          // This is what makes `await workflow.invoke(...)` actually return
+          // the per-step outputs that authors `.returns()`-typed against,
+          // instead of an empty object.
+          //
+          // Router nodes (which return `routeTarget` instead of a payload)
+          // are excluded — they're control-flow, not value producers.
+          const artifactKey =
+            typeof node.metadata?.outputAs === 'string' && node.metadata.outputAs.length > 0
+              ? node.metadata.outputAs
+              : nodeId;
+          state = stateManager.updateArtifacts(state, { [artifactKey]: result.output });
+        }
+        // A node that interrupts or fails stops the run here. Save the
+        // checkpoint the run resumes from before yielding the node's events:
+        // a consumer that stops iterating at one of them (`interrupt`,
+        // `error`) closes this generator at that `yield`, and the code after
+        // it never runs.
+        let haltCheckpointId: string | undefined;
+        if (result.interrupt || !result.success) {
+          haltCheckpointId = await this.saveCheckpoint(
+            activeGraph,
+            runId,
+            nodeId,
+            state,
+            nodeResults,
+            completedNodes,
+            skippedNodes,
+            [],
+          );
+          state = this.attachCheckpointMetadata(state, haltCheckpointId);
+        }
+
+        for (const event of getResultEvents(result)) {
+          yield event;
+        }
+
+        // ── Human interrupt ───────────────────────────────────────────────────
+        if (result.interrupt) {
+          yield { type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata };
+          yield { type: 'interrupt', nodeId, reason: 'human_approval' };
+          yield { type: 'checkpoint_saved', checkpointId: haltCheckpointId!, nodeId };
+          yield { type: 'run_end', runId, finalOutput: state.artifacts, totalDurationMs: Date.now() - startTime };
+          return;
+        }
+
+        if (!result.success) {
+          const errorMessage = result.error ?? `Node ${nodeId} failed`;
+          const timeoutMs = this.extractTimeoutMs(errorMessage);
+          if (timeoutMs !== null) {
+            yield { type: 'node_timeout', nodeId, timeoutMs };
+          }
+          yield {
+            type: 'error',
+            nodeId,
+            error: {
+              code: timeoutMs !== null ? 'NODE_TIMEOUT' : 'NODE_EXECUTION_FAILED',
+              message: errorMessage,
+            },
+          };
+          yield { type: 'checkpoint_saved', checkpointId: haltCheckpointId!, nodeId };
+          yield {
+            type: 'interrupt',
+            nodeId,
+            reason: node.type === 'guardrail' ? 'guardrail_violation' : 'error',
+          };
+          yield { type: 'run_end', runId, finalOutput: state.artifacts, totalDurationMs: Date.now() - startTime };
+          return;
+        }
+
+        yield { type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata };
+
+        completedNodes.push(nodeId);
+
+        const expansionRequests = [...(result.expansionRequests ?? [])];
+        if (
+          this.config.expansionHandler
+          && shouldTriggerPlannerReevaluation(this.config.reevalInterval, completedNodes.length)
+        ) {
+          expansionRequests.push({
+            trigger: 'planner_reeval',
+            reason: `Periodic reevaluation after ${completedNodes.length} completed nodes`,
+            request: {
+              completedNodeCount: completedNodes.length,
+              lastCompletedNodeId: nodeId,
+            },
+          });
+        }
+
+        if (this.config.expansionHandler && expansionRequests.length > 0) {
+          let checkpointIdBefore: string | undefined;
+
+          for (const request of expansionRequests) {
+            if (!checkpointIdBefore) {
+              // The node's edges are decided after the expansion, so this
+              // checkpoint does not list it as completed: a resume from it
+              // routes the node once, rather than making every target of its
+              // edges ready.
+              const beforeExpansion = checkpointBeforeExpansion(
+                node, state, stateBeforeWrites, nodeResults, completedNodes,
+              );
+              checkpointIdBefore = await this.saveCheckpoint(
+                activeGraph,
+                runId,
+                nodeId,
+                beforeExpansion.state,
+                beforeExpansion.nodeResults,
+                beforeExpansion.visitedNodes,
+                skippedNodes,
+                [],
+              );
+              state = this.attachCheckpointMetadata(state, checkpointIdBefore);
+              yield { type: 'checkpoint_saved', checkpointId: checkpointIdBefore, nodeId };
+              yield { type: 'mission:checkpoint_saved', checkpointId: checkpointIdBefore, nodeId };
+            }
+
+            const outcome = await this.config.expansionHandler.handle({
+              graph: activeGraph,
+              runId,
+              nodeId,
+              state,
+              request,
+              checkpointIdBefore,
+              completedNodes: [...completedNodes],
+              skippedNodes: [...skippedNodes],
+              nodeResults: nodeResults as GraphExpansionContext['nodeResults'],
+            });
+
+            for (const event of outcome?.events ?? []) {
+              yield event;
+            }
+
+            if (outcome?.graph) {
+              activeGraph = outcome.graph;
+            }
+          }
+        }
+
+        // ── Edge routing ──────────────────────────────────────────────────────
+        const outEdges = activeGraph.edges.filter(e => e.source === nodeId);
+        const targets = await this.evaluateEdges(outEdges, state, result);
+
+        // Any outgoing-edge target that was NOT selected is marked as skipped
+        // so downstream nodes that depend only on the skipped branch do not block.
+        // This applies to ALL edge types (static, conditional, personality, discovery)
+        // when a router node produces a routing decision.
+        for (const potentialTarget of outEdges.map(e => e.target)) {
+          if (
+            !targets.includes(potentialTarget) &&
+            !completedNodes.includes(potentialTarget) &&
+            !skippedNodes.includes(potentialTarget)
+          ) {
+            skippedNodes.push(potentialTarget);
+          }
+        }
+
+        for (const target of targets) {
+          if (target !== END) {
+            const edgeType = outEdges.find(e => e.target === target)?.type ?? 'static';
+            yield { type: 'edge_transition', sourceId: nodeId, targetId: target, edgeType };
+          }
+        }
+
+        // ── Checkpoint AFTER ──────────────────────────────────────────────────
+        if (
+          node.checkpoint === 'after' ||
+          node.checkpoint === 'both' ||
+          activeGraph.checkpointPolicy === 'every_node'
+        ) {
+          const checkpointId = await this.saveCheckpoint(
+            activeGraph,
+            runId,
+            nodeId,
+            state,
+            nodeResults,
+            completedNodes,
+            skippedNodes,
+            this.resolvePendingEdgeIds(outEdges, targets),
+          );
+          state = this.attachCheckpointMetadata(state, checkpointId);
+          yield { type: 'checkpoint_saved', checkpointId, nodeId };
+        }
+      }
+    }
+
+    yield {
+      type: 'run_end',
+      runId,
+      finalOutput: state.artifacts,
+      totalDurationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Resume a previously interrupted run from its latest persisted checkpoint.
+   *
+   * The runtime restores `GraphState` from the checkpoint and re-executes any nodes
+   * that had not yet completed when the run was suspended. A node the checkpoint
+   * records as `write`, `external`, or `human` effect-class (the node that
+   * interrupted the run) is replayed from its stored output to avoid duplicate
+   * side-effects; all other nodes are re-executed. A replayed node's edges are
+   * evaluated on the restored state with the node's visit recorded
+   * (`currentNodeId` names the node and `visitedNodes` lists it), as a node's
+   * are after it runs, so the run follows the targets they pick and skips the
+   * others; a replayed node that picked its target itself, as the exit of a voice
+   * node does, goes to the target its recorded result names. A node that failed
+   * recorded no result and wrote nothing, so it runs again, from the state it ran on.
+   *
+   * @param graph - The same compiled graph that was originally invoked.
+   * @param runOrCheckpointId - Either the original run id or an exact checkpoint id.
+   * @returns The final `GraphState.artifacts` value after resumption completes.
+   * @throws {Error} When no checkpoint exists for the given identifier.
+   * @throws The error of a checkpoint save the store refuses, or of a conditional
+   *   edge's function that throws, as {@link stream()} throws it.
+   */
+  async resume(graph: CompiledExecutionGraph, runOrCheckpointId: string): Promise<unknown> {
+    let finalOutput: unknown;
+    for await (const event of this.streamResume(graph, runOrCheckpointId)) {
+      if (event.type === 'run_end') finalOutput = event.finalOutput;
+    }
+    return finalOutput;
+  }
+
+  /**
+   * Resume a previously interrupted run and stream runtime events from the restore point.
+   *
+   * Accepts either the original run id or an exact checkpoint id. The resolved checkpoint
+   * is used to reconstruct `GraphState`, then execution continues through the same event
+   * stream contract as {@link stream()}.
+   *
+   * @param graph - Compiled execution graph to resume.
+   * @param runOrCheckpointId - Either the original run id or an exact checkpoint id.
+   * @yields {GraphEvent} Runtime events in causal order from the checkpoint onward.
+   * @throws {Error} When no checkpoint exists for the given identifier.
+   * @throws The error of a checkpoint save the store refuses, or of a conditional
+   *   edge's function that throws, as {@link stream()} throws it.
+   */
+  async *streamResume(
+    graph: CompiledExecutionGraph,
+    runOrCheckpointId: string,
+  ): AsyncGenerator<GraphEvent> {
+    const checkpoint =
+      await this.config.checkpointStore.latest(runOrCheckpointId)
+      ?? await this.config.checkpointStore.get(runOrCheckpointId);
+    if (!checkpoint) throw new Error(`No checkpoint found for identifier ${runOrCheckpointId}`);
+
+    // Reconstruct graph state from the persisted snapshot.
+    const stateManager = new StateManager(graph.reducers);
+    let state = stateManager.initialize(checkpoint.state.input);
+    state = {
+      ...state,
+      scratch: checkpoint.state.scratch as GraphState['scratch'],
+      artifacts: checkpoint.state.artifacts as GraphState['artifacts'],
+      visitedNodes: [...checkpoint.visitedNodes],
+      iteration: checkpoint.visitedNodes.length,
+    };
+    yield* this.continueFromCheckpoint(graph, checkpoint.runId, state, checkpoint);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Continue execution from a restored checkpoint state.
+   *
+   * Mirrors `stream()` but initialises `completedNodes` / `nodeResults` from the
+   * checkpoint so previously-finished work is not repeated. Nodes with side-effectful
+   * effect classes are replayed from stored outputs; pure / read nodes are re-executed.
+   *
+   * @param graph      - The compiled execution graph.
+   * @param runId      - Original run identifier for checkpoint persistence.
+   * @param state      - `GraphState` restored from the checkpoint.
+   * @param checkpoint - Full checkpoint snapshot; provides `nodeResults` and `visitedNodes`.
+   * @yields {GraphEvent} Runtime events in causal order, starting from the resume point.
+   */
+  private async *continueFromCheckpoint(
+    graph: CompiledExecutionGraph,
+    runId: string,
+    state: GraphState,
+    checkpoint: Checkpoint,
+  ): AsyncGenerator<GraphEvent> {
+    const stateManager = new StateManager(graph.reducers);
+    let activeGraph = graph;
+
+    const completedNodes = [...checkpoint.visitedNodes];
+    const skippedNodes = [...(checkpoint.skippedNodes ?? [])];
+    const nodeResults = { ...checkpoint.nodeResults };
+    const startTime = Date.now();
+
+    yield { type: 'run_start', runId, graphId: graph.id };
+
+    while (true) {
+      const scheduler = new NodeScheduler(activeGraph.nodes, activeGraph.edges);
+      const readyNodes = scheduler.getReadyNodes(completedNodes, skippedNodes);
+      if (readyNodes.length === 0) break;
+
+      for (const nodeId of readyNodes) {
+        const node = activeGraph.nodes.find(n => n.id === nodeId);
+        if (!node) {
+          skippedNodes.push(nodeId);
+          continue;
+        }
+
+        // Nodes with side-effects that were recorded are replayed from stored output
+        // to prevent duplicate writes/calls.
+        const recorded = checkpoint.nodeResults[nodeId];
+        if (recorded && REPLAYED_EFFECT_CLASSES.has(recorded.effectClass)) {
+          yield { type: 'node_end', nodeId, output: recorded.output, durationMs: recorded.durationMs };
+
+          // The node does not run again, but its edges still decide where the
+          // run goes, as after a node that runs: a condition reads the state
+          // the run resumed with, such as the decision a host wrote into the
+          // checkpoint it forked, and the targets the node does not pick are
+          // skipped. That state records the node's visit, as the state after
+          // a node runs does: `currentNodeId` names the node and
+          // `visitedNodes` lists it. A node that picked its target itself, as
+          // a voice node's exit does, goes to the target its result recorded.
+          state = stateManager.recordNodeVisit(state, nodeId);
+          const replayedEdges = activeGraph.edges.filter(e => e.source === nodeId);
+          const replayedTargets = await this.evaluateEdges(
+            replayedEdges,
+            state,
+            { success: true, output: recorded.output, routeTarget: recorded.routeTarget },
+          );
+          for (const potentialTarget of replayedEdges.map(e => e.target)) {
+            if (
+              !replayedTargets.includes(potentialTarget) &&
+              !completedNodes.includes(potentialTarget) &&
+              !skippedNodes.includes(potentialTarget)
+            ) {
+              skippedNodes.push(potentialTarget);
+            }
+          }
+          completedNodes.push(nodeId);
+          for (const target of replayedTargets) {
+            if (target !== END) {
+              const edgeType = replayedEdges.find(e => e.target === target)?.type ?? 'static';
+              yield { type: 'edge_transition', sourceId: nodeId, targetId: target, edgeType };
+            }
+          }
+          continue;
+        }
+
+        // Re-execute the node (pure / read effects, or nodes without a stored result).
+        state = stateManager.recordNodeVisit(state, nodeId);
+        yield { type: 'node_start', nodeId, state: { input: state.input, scratch: state.scratch } };
+        const nodeStart = Date.now();
+
+        let result = await this.config.nodeExecutor.execute(node, state);
+        let durationMs = Date.now() - nodeStart;
+
+        if (!result.success && !result.interrupt && node.retryPolicy) {
+          const policy = node.retryPolicy;
+          let attempt = 1;
+          while (attempt < policy.maxAttempts && shouldRetry(policy, result.error)) {
+            attempt++;
+            await sleep(calculateBackoff(policy, attempt - 1));
+            yield { type: 'node_start', nodeId, state: { input: state.input, scratch: state.scratch } };
+            const retryStart = Date.now();
+            result = await this.config.nodeExecutor.execute(node, state);
+            durationMs = Date.now() - retryStart;
+            if (result.success || result.interrupt) break;
+          }
+        }
+
+        // As in stream(), a node that fails writes nothing and leaves no
+        // result, so a later resume executes it again.
+        const failed = !result.success && !result.interrupt;
+        if (!failed) {
+          nodeResults[nodeId] = recordedResult(node, result, durationMs);
+        }
+        // The state the node ran on, for the checkpoint saved before an expansion.
+        const stateBeforeWrites = state;
+
+        if (result.scratchUpdate && !failed) state = stateManager.updateScratch(state, result.scratchUpdate);
+        if (result.artifactsUpdate && !failed) {
+          state = stateManager.updateArtifacts(state, result.artifactsUpdate);
+        } else if (result.success && result.output !== undefined && !result.routeTarget) {
+          // Same default artifact promotion as the primary path.
+          const artifactKey =
+            typeof node.metadata?.outputAs === 'string' && node.metadata.outputAs.length > 0
+              ? node.metadata.outputAs
+              : nodeId;
+          state = stateManager.updateArtifacts(state, { [artifactKey]: result.output });
+        }
+        // As in stream(): save the checkpoint of a node that interrupts or
+        // fails before yielding its events, so a consumer that stops
+        // iterating at `interrupt` or `error` still finds it saved.
+        let haltCheckpointId: string | undefined;
+        if (result.interrupt || !result.success) {
+          haltCheckpointId = await this.saveCheckpoint(
+            activeGraph,
+            runId,
+            nodeId,
+            state,
+            nodeResults,
+            completedNodes,
+            skippedNodes,
+            [],
+          );
+          state = this.attachCheckpointMetadata(state, haltCheckpointId);
+        }
+
+        for (const event of getResultEvents(result)) {
+          yield event;
+        }
+
+        if (result.interrupt) {
+          yield { type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata };
+          yield { type: 'interrupt', nodeId, reason: 'human_approval' };
+          yield { type: 'checkpoint_saved', checkpointId: haltCheckpointId!, nodeId };
+          yield { type: 'run_end', runId, finalOutput: state.artifacts, totalDurationMs: Date.now() - startTime };
+          return;
+        }
+
+        if (!result.success) {
+          const errorMessage = result.error ?? `Node ${nodeId} failed`;
+          const timeoutMs = this.extractTimeoutMs(errorMessage);
+          if (timeoutMs !== null) {
+            yield { type: 'node_timeout', nodeId, timeoutMs };
+          }
+          yield {
+            type: 'error',
+            nodeId,
+            error: {
+              code: timeoutMs !== null ? 'NODE_TIMEOUT' : 'NODE_EXECUTION_FAILED',
+              message: errorMessage,
+            },
+          };
+          yield { type: 'checkpoint_saved', checkpointId: haltCheckpointId!, nodeId };
+          yield {
+            type: 'interrupt',
+            nodeId,
+            reason: node.type === 'guardrail' ? 'guardrail_violation' : 'error',
+          };
+          yield { type: 'run_end', runId, finalOutput: state.artifacts, totalDurationMs: Date.now() - startTime };
+          return;
+        }
+
+        yield { type: 'node_end', nodeId, output: result.output, durationMs, telemetry: result.metadata };
+        completedNodes.push(nodeId);
+
+        const expansionRequests = [...(result.expansionRequests ?? [])];
+        if (
+          this.config.expansionHandler
+          && shouldTriggerPlannerReevaluation(this.config.reevalInterval, completedNodes.length)
+        ) {
+          expansionRequests.push({
+            trigger: 'planner_reeval',
+            reason: `Periodic reevaluation after ${completedNodes.length} completed nodes`,
+            request: {
+              completedNodeCount: completedNodes.length,
+              lastCompletedNodeId: nodeId,
+            },
+          });
+        }
+
+        if (this.config.expansionHandler && expansionRequests.length > 0) {
+          let checkpointIdBefore: string | undefined;
+
+          for (const request of expansionRequests) {
+            if (!checkpointIdBefore) {
+              // The node's edges are decided after the expansion, so this
+              // checkpoint does not list it as completed: a resume from it
+              // routes the node once, rather than making every target of its
+              // edges ready.
+              const beforeExpansion = checkpointBeforeExpansion(
+                node, state, stateBeforeWrites, nodeResults, completedNodes,
+              );
+              checkpointIdBefore = await this.saveCheckpoint(
+                activeGraph,
+                runId,
+                nodeId,
+                beforeExpansion.state,
+                beforeExpansion.nodeResults,
+                beforeExpansion.visitedNodes,
+                skippedNodes,
+                [],
+              );
+              state = this.attachCheckpointMetadata(state, checkpointIdBefore);
+              yield { type: 'checkpoint_saved', checkpointId: checkpointIdBefore, nodeId };
+              yield { type: 'mission:checkpoint_saved', checkpointId: checkpointIdBefore, nodeId };
+            }
+
+            const outcome = await this.config.expansionHandler.handle({
+              graph: activeGraph,
+              runId,
+              nodeId,
+              state,
+              request,
+              checkpointIdBefore,
+              completedNodes: [...completedNodes],
+              skippedNodes: [...skippedNodes],
+              nodeResults: nodeResults as GraphExpansionContext['nodeResults'],
+            });
+
+            for (const event of outcome?.events ?? []) {
+              yield event;
+            }
+
+            if (outcome?.graph) {
+              activeGraph = outcome.graph;
+            }
+          }
+        }
+
+        // Evaluate outgoing edges for the resumed node.
+        const outEdges = activeGraph.edges.filter(e => e.source === nodeId);
+        const targets = await this.evaluateEdges(outEdges, state, result);
+
+        for (const potentialTarget of outEdges.map(e => e.target)) {
+          if (
+            !targets.includes(potentialTarget) &&
+            !completedNodes.includes(potentialTarget) &&
+            !skippedNodes.includes(potentialTarget)
+          ) {
+            skippedNodes.push(potentialTarget);
+          }
+        }
+
+        for (const target of targets) {
+          if (target !== END) {
+            const edgeType = outEdges.find(e => e.target === target)?.type ?? 'static';
+            yield { type: 'edge_transition', sourceId: nodeId, targetId: target, edgeType };
+          }
+        }
+      }
+    }
+
+    yield {
+      type: 'run_end',
+      runId,
+      finalOutput: state.artifacts,
+      totalDurationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Evaluate the outgoing edges from a just-completed node and return the list of
+   * target node ids to activate next.
+   *
+   * Priority rule: if `result.routeTarget` is set (returned by `router` or `guardrail`
+   * nodes) it overrides any edge-derived targets.
+   *
+   * @param edges  - All outgoing edges from the source node.
+   * @param state  - Current `GraphState` passed to condition functions.
+   * @param result - Execution result; `routeTarget` takes precedence when present.
+   * @returns Ordered array of target node ids (may include `END`).
+   */
+  private async evaluateEdges(
+    edges: GraphEdge[],
+    state: GraphState,
+    result: NodeExecutionResult,
+  ): Promise<string[]> {
+    // Router / guardrail nodes return an explicit target that takes precedence.
+    if (result.routeTarget) {
+      return [result.routeTarget];
+    }
+
+    const targets: string[] = [];
+
+    for (const edge of edges) {
+      switch (edge.type) {
+        case 'static':
+          // Always follow static edges.
+          targets.push(edge.target);
+          break;
+
+        case 'conditional': {
+          if (!edge.condition) break;
+
+          let resolvedTarget: string | undefined;
+          if (edge.condition.type === 'function') {
+            // Call the author-provided TypeScript routing function.
+            // Function conditions return the actual node id to route to — add it directly.
+            resolvedTarget = edge.condition.fn(state);
+          } else {
+            const expressionResult = evaluateConditionExpression(edge.condition.expr, state);
+            const resultStr = String(expressionResult);
+            // Expression evaluated to boolean true/false — use edge target directly
+            if (resultStr === 'true') {
+              resolvedTarget = edge.target;
+            } else if (resultStr === 'false') {
+              // Condition is false — do not add this edge's target
+              resolvedTarget = undefined;
+            } else {
+              // Expression returned a route name string (e.g., 'nodeA')
+              resolvedTarget = resultStr;
+            }
+          }
+
+          // For function-based conditions the target field is the placeholder '__CONDITIONAL__',
+          // so we accept whatever the function returned.  For expression-based conditions the
+          // target field holds the real node id, so we only follow the edge when it matches.
+          if (resolvedTarget != null) {
+            const isPlaceholder = edge.target === '__CONDITIONAL__' || edge.target === '__DISCOVERY__';
+            if ((isPlaceholder || resolvedTarget === edge.target) && !targets.includes(resolvedTarget)) {
+              targets.push(resolvedTarget);
+            }
+          }
+          break;
+        }
+
+        case 'personality':
+          if (edge.personalityCondition) {
+            const { trait, threshold, above, below } = edge.personalityCondition;
+            // Resolve trait value: config > scratch._personaTraits > default 0.5
+            const traitValue =
+              this.config.personaTraits?.[trait]
+                ?? ((state.scratch as Record<string, unknown> | undefined)?._personaTraits as Record<string, number> | undefined)?.[trait]
+                ?? 0.5;
+            targets.push(traitValue >= threshold ? above : below);
+          }
+          break;
+
+        case 'discovery': {
+          // Attempt dynamic discovery when an engine and query are available.
+          if (this.config.discoveryEngine && edge.discoveryQuery) {
+            try {
+              const discoveryResult = await this.config.discoveryEngine.discover(edge.discoveryQuery, {
+                kind: edge.discoveryKind,
+              });
+              const topResult = discoveryResult?.results?.[0];
+              if (topResult && (topResult.id || topResult.name)) {
+                targets.push(edge.target);
+                break;
+              }
+            } catch {
+              // Fall through to fallback on discovery error.
+            }
+          }
+          // Fallback when no engine, no query, no results, or error.
+          if (edge.discoveryFallback) targets.push(edge.discoveryFallback);
+          break;
+        }
+      }
+    }
+
+    return targets;
+  }
+
+  /**
+   * Serialize the current execution state into a `Checkpoint` and persist it
+   * via the injected `ICheckpointStore`.
+   *
+   * @param graph        - The compiled graph (provides `id`).
+   * @param runId        - Unique run identifier assigned at `stream()` call-time.
+   * @param nodeId       - The node at whose boundary the checkpoint is being taken.
+   * @param state        - Current full `GraphState`.
+   * @param nodeResults  - Accumulated per-node execution results. The checkpoint
+   *                       holds a copy, so a result recorded after it was saved
+   *                       never reaches it: the run's own record keeps growing,
+   *                       and a store such as `InMemoryCheckpointStore` keeps the
+   *                       object it is given.
+   * @param visitedNodes - Ordered list of completed node ids.
+   */
+  private async saveCheckpoint(
+    graph: CompiledExecutionGraph,
+    runId: string,
+    nodeId: string,
+    state: GraphState,
+    nodeResults: Record<string, RecordedResult>,
+    visitedNodes: string[],
+    skippedNodes: string[],
+    pendingEdges: string[],
+  ): Promise<string> {
+    const checkpoint: Checkpoint = {
+      id: crypto.randomUUID(),
+      graphId: graph.id,
+      runId,
+      nodeId,
+      timestamp: Date.now(),
+      state: {
+        input: state.input,
+        scratch: state.scratch,
+        artifacts: state.artifacts,
+        diagnostics: state.diagnostics,
+      },
+      // Cast: checkpoint type requires EffectClass but we store as string for flexibility.
+      nodeResults: { ...nodeResults } as Checkpoint['nodeResults'],
+      visitedNodes: [...visitedNodes],
+      skippedNodes: [...skippedNodes],
+      pendingEdges: [...pendingEdges],
+    };
+    await this.config.checkpointStore.save(checkpoint);
+    return checkpoint.id;
+  }
+
+  private attachCheckpointMetadata(state: GraphState, checkpointId: string): GraphState {
+    return {
+      ...state,
+      checkpointId,
+      diagnostics: {
+        ...state.diagnostics,
+        checkpointsSaved: state.diagnostics.checkpointsSaved + 1,
+      },
+    };
+  }
+
+  private extractTimeoutMs(errorMessage: string): number | null {
+    const match = errorMessage.match(/timeout after (\d+)ms/i);
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  private resolvePendingEdgeIds(edges: GraphEdge[], targets: string[]): string[] {
+    return edges
+      .filter((edge) => edge.target !== END && targets.includes(edge.target))
+      .map((edge) => edge.id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helpers
+// ---------------------------------------------------------------------------
+
+import type { RetryPolicy } from '../ir/types.js';
+
+/**
+ * Calculate the backoff delay in milliseconds for a given retry attempt.
+ *
+ * @param policy  - The retry policy with backoff strategy and base duration.
+ * @param attempt - The current attempt number (1-indexed; attempt 2 is the first retry).
+ * @returns Delay in milliseconds before the next attempt.
+ */
+function calculateBackoff(policy: RetryPolicy, attempt: number): number {
+  switch (policy.backoff) {
+    case 'fixed': return policy.backoffMs;
+    case 'linear': return policy.backoffMs * attempt;
+    case 'exponential': return policy.backoffMs * Math.pow(2, attempt - 1);
+    default: return policy.backoffMs;
+  }
+}
+
+function shouldRetry(policy: RetryPolicy, errorMessage?: string): boolean {
+  if (!policy.retryOn || policy.retryOn.length === 0) return true;
+  if (!errorMessage) return false;
+
+  const normalizedError = errorMessage.toLowerCase();
+  return policy.retryOn.some((entry) => normalizedError.includes(entry.toLowerCase()));
+}
+
+function evaluateConditionExpression(expr: string, state: GraphState): unknown {
+  return safeEvaluateExpression(expr, state);
+}
+
+function getResultEvents(result: NodeExecutionResult): GraphEvent[] {
+  return Array.isArray(result.events) ? result.events : [];
+}
+
+/**
+ * The state a branch of a parallel batch gives the merge after the batch: its
+ * own state, with each scratch key it wrote holding the value it wrote.
+ *
+ * Inside the branch, a reducer registered for the key has already combined the
+ * write with the value from before the batch. The merge combines each branch's
+ * value with the value merged so far, which starts from that same value, so
+ * given the combined value it would count the value from before the batch once
+ * more for every branch that wrote the key.
+ *
+ * @param branchState - The branch's state after its node ran.
+ * @param writes      - What the branch wrote.
+ */
+function stateAsWritten(branchState: GraphState, writes: ParallelBranchWrites): GraphState {
+  if (!writes.scratch) return branchState;
+  return {
+    ...branchState,
+    scratch: { ...(branchState.scratch as Record<string, unknown>), ...writes.scratch },
+  };
+}
+
+/** What a branch of a parallel batch that completed wrote, as the merge reads it. */
+interface CompletedBranch {
+  /** The branch's state, as {@link stateAsWritten} gives it. */
+  state: GraphState;
+  /** What the branch wrote. */
+  writes: ParallelBranchWrites;
+}
+
+/**
+ * The results of `nodeIds` in `nodeResults`, for a checkpoint that lists those
+ * nodes as completed and must hold no result of another node: a resume marks a
+ * `human`, `write` or `external` node complete from its recorded result.
+ *
+ * @param nodeResults - The results recorded in the run.
+ * @param nodeIds     - The nodes the checkpoint lists as completed.
+ */
+function resultsOf<TResult>(
+  nodeResults: Record<string, TResult>,
+  nodeIds: readonly string[],
+): Record<string, TResult> {
+  return Object.fromEntries(
+    nodeIds
+      .filter((id) => Object.prototype.hasOwnProperty.call(nodeResults, id))
+      .map((id) => [id, nodeResults[id]] as [string, TResult]),
+  );
+}
+
+/** A node's result as the run records it and a checkpoint holds it. */
+type RecordedResult = Checkpoint['nodeResults'][string];
+
+/**
+ * The result the run records for a node that completed or interrupted, with the
+ * target the node picked itself, when it did, so that a resume that marks the
+ * node complete from it goes there.
+ *
+ * @param node       - The node that ran.
+ * @param result     - What its executor returned.
+ * @param durationMs - How long its last attempt took.
+ */
+function recordedResult(node: GraphNode, result: NodeExecutionResult, durationMs: number): RecordedResult {
+  return {
+    effectClass: node.effectClass,
+    output: result.output,
+    durationMs,
+    ...(result.routeTarget ? { routeTarget: result.routeTarget } : {}),
+  };
+}
+
+/**
+ * The effect classes of the nodes a resume marks complete with their recorded
+ * output instead of running them again: a `write` or `external` node would
+ * repeat what it did outside the graph, and a `human` node would ask again.
+ */
+const REPLAYED_EFFECT_CLASSES: ReadonlySet<EffectClass> = new Set<EffectClass>(['write', 'external', 'human']);
+
+/**
+ * What the checkpoint saved before an expansion holds for the node after which
+ * the runtime hands expansion requests to the handler.
+ *
+ * The node's edges are decided after the expansion, on the graph it leaves, and
+ * a node counts as completed once its edges are decided, so the checkpoint
+ * leaves the node out of `visitedNodes`: a resume from it routes the node once
+ * by its edges. A node a resume marks complete with its recorded output keeps
+ * its result and what it wrote, as in the checkpoint of a node that interrupts.
+ * Any other node is saved as it was before it ran, with neither its result nor
+ * its writes, so a resume runs it again on the state it ran on, where a reducer
+ * does not count its writes twice, and the expansion requests it makes then go
+ * to the handler.
+ *
+ * @param node            - The node the expansion requests came after.
+ * @param stateAfterNode  - The run's state after the node ran.
+ * @param stateBeforeNode - The state the node ran on.
+ * @param nodeResults     - The results recorded in the run, the node's included.
+ * @param completedNodes  - The nodes completed in the run, the node included.
+ */
+function checkpointBeforeExpansion<TResult>(
+  node: GraphNode,
+  stateAfterNode: GraphState,
+  stateBeforeNode: GraphState,
+  nodeResults: Record<string, TResult>,
+  completedNodes: readonly string[],
+): { state: GraphState; nodeResults: Record<string, TResult>; visitedNodes: string[] } {
+  const visitedNodes = completedNodes.filter((id) => id !== node.id);
+  if (REPLAYED_EFFECT_CLASSES.has(node.effectClass)) {
+    return { state: stateAfterNode, nodeResults, visitedNodes };
+  }
+  return {
+    state: stateBeforeNode,
+    nodeResults: Object.fromEntries(
+      Object.entries(nodeResults).filter(([resultNodeId]) => resultNodeId !== node.id),
+    ),
+    visitedNodes,
+  };
+}
+
+/**
+ * Promise-based sleep utility for retry backoff delays.
+ *
+ * @param ms - Duration in milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

@@ -1,0 +1,883 @@
+{
+  "name": "@framers/agentos",
+  "version": "0.13.150",
+  "description": "AgentOS: open-source TypeScript framework for autonomous AI agents. Unified graph orchestration, cognitive memory, runtime tool forging, multi-tier guardrails, voice pipeline, and 11 LLM providers.",
+  "homepage": "https://agentos.sh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/framerslab/agentos.git"
+  },
+  "bugs": {
+    "url": "https://github.com/framerslab/agentos/issues"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./api": {
+      "import": "./dist/api/index.js",
+      "default": "./dist/api/index.js",
+      "types": "./dist/api/index.d.ts"
+    },
+    "./api/agent": {
+      "import": "./dist/api/agent.js",
+      "default": "./dist/api/agent.js",
+      "types": "./dist/api/agent.d.ts"
+    },
+    "./api/agency": {
+      "import": "./dist/api/agency.js",
+      "default": "./dist/api/agency.js",
+      "types": "./dist/api/agency.d.ts"
+    },
+    "./api/souledAgent": {
+      "import": "./dist/api/souledAgent.js",
+      "default": "./dist/api/souledAgent.js",
+      "types": "./dist/api/souledAgent.d.ts"
+    },
+    "./api/generateText": {
+      "import": "./dist/api/generateText.js",
+      "default": "./dist/api/generateText.js",
+      "types": "./dist/api/generateText.d.ts"
+    },
+    "./api/keyPoolDefaults": {
+      "import": "./dist/api/keyPoolDefaults.js",
+      "default": "./dist/api/keyPoolDefaults.js",
+      "types": "./dist/api/keyPoolDefaults.d.ts"
+    },
+    "./api/probeProviderKey": {
+      "import": "./dist/api/probeProviderKey.js",
+      "default": "./dist/api/probeProviderKey.js",
+      "types": "./dist/api/probeProviderKey.d.ts"
+    },
+    "./api/streamText": {
+      "import": "./dist/api/streamText.js",
+      "default": "./dist/api/streamText.js",
+      "types": "./dist/api/streamText.d.ts"
+    },
+    "./api/generateImage": {
+      "import": "./dist/api/generateImage.js",
+      "default": "./dist/api/generateImage.js",
+      "types": "./dist/api/generateImage.d.ts"
+    },
+    "./api/generateObject": {
+      "import": "./dist/api/generateObject.js",
+      "default": "./dist/api/generateObject.js",
+      "types": "./dist/api/generateObject.d.ts"
+    },
+    "./api/generateMusic": {
+      "import": "./dist/api/generateMusic.js",
+      "default": "./dist/api/generateMusic.js",
+      "types": "./dist/api/generateMusic.d.ts"
+    },
+    "./api/generateSFX": {
+      "import": "./dist/api/generateSFX.js",
+      "default": "./dist/api/generateSFX.js",
+      "types": "./dist/api/generateSFX.d.ts"
+    },
+    "./api/generateVideo": {
+      "import": "./dist/api/generateVideo.js",
+      "default": "./dist/api/generateVideo.js",
+      "types": "./dist/api/generateVideo.d.ts"
+    },
+    "./api/types": {
+      "import": "./dist/api/types/index.js",
+      "default": "./dist/api/types/index.js",
+      "types": "./dist/api/types/index.d.ts"
+    },
+    "./api/structured": {
+      "import": "./dist/api/structured/index.js",
+      "default": "./dist/api/structured/index.js",
+      "types": "./dist/api/structured/index.d.ts"
+    },
+    "./core/llm/routing/IModelRouter": {
+      "import": "./dist/core/llm/routing/IModelRouter.js",
+      "default": "./dist/core/llm/routing/IModelRouter.js",
+      "types": "./dist/core/llm/routing/IModelRouter.d.ts"
+    },
+    "./core/llm/routing/PolicyAwareRouter": {
+      "import": "./dist/core/llm/routing/PolicyAwareRouter.js",
+      "default": "./dist/core/llm/routing/PolicyAwareRouter.js",
+      "types": "./dist/core/llm/routing/PolicyAwareRouter.d.ts"
+    },
+    "./core/llm/routing/UncensoredModelCatalog": {
+      "import": "./dist/core/llm/routing/UncensoredModelCatalog.js",
+      "default": "./dist/core/llm/routing/UncensoredModelCatalog.js",
+      "types": "./dist/core/llm/routing/UncensoredModelCatalog.d.ts"
+    },
+    "./core/tools": {
+      "import": "./dist/core/tools/index.js",
+      "default": "./dist/core/tools/index.js",
+      "types": "./dist/core/tools/index.d.ts"
+    },
+    "./core/tools/index": {
+      "import": "./dist/core/tools/index.js",
+      "default": "./dist/core/tools/index.js",
+      "types": "./dist/core/tools/index.d.ts"
+    },
+    "./core/tools/*": {
+      "import": "./dist/core/tools/*.js",
+      "default": "./dist/core/tools/*.js",
+      "types": "./dist/core/tools/*.d.ts"
+    },
+    "./auth": {
+      "import": "./dist/core/llm/auth/index.js",
+      "default": "./dist/core/llm/auth/index.js",
+      "types": "./dist/core/llm/auth/index.d.ts"
+    },
+    "./logging": {
+      "types": "./dist/core/logging/index.d.ts",
+      "import": "./dist/core/logging/index.js",
+      "default": "./dist/core/logging/index.js"
+    },
+    "./logging/kit": {
+      "types": "./dist/core/logging/kit/index.d.ts",
+      "import": "./dist/core/logging/kit/index.js",
+      "default": "./dist/core/logging/kit/index.js"
+    },
+    "./orchestration": {
+      "import": "./dist/orchestration/index.js",
+      "default": "./dist/orchestration/index.js",
+      "types": "./dist/orchestration/index.d.ts"
+    },
+    "./orchestration/builders/*": {
+      "import": "./dist/orchestration/builders/*.js",
+      "default": "./dist/orchestration/builders/*.js",
+      "types": "./dist/orchestration/builders/*.d.ts"
+    },
+    "./orchestration/checkpoint": {
+      "import": "./dist/orchestration/checkpoint/index.js",
+      "default": "./dist/orchestration/checkpoint/index.js",
+      "types": "./dist/orchestration/checkpoint/index.d.ts"
+    },
+    "./orchestration/hitl": {
+      "import": "./dist/orchestration/hitl/index.js",
+      "default": "./dist/orchestration/hitl/index.js",
+      "types": "./dist/orchestration/hitl/index.d.ts"
+    },
+    "./orchestration/pipeline": {
+      "import": "./dist/orchestration/pipeline/index.js",
+      "default": "./dist/orchestration/pipeline/index.js",
+      "types": "./dist/orchestration/pipeline/index.d.ts"
+    },
+    "./orchestration/pipeline/ingest": {
+      "import": "./dist/orchestration/pipeline/ingest/index.js",
+      "default": "./dist/orchestration/pipeline/ingest/index.js",
+      "types": "./dist/orchestration/pipeline/ingest/index.d.ts"
+    },
+    "./orchestration/pipeline/memory": {
+      "import": "./dist/orchestration/pipeline/memory/index.js",
+      "default": "./dist/orchestration/pipeline/memory/index.js",
+      "types": "./dist/orchestration/pipeline/memory/index.d.ts"
+    },
+    "./orchestration/pipeline/query": {
+      "import": "./dist/orchestration/pipeline/query/index.js",
+      "default": "./dist/orchestration/pipeline/query/index.js",
+      "types": "./dist/orchestration/pipeline/query/index.d.ts"
+    },
+    "./orchestration/pipeline/read": {
+      "import": "./dist/orchestration/pipeline/read/index.js",
+      "default": "./dist/orchestration/pipeline/read/index.js",
+      "types": "./dist/orchestration/pipeline/read/index.d.ts"
+    },
+    "./agents": {
+      "import": "./dist/agents/index.js",
+      "default": "./dist/agents/index.js",
+      "types": "./dist/agents/index.d.ts"
+    },
+    "./agents/agency": {
+      "import": "./dist/agents/agency/index.js",
+      "default": "./dist/agents/agency/index.js",
+      "types": "./dist/agents/agency/index.d.ts"
+    },
+    "./agents/definitions": {
+      "import": "./dist/agents/definitions/index.js",
+      "default": "./dist/agents/definitions/index.js",
+      "types": "./dist/agents/definitions/index.d.ts"
+    },
+    "./agents/*": {
+      "import": "./dist/agents/*.js",
+      "default": "./dist/agents/*.js",
+      "types": "./dist/agents/*.d.ts"
+    },
+    "./cognition/memory": {
+      "import": "./dist/cognition/memory/index.js",
+      "default": "./dist/cognition/memory/index.js",
+      "types": "./dist/cognition/memory/index.d.ts"
+    },
+    "./cognition/memory/office": {
+      "types": "./dist/cognition/memory/io/ingestion/OfficeLoader.d.ts",
+      "import": "./dist/cognition/memory/io/ingestion/OfficeLoader.js",
+      "default": "./dist/cognition/memory/io/ingestion/OfficeLoader.js"
+    },
+    "./cognition/memory/retrieval/typed-network": {
+      "import": "./dist/cognition/memory/retrieval/typed-network/index.js",
+      "default": "./dist/cognition/memory/retrieval/typed-network/index.js",
+      "types": "./dist/cognition/memory/retrieval/typed-network/index.d.ts"
+    },
+    "./cognition/nlp": {
+      "import": "./dist/cognition/nlp/index.js",
+      "default": "./dist/cognition/nlp/index.js",
+      "types": "./dist/cognition/nlp/index.d.ts"
+    },
+    "./cognition/nlp/ai_utilities": {
+      "import": "./dist/cognition/nlp/ai_utilities/index.js",
+      "default": "./dist/cognition/nlp/ai_utilities/index.js",
+      "types": "./dist/cognition/nlp/ai_utilities/index.d.ts"
+    },
+    "./cognition/nlp/language": {
+      "import": "./dist/cognition/nlp/language/index.js",
+      "default": "./dist/cognition/nlp/language/index.js",
+      "types": "./dist/cognition/nlp/language/index.d.ts"
+    },
+    "./cognition/rag": {
+      "import": "./dist/cognition/rag/index.js",
+      "default": "./dist/cognition/rag/index.js",
+      "types": "./dist/cognition/rag/index.d.ts"
+    },
+    "./cognition/rag/reranking": {
+      "import": "./dist/cognition/rag/reranking/index.js",
+      "default": "./dist/cognition/rag/reranking/index.js",
+      "types": "./dist/cognition/rag/reranking/index.d.ts"
+    },
+    "./cognition/rag/graphrag": {
+      "import": "./dist/cognition/rag/graphrag/index.js",
+      "default": "./dist/cognition/rag/graphrag/index.js",
+      "types": "./dist/cognition/rag/graphrag/index.d.ts"
+    },
+    "./cognition/library": {
+      "import": "./dist/cognition/library/index.js",
+      "default": "./dist/cognition/library/index.js",
+      "types": "./dist/cognition/library/index.d.ts"
+    },
+    "./cognition/library/browser": {
+      "import": "./dist/cognition/library/browser.js",
+      "default": "./dist/cognition/library/browser.js",
+      "types": "./dist/cognition/library/browser.d.ts"
+    },
+    "./cognition/rag/*": {
+      "import": "./dist/cognition/rag/*.js",
+      "default": "./dist/cognition/rag/*.js",
+      "types": "./dist/cognition/rag/*.d.ts"
+    },
+    "./cognition/skills": {
+      "import": "./dist/cognition/skills/index.js",
+      "default": "./dist/cognition/skills/index.js",
+      "types": "./dist/cognition/skills/index.d.ts"
+    },
+    "./cognition/web-search": {
+      "import": "./dist/cognition/web-search/index.js",
+      "default": "./dist/cognition/web-search/index.js",
+      "types": "./dist/cognition/web-search/index.d.ts"
+    },
+    "./cognition/discovery": {
+      "import": "./dist/cognition/discovery/index.js",
+      "default": "./dist/cognition/discovery/index.js",
+      "types": "./dist/cognition/discovery/index.d.ts"
+    },
+    "./cognition/emergent": {
+      "import": "./dist/cognition/emergent/index.js",
+      "default": "./dist/cognition/emergent/index.js",
+      "types": "./dist/cognition/emergent/index.d.ts"
+    },
+    "./cognition/learning": {
+      "import": "./dist/cognition/learning/index.js",
+      "default": "./dist/cognition/learning/index.js",
+      "types": "./dist/cognition/learning/index.d.ts"
+    },
+    "./cognition/substrate": {
+      "import": "./dist/cognition/substrate/index.js",
+      "default": "./dist/cognition/substrate/index.js",
+      "types": "./dist/cognition/substrate/index.d.ts"
+    },
+    "./cognition/marketplace": {
+      "import": "./dist/cognition/marketplace/index.js",
+      "default": "./dist/cognition/marketplace/index.js",
+      "types": "./dist/cognition/marketplace/index.d.ts"
+    },
+    "./io/channels": {
+      "import": "./dist/io/channels/index.js",
+      "default": "./dist/io/channels/index.js",
+      "types": "./dist/io/channels/index.d.ts"
+    },
+    "./io/channels/social-posting": {
+      "import": "./dist/io/channels/social-posting/index.js",
+      "default": "./dist/io/channels/social-posting/index.js",
+      "types": "./dist/io/channels/social-posting/index.d.ts"
+    },
+    "./io/channels/telephony": {
+      "import": "./dist/io/channels/telephony/index.js",
+      "default": "./dist/io/channels/telephony/index.js",
+      "types": "./dist/io/channels/telephony/index.d.ts"
+    },
+    "./io/channels/meetings": {
+      "import": "./dist/io/channels/meetings/index.js",
+      "default": "./dist/io/channels/meetings/index.js",
+      "types": "./dist/io/channels/meetings/index.d.ts"
+    },
+    "./io/speech": {
+      "import": "./dist/io/speech/index.js",
+      "default": "./dist/io/speech/index.js",
+      "types": "./dist/io/speech/index.d.ts"
+    },
+    "./io/hearing": {
+      "import": "./dist/io/hearing/index.js",
+      "default": "./dist/io/hearing/index.js",
+      "types": "./dist/io/hearing/index.d.ts"
+    },
+    "./io/hearing/capture": {
+      "import": "./dist/io/hearing/AudioWorkletCapture.js",
+      "default": "./dist/io/hearing/AudioWorkletCapture.js",
+      "types": "./dist/io/hearing/AudioWorkletCapture.d.ts"
+    },
+    "./io/hearing/pieces": {
+      "import": "./dist/io/hearing/pieces/index.js",
+      "default": "./dist/io/hearing/pieces/index.js",
+      "types": "./dist/io/hearing/pieces/index.d.ts"
+    },
+    "./io/hearing/livekit": {
+      "import": "./dist/io/hearing/livekit.js",
+      "default": "./dist/io/hearing/livekit.js",
+      "types": "./dist/io/hearing/livekit.d.ts"
+    },
+    "./io/vision": {
+      "import": "./dist/io/vision/index.js",
+      "default": "./dist/io/vision/index.js",
+      "types": "./dist/io/vision/index.d.ts"
+    },
+    "./io/media": {
+      "import": "./dist/io/media/index.js",
+      "default": "./dist/io/media/index.js",
+      "types": "./dist/io/media/index.d.ts"
+    },
+    "./io/media/images": {
+      "import": "./dist/io/media/images/index.js",
+      "default": "./dist/io/media/images/index.js",
+      "types": "./dist/io/media/images/index.d.ts"
+    },
+    "./io/avatar": {
+      "import": "./dist/io/avatar/index.js",
+      "default": "./dist/io/avatar/index.js",
+      "types": "./dist/io/avatar/index.d.ts"
+    },
+    "./io/segmentation": {
+      "import": "./dist/io/segmentation/index.js",
+      "default": "./dist/io/segmentation/index.js",
+      "types": "./dist/io/segmentation/index.d.ts"
+    },
+    "./io/media/avatar": {
+      "import": "./dist/io/media/avatar/index.js",
+      "default": "./dist/io/media/avatar/index.js",
+      "types": "./dist/io/media/avatar/index.d.ts"
+    },
+    "./io/voice-pipeline": {
+      "import": "./dist/io/voice-pipeline/index.js",
+      "default": "./dist/io/voice-pipeline/index.js",
+      "types": "./dist/io/voice-pipeline/index.d.ts"
+    },
+    "./io/voice-pipeline/browser": {
+      "import": "./dist/io/voice-pipeline/browser.js",
+      "default": "./dist/io/voice-pipeline/browser.js",
+      "types": "./dist/io/voice-pipeline/browser.d.ts"
+    },
+    "./io/voice-pipeline/providers": {
+      "import": "./dist/io/voice-pipeline/providers/index.js",
+      "default": "./dist/io/voice-pipeline/providers/index.js",
+      "types": "./dist/io/voice-pipeline/providers/index.d.ts"
+    },
+    "./io/voice-pipeline/providers/*": {
+      "import": "./dist/io/voice-pipeline/providers/*.js",
+      "default": "./dist/io/voice-pipeline/providers/*.js",
+      "types": "./dist/io/voice-pipeline/providers/*.d.ts"
+    },
+    "./extensions": {
+      "import": "./dist/extensions/index.js",
+      "default": "./dist/extensions/index.js",
+      "types": "./dist/extensions/index.d.ts"
+    },
+    "./safety": {
+      "import": "./dist/safety/index.js",
+      "default": "./dist/safety/index.js",
+      "types": "./dist/safety/index.d.ts"
+    },
+    "./safety/guardrails": {
+      "import": "./dist/safety/guardrails/index.js",
+      "default": "./dist/safety/guardrails/index.js",
+      "types": "./dist/safety/guardrails/index.d.ts"
+    },
+    "./safety/guardrails/index": {
+      "import": "./dist/safety/guardrails/index.js",
+      "default": "./dist/safety/guardrails/index.js",
+      "types": "./dist/safety/guardrails/index.d.ts"
+    },
+    "./safety/runtime": {
+      "import": "./dist/safety/runtime/index.js",
+      "default": "./dist/safety/runtime/index.js",
+      "types": "./dist/safety/runtime/index.d.ts"
+    },
+    "./safety/runtime/index": {
+      "import": "./dist/safety/runtime/index.js",
+      "default": "./dist/safety/runtime/index.js",
+      "types": "./dist/safety/runtime/index.d.ts"
+    },
+    "./safety/runtime/*": {
+      "import": "./dist/safety/runtime/*.js",
+      "default": "./dist/safety/runtime/*.js",
+      "types": "./dist/safety/runtime/*.d.ts"
+    },
+    "./safety/provenance": {
+      "import": "./dist/safety/provenance/index.js",
+      "default": "./dist/safety/provenance/index.js",
+      "types": "./dist/safety/provenance/index.d.ts"
+    },
+    "./safety/sandbox": {
+      "import": "./dist/safety/sandbox/index.js",
+      "default": "./dist/safety/sandbox/index.js",
+      "types": "./dist/safety/sandbox/index.d.ts"
+    },
+    "./safety/evaluation": {
+      "import": "./dist/safety/evaluation/index.js",
+      "default": "./dist/safety/evaluation/index.js",
+      "types": "./dist/safety/evaluation/index.d.ts"
+    },
+    "./safety/validation": {
+      "import": "./dist/safety/validation/index.js",
+      "default": "./dist/safety/validation/index.js",
+      "types": "./dist/safety/validation/index.d.ts"
+    },
+    "./safety/auth": {
+      "import": "./dist/safety/auth/index.js",
+      "default": "./dist/safety/auth/index.js",
+      "types": "./dist/safety/auth/index.d.ts"
+    },
+    "./safety/egress": {
+      "types": "./dist/safety/egress/index.d.ts",
+      "import": "./dist/safety/egress/index.js",
+      "default": "./dist/safety/egress/index.js"
+    },
+    "./sandbox/subprocess": {
+      "import": "./dist/safety/sandbox/subprocess/index.js",
+      "default": "./dist/safety/sandbox/subprocess/index.js",
+      "types": "./dist/safety/sandbox/subprocess/index.d.ts"
+    },
+    "./core/embeddings/IEmbeddingManager": {
+      "import": "./dist/core/embeddings/IEmbeddingManager.js",
+      "default": "./dist/core/embeddings/IEmbeddingManager.js",
+      "types": "./dist/core/embeddings/IEmbeddingManager.d.ts"
+    },
+    "./core/vector-store/IVectorStore": {
+      "import": "./dist/core/vector-store/IVectorStore.js",
+      "default": "./dist/core/vector-store/IVectorStore.js",
+      "types": "./dist/core/vector-store/IVectorStore.d.ts"
+    },
+    "./core/storage/browser": {
+      "import": "./dist/core/storage/browser/index.js",
+      "default": "./dist/core/storage/browser/index.js",
+      "types": "./dist/core/storage/browser/index.d.ts"
+    },
+    "./memory": {
+      "import": "./dist/cognition/memory/index.js",
+      "default": "./dist/cognition/memory/index.js",
+      "types": "./dist/cognition/memory/index.d.ts"
+    },
+    "./memory/index": {
+      "import": "./dist/cognition/memory/index.js",
+      "default": "./dist/cognition/memory/index.js",
+      "types": "./dist/cognition/memory/index.d.ts"
+    },
+    "./memory/retrieval/typed-network": {
+      "import": "./dist/cognition/memory/retrieval/typed-network/index.js",
+      "default": "./dist/cognition/memory/retrieval/typed-network/index.js",
+      "types": "./dist/cognition/memory/retrieval/typed-network/index.d.ts"
+    },
+    "./memory/*": {
+      "import": "./dist/cognition/memory/*.js",
+      "default": "./dist/cognition/memory/*.js",
+      "types": "./dist/cognition/memory/*.d.ts"
+    },
+    "./nlp": {
+      "import": "./dist/cognition/nlp/index.js",
+      "default": "./dist/cognition/nlp/index.js",
+      "types": "./dist/cognition/nlp/index.d.ts"
+    },
+    "./nlp/ai_utilities": {
+      "import": "./dist/cognition/nlp/ai_utilities/index.js",
+      "default": "./dist/cognition/nlp/ai_utilities/index.js",
+      "types": "./dist/cognition/nlp/ai_utilities/index.d.ts"
+    },
+    "./speech": {
+      "import": "./dist/io/speech/index.js",
+      "default": "./dist/io/speech/index.js",
+      "types": "./dist/io/speech/index.d.ts"
+    },
+    "./speech/index": {
+      "import": "./dist/io/speech/index.js",
+      "default": "./dist/io/speech/index.js",
+      "types": "./dist/io/speech/index.d.ts"
+    },
+    "./hearing": {
+      "import": "./dist/io/hearing/index.js",
+      "default": "./dist/io/hearing/index.js",
+      "types": "./dist/io/hearing/index.d.ts"
+    },
+    "./images": {
+      "import": "./dist/io/media/images/index.js",
+      "default": "./dist/io/media/images/index.js",
+      "types": "./dist/io/media/images/index.d.ts"
+    },
+    "./channels": {
+      "import": "./dist/io/channels/index.js",
+      "default": "./dist/io/channels/index.js",
+      "types": "./dist/io/channels/index.d.ts"
+    },
+    "./channels/social-posting": {
+      "import": "./dist/io/channels/social-posting/index.js",
+      "default": "./dist/io/channels/social-posting/index.js",
+      "types": "./dist/io/channels/social-posting/index.d.ts"
+    },
+    "./social-posting": {
+      "import": "./dist/io/channels/social-posting/index.js",
+      "default": "./dist/io/channels/social-posting/index.js",
+      "types": "./dist/io/channels/social-posting/index.d.ts"
+    },
+    "./emergent": {
+      "import": "./dist/cognition/emergent/index.js",
+      "default": "./dist/cognition/emergent/index.js",
+      "types": "./dist/cognition/emergent/index.d.ts"
+    },
+    "./discovery": {
+      "import": "./dist/cognition/discovery/index.js",
+      "default": "./dist/cognition/discovery/index.js",
+      "types": "./dist/cognition/discovery/index.d.ts"
+    },
+    "./provenance": {
+      "import": "./dist/safety/provenance/index.js",
+      "default": "./dist/safety/provenance/index.js",
+      "types": "./dist/safety/provenance/index.d.ts"
+    },
+    "./query-router": {
+      "import": "./dist/orchestration/pipeline/query/index.js",
+      "default": "./dist/orchestration/pipeline/query/index.js",
+      "types": "./dist/orchestration/pipeline/query/index.d.ts"
+    },
+    "./memory-router": {
+      "import": "./dist/orchestration/pipeline/memory/index.js",
+      "default": "./dist/orchestration/pipeline/memory/index.js",
+      "types": "./dist/orchestration/pipeline/memory/index.d.ts"
+    },
+    "./ingest-router": {
+      "import": "./dist/orchestration/pipeline/ingest/index.js",
+      "default": "./dist/orchestration/pipeline/ingest/index.js",
+      "types": "./dist/orchestration/pipeline/ingest/index.d.ts"
+    },
+    "./read-router": {
+      "import": "./dist/orchestration/pipeline/read/index.js",
+      "default": "./dist/orchestration/pipeline/read/index.js",
+      "types": "./dist/orchestration/pipeline/read/index.d.ts"
+    },
+    "./media/avatar": {
+      "import": "./dist/io/media/avatar/index.js",
+      "default": "./dist/io/media/avatar/index.js",
+      "types": "./dist/io/media/avatar/index.d.ts"
+    },
+    "./voice-pipeline/providers": {
+      "import": "./dist/io/voice-pipeline/providers/index.js",
+      "default": "./dist/io/voice-pipeline/providers/index.js",
+      "types": "./dist/io/voice-pipeline/providers/index.d.ts"
+    },
+    "./voice-pipeline/providers/index": {
+      "import": "./dist/io/voice-pipeline/providers/index.js",
+      "default": "./dist/io/voice-pipeline/providers/index.js",
+      "types": "./dist/io/voice-pipeline/providers/index.d.ts"
+    },
+    "./voice-pipeline/providers/*": {
+      "import": "./dist/io/voice-pipeline/providers/*.js",
+      "default": "./dist/io/voice-pipeline/providers/*.js",
+      "types": "./dist/io/voice-pipeline/providers/*.d.ts"
+    },
+    "./core/safety": {
+      "import": "./dist/safety/runtime/index.js",
+      "default": "./dist/safety/runtime/index.js",
+      "types": "./dist/safety/runtime/index.d.ts"
+    },
+    "./core/guardrails": {
+      "import": "./dist/safety/guardrails/index.js",
+      "default": "./dist/safety/guardrails/index.js",
+      "types": "./dist/safety/guardrails/index.d.ts"
+    },
+    "./core/hitl": {
+      "import": "./dist/orchestration/hitl/index.js",
+      "default": "./dist/orchestration/hitl/index.js",
+      "types": "./dist/orchestration/hitl/index.d.ts"
+    },
+    "./rag/graphrag": {
+      "import": "./dist/cognition/rag/graphrag/index.js",
+      "default": "./dist/cognition/rag/graphrag/index.js",
+      "types": "./dist/cognition/rag/graphrag/index.d.ts"
+    },
+    "./rag/*": {
+      "import": "./dist/cognition/rag/*.js",
+      "default": "./dist/cognition/rag/*.js",
+      "types": "./dist/cognition/rag/*.d.ts"
+    },
+    "./config/*": {
+      "import": "./dist/config/*.js",
+      "default": "./dist/config/*.js",
+      "types": "./dist/config/*.d.ts"
+    },
+    "./config/extension-secrets.json": "./dist/config/extension-secrets.json",
+    "./package.json": "./package.json",
+    "./*": {
+      "import": "./dist/*.js",
+      "default": "./dist/*.js",
+      "types": "./dist/*.d.ts"
+    },
+    "./*/*": {
+      "import": "./dist/*/*.js",
+      "default": "./dist/*/*.js",
+      "types": "./dist/*/*.d.ts"
+    },
+    "./*/*/*": {
+      "import": "./dist/*/*/*.js",
+      "default": "./dist/*/*/*.js",
+      "types": "./dist/*/*/*.d.ts"
+    },
+    "./*/*/*/*": {
+      "import": "./dist/*/*/*/*.js",
+      "default": "./dist/*/*/*/*.js",
+      "types": "./dist/*/*/*/*.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "knowledge",
+    "README.md",
+    ".github/badges/tests.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo",
+    "prepare": "test -d dist || npm run build",
+    "build": "npm run clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && node scripts/fix-esm-imports.mjs",
+    "build:knowledge": "node scripts/build-knowledge-corpus.mjs",
+    "verify:exports": "node --test scripts/package-exports.test.mjs scripts/meeting-package.test.mjs",
+    "prepublishOnly": "npm run build:knowledge && npm run build && npm run verify:exports",
+    "typecheck": "tsc --noEmit",
+    "lint": "node scripts/strip-nbsp.mjs && eslint \"src/**/*.ts\"",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "dev:test": "vitest",
+    "docs:clean": "rimraf docs/api ../../docs-generated/library ../../docs-generated/api",
+    "docs:library": "npm run docs:clean && pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.json && pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.modules.json && node scripts/generate-doc-search-index.mjs && pnpm --dir ../../ exec node apps/agentos.sh/scripts/copy-docs.js",
+    "docs:site-api": "pnpm --dir ../../ --filter @framers/agentos-live-docs run build",
+    "docs:verify": "node scripts/build-publication-inventory.mjs && pnpm --dir ../../ --filter @framers/agentos-live-docs run verify:publication && npx vitest run src/api/runtime/__tests__/docs-alignment.test.ts",
+    "docs": "npm run docs:library",
+    "docs:full": "npm run docs:library && npm run docs:site-api",
+    "docs:watch": "npm run docs:clean && pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.json && pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.modules.json && node scripts/generate-doc-search-index.mjs && pnpm --dir ../../ exec node apps/agentos.sh/scripts/copy-docs.js && concurrently \"pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.json --watch\" \"pnpm --dir ../../ exec typedoc --options packages/agentos/typedoc.modules.json --watch\" \"node scripts/generate-doc-search-index.mjs --watch\" \"pnpm --dir ../../ exec node apps/agentos.sh/scripts/copy-docs.js --watch\""
+  },
+  "keywords": [
+    "agentos",
+    "framers-agentos",
+    "ai-agents",
+    "ai-agent-framework",
+    "ai-agent-runtime",
+    "autonomous-agents",
+    "agent-framework",
+    "agentic-ai",
+    "multi-agent",
+    "multi-agent-orchestration",
+    "agent-graph",
+    "agent-graph-orchestration",
+    "cognitive-memory",
+    "cognitive-pipeline",
+    "memory-router",
+    "ebbinghaus-decay",
+    "rag",
+    "multimodal-rag",
+    "vector-search",
+    "guardrails",
+    "ai-guardrails",
+    "voice-pipeline",
+    "speech-to-text",
+    "text-to-speech",
+    "tool-use",
+    "tool-generation",
+    "runtime-tool-generation",
+    "specialist-spawning",
+    "hexaco",
+    "personality",
+    "emergent-behavior",
+    "llm",
+    "llm-orchestration",
+    "openai",
+    "anthropic",
+    "claude",
+    "gpt",
+    "typescript",
+    "nodejs",
+    "open-source",
+    "apache-2.0",
+    "framers",
+    "frame-dev",
+    "long-term-memory",
+    "agent-memory",
+    "ai-agent-memory",
+    "tool-forging",
+    "longmemeval"
+  ],
+  "author": {
+    "name": "Frame.dev",
+    "email": "team@frame.dev",
+    "url": "https://frame.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "compromise": "^14.15.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@framers/agentos": "link:.",
+    "@framers/agentos-ext-account-sources": "^0.11.0",
+    "@framers/agentos-extensions-registry": "^0.18.16",
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
+    "@opentelemetry/context-async-hooks": "^2.0.1",
+    "@opentelemetry/sdk-metrics": "^2.0.1",
+    "@opentelemetry/sdk-trace-base": "^2.0.1",
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/commit-analyzer": "^13.0.0",
+    "@semantic-release/git": "^11.0.1",
+    "@semantic-release/github": "^12.0.10",
+    "@semantic-release/npm": "^13.2.0",
+    "@semantic-release/release-notes-generator": "^14.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/natural": "^5.1.5",
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
+    "@types/pg": "^8.20.0",
+    "@vitest/browser-playwright": "5.0.3",
+    "@vitest/coverage-v8": "5.0.3",
+    "better-sqlite3": "^13.0.3",
+    "conventional-changelog-conventionalcommits": "^9.3.1",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import": "^2.29.1",
+    "fake-indexeddb": "6.2.5",
+    "mediabunny": "1.61.3",
+    "officeparser": "8.1.1",
+    "playwright": "1.63.0",
+    "prettier": "^3.3.2",
+    "quickjs-emscripten-core": "0.32.0",
+    "rimraf": "^6.1.3",
+    "semantic-release": "^25.0.9",
+    "ts-morph": "^28.0.0",
+    "ts-node": "^10.9.2",
+    "tsc-alias": "^1.8.10",
+    "tsconfig-paths": "^4.2.0",
+    "tsx": "^4.20.0",
+    "typedoc": "^0.25.13",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@framers/sql-storage-adapter": "^0.9.4",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api-logs": "^0.201.1",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "axios": "^1.7.7",
+    "execa": "^10.0.1",
+    "gray-matter": "^4.0.3",
+    "lru-cache": "^11.1.0",
+    "mammoth": "^1.12.0",
+    "minimatch": "^10.2.6",
+    "natural": "^6.12.0",
+    "openredaction": "^1.1.2",
+    "pg": "^8.20.0",
+    "pino": "^10.4.0",
+    "unpdf": "^1.4.0",
+    "uuid": "^14.0.2",
+    "ws": "^8.18.0",
+    "yaml": "^2.8.1",
+    "zod": "^4.3.6",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "peerDependencies": {
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
+    "@livekit/rtc-node": "^1.1.0",
+    "@moonshine-ai/moonshine-wasm": "^0.1.5",
+    "graphology": ">=0.25.0",
+    "graphology-communities-louvain": ">=2.0.0",
+    "graphology-types": ">=0.24.0",
+    "hnswlib-node": ">=3.0.0",
+    "mediabunny": "^1.61.3",
+    "neo4j-driver": ">=5.0.0",
+    "officeparser": "^8.1.1",
+    "ppu-paddle-ocr": ">=3.0.0",
+    "quickjs-emscripten-core": "0.32.0",
+    "tesseract.js": ">=5.0.0",
+    "typescript": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@jitl/quickjs-wasmfile-release-sync": {
+      "optional": true
+    },
+    "@livekit/rtc-node": {
+      "optional": true
+    },
+    "@moonshine-ai/moonshine-wasm": {
+      "optional": true
+    },
+    "graphology": {
+      "optional": true
+    },
+    "graphology-communities-louvain": {
+      "optional": true
+    },
+    "graphology-types": {
+      "optional": true
+    },
+    "hnswlib-node": {
+      "optional": true
+    },
+    "mediabunny": {
+      "optional": true
+    },
+    "neo4j-driver": {
+      "optional": true
+    },
+    "officeparser": {
+      "optional": true
+    },
+    "ppu-paddle-ocr": {
+      "optional": true
+    },
+    "quickjs-emscripten-core": {
+      "optional": true
+    },
+    "tesseract.js": {
+      "optional": true
+    }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "sharp",
+      "bcrypt",
+      "tesseract.js"
+    ]
+  },
+  "sideEffects": false
+}

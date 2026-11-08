@@ -1,0 +1,324 @@
+/**
+ * @file OpenRouterProvider.retry-structured.test.ts
+ * @description Covers the 2026-07-06 reliability + schema-enforcement pass:
+ *              per-attempt key rotation with quota cooldown, bounded retry on
+ *              transient failures, json_schema response_format forwarding
+ *              paired with `provider.require_parameters` routing, the
+ *              one-shot json_object degrade when no endpoint supports the
+ *              schema, and mid-stream upstream-error surfacing.
+ */
+import { Readable } from 'node:stream';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import pino from 'pino';
+import { setLogger, resetLoggerFactory } from '../../../logging/loggerFactory.js';
+import { OpenRouterProvider } from '../implementations/OpenRouterProvider';
+import { OpenRouterProviderError } from '../errors/OpenRouterProviderError';
+import { ApiKeyPool } from '../../../providers/ApiKeyPool';
+import type { ChatMessage } from '../IProvider';
+
+const messages: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+
+const logged: Record<string, unknown>[] = [];
+beforeEach(() => {
+  logged.length = 0;
+  setLogger(pino({ level: 'debug', base: undefined }, { write(line: string) { logged.push(JSON.parse(line)); } }));
+});
+afterEach(() => resetLoggerFactory());
+
+function okResponse() {
+  return {
+    id: 'gen-1',
+    object: 'chat.completion',
+    created: 1,
+    model: 'meta-llama/llama-3.3-70b-instruct',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+}
+
+function axiosError(status: number | undefined, message: string, headers?: Record<string, string>) {
+  return {
+    isAxiosError: true,
+    message,
+    response:
+      status === undefined
+        ? undefined
+        : { status, data: { error: { message } }, headers: headers ?? {} },
+  };
+}
+
+/** Bare provider with injected internals (initialize() hits the network). */
+function makeProvider(clientRequest: ReturnType<typeof vi.fn>, keys = 'key-a,key-b') {
+  const provider = new OpenRouterProvider();
+  Object.assign(provider as unknown as Record<string, unknown>, {
+    isInitialized: true,
+    ensureInitialized: () => {},
+    config: { apiKey: keys, requestTimeout: 1000, streamRequestTimeout: 1000 },
+    keyPool: new ApiKeyPool(keys),
+    client: { request: clientRequest },
+  });
+  return provider;
+}
+
+function authHeaderOfCall(request: ReturnType<typeof vi.fn>, callIdx: number): string {
+  const cfg = request.mock.calls[callIdx][0] as { headers?: Record<string, string> };
+  return cfg.headers?.Authorization ?? '';
+}
+
+describe('makeApiRequest retry + key rotation', () => {
+  it('retries a 429 on the next pool key and succeeds', async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(axiosError(429, 'rate limited'))
+      .mockResolvedValueOnce({ data: okResponse() });
+    const provider = makeProvider(request);
+
+    const result = await (provider as never as {
+      makeApiRequest: (e: string, m: string, t?: number, b?: Record<string, unknown>) => Promise<unknown>;
+    }).makeApiRequest('/chat/completions', 'POST', 1000, { model: 'x' });
+
+    expect((result as { id: string }).id).toBe('gen-1');
+    expect(request).toHaveBeenCalledTimes(2);
+    // The 429'd key leaves rotation and the request moves to the OTHER key at once, outside the attempt count: a key
+    // hop schedules no wait, so it writes no llm.retry event.
+    expect(authHeaderOfCall(request, 0)).toBe('Bearer key-a');
+    expect(authHeaderOfCall(request, 1)).toBe('Bearer key-b');
+    expect(logged.filter((line) => line.event === 'llm.retry')).toEqual([]);
+  });
+
+  it('retries transport-level failures (no HTTP response)', async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(axiosError(undefined, 'socket hang up'))
+      .mockResolvedValueOnce({ data: okResponse() });
+    const provider = makeProvider(request);
+
+    const result = await (provider as never as {
+      makeApiRequest: (e: string, m: string, t?: number, b?: Record<string, unknown>) => Promise<unknown>;
+    }).makeApiRequest('/chat/completions', 'POST', 1000, { model: 'x' });
+
+    expect((result as { id: string }).id).toBe('gen-1');
+    expect(request).toHaveBeenCalledTimes(2);
+    // No HTTP response, so the retry line carries status 0.
+    expect(logged.filter((line) => line.event === 'llm.retry')).toEqual([
+      expect.objectContaining({ provider: 'openrouter', status: 0, attempt: 1 }),
+    ]);
+  });
+
+  it('does NOT retry a 400 request error', async () => {
+    const request = vi.fn().mockRejectedValue(axiosError(400, 'bad request'));
+    const provider = makeProvider(request);
+
+    await expect(
+      (provider as never as {
+        makeApiRequest: (e: string, m: string, t?: number, b?: Record<string, unknown>) => Promise<unknown>;
+      }).makeApiRequest('/chat/completions', 'POST', 1000, { model: 'x' }),
+    ).rejects.toMatchObject({ httpStatus: 400, message: '[400] bad request' });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(logged.filter((line) => line.event === 'llm.retry')).toEqual([]);
+  });
+
+  it('gives up after 3 attempts on persistent 5xx', async () => {
+    const request = vi.fn().mockRejectedValue(axiosError(503, 'upstream down'));
+    const provider = makeProvider(request);
+
+    await expect(
+      (provider as never as {
+        makeApiRequest: (e: string, m: string, t?: number, b?: Record<string, unknown>) => Promise<unknown>;
+      }).makeApiRequest('/chat/completions', 'POST', 1000, { model: 'x' }),
+    ).rejects.toMatchObject({ httpStatus: 503 });
+    expect(request).toHaveBeenCalledTimes(3);
+    // Two retries are scheduled; the third failure is thrown, with no wait.
+    expect(logged.filter((line) => line.event === 'llm.retry')).toEqual([
+      expect.objectContaining({ provider: 'openrouter', status: 503, attempt: 1 }),
+      expect.objectContaining({ provider: 'openrouter', status: 503, attempt: 2 }),
+    ]);
+  });
+});
+
+describe('json_schema forwarding + require_parameters routing', () => {
+  let provider: OpenRouterProvider;
+  let makeApiRequest: ReturnType<typeof vi.fn>;
+
+  const jsonSchemaFormat = {
+    type: 'json_schema',
+    json_schema: {
+      name: 'verdict',
+      strict: true,
+      schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+    },
+  };
+
+  beforeEach(() => {
+    provider = new OpenRouterProvider();
+    makeApiRequest = vi.fn().mockResolvedValue(okResponse());
+    Object.assign(provider as unknown as Record<string, unknown>, {
+      ensureInitialized: () => {},
+      config: { requestTimeout: 60000, streamRequestTimeout: 120000 },
+      makeApiRequest,
+    });
+  });
+
+  it('forwards the json_schema response_format and adds require_parameters', async () => {
+    await provider.generateCompletion('meta-llama/llama-3.3-70b-instruct', messages, {
+      responseFormat: jsonSchemaFormat,
+    } as never);
+    const payload = makeApiRequest.mock.calls[0][3] as Record<string, unknown>;
+    expect(payload.response_format).toEqual(jsonSchemaFormat);
+    expect(payload.provider).toEqual({ require_parameters: true });
+  });
+
+  it('merges require_parameters over caller provider prefs instead of clobbering', async () => {
+    await provider.generateCompletion('meta-llama/llama-3.3-70b-instruct', messages, {
+      responseFormat: jsonSchemaFormat,
+      customModelParams: { provider: { sort: 'latency' } },
+    } as never);
+    const payload = makeApiRequest.mock.calls[0][3] as Record<string, unknown>;
+    expect(payload.provider).toEqual({ sort: 'latency', require_parameters: true });
+  });
+
+  it('json_object requests stay untouched (no provider prefs added)', async () => {
+    await provider.generateCompletion('meta-llama/llama-3.3-70b-instruct', messages, {
+      responseFormat: { type: 'json_object' },
+    } as never);
+    const payload = makeApiRequest.mock.calls[0][3] as Record<string, unknown>;
+    expect(payload.response_format).toEqual({ type: 'json_object' });
+    expect(payload.provider).toBeUndefined();
+  });
+
+  it('degrades to json_object once when no endpoint supports the schema', async () => {
+    makeApiRequest
+      .mockRejectedValueOnce(
+        new OpenRouterProviderError(
+          '[404] No endpoints found that support the requested parameters.',
+          'API_REQUEST_FAILED',
+          404,
+        ),
+      )
+      .mockResolvedValueOnce(okResponse());
+
+    await provider.generateCompletion('anthracite-org/magnum-v4-72b', messages, {
+      responseFormat: jsonSchemaFormat,
+    } as never);
+
+    expect(makeApiRequest).toHaveBeenCalledTimes(2);
+    const retryPayload = makeApiRequest.mock.calls[1][3] as Record<string, unknown>;
+    expect(retryPayload.response_format).toEqual({ type: 'json_object' });
+    expect(retryPayload.provider).toBeUndefined();
+    expect(logged.filter((line) => line.event === 'llm.format_fallback')).toEqual([
+      expect.objectContaining({ provider: 'openrouter', reason: 'json_schema' }),
+    ]);
+  });
+
+  it('does not degrade on unrelated errors', async () => {
+    makeApiRequest.mockRejectedValue(
+      new OpenRouterProviderError('[401] bad key', 'API_REQUEST_FAILED', 401),
+    );
+    await expect(
+      provider.generateCompletion('anthracite-org/magnum-v4-72b', messages, {
+        responseFormat: jsonSchemaFormat,
+      } as never),
+    ).rejects.toMatchObject({ httpStatus: 401 });
+    expect(makeApiRequest).toHaveBeenCalledTimes(1);
+    expect(logged.filter((line) => line.event === 'llm.format_fallback')).toEqual([]);
+  });
+});
+
+describe('mid-stream upstream error surfacing', () => {
+  it('yields the real upstream error message + code instead of "no choices"', async () => {
+    const provider = new OpenRouterProvider();
+    const sse = [
+      'data: {"id":"gen-2","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}\n',
+      'data: {"id":"gen-2","error":{"code":502,"message":"Provider returned error"}}\n',
+    ];
+    const makeApiRequest = vi.fn().mockResolvedValue(Readable.from(sse));
+    Object.assign(provider as unknown as Record<string, unknown>, {
+      ensureInitialized: () => {},
+      config: { requestTimeout: 1000, streamRequestTimeout: 1000 },
+      makeApiRequest,
+    });
+
+    const chunks: Array<{ error?: { message: string; type?: string }; isFinal?: boolean }> = [];
+    for await (const chunk of provider.generateCompletionStream('m', messages, {} as never)) {
+      chunks.push(chunk as never);
+    }
+
+    const errChunk = chunks.find((c) => c.error);
+    expect(errChunk).toBeDefined();
+    expect(errChunk!.error!.message).toBe('[502] Provider returned error');
+    expect(errChunk!.error!.type).toBe('upstream_error');
+    expect(errChunk!.isFinal).toBe(true);
+  });
+});
+
+describe('the json_object retry draws on the call\'s maxAttempts', () => {
+  const schemaFormat = {
+    type: 'json_schema',
+    json_schema: {
+      name: 'verdict',
+      strict: true,
+      schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+    },
+  };
+  const noEndpoints = () => axiosError(404, 'No endpoints found that support the requested parameters.');
+  const bodyOfCall = (request: ReturnType<typeof vi.fn>, callIdx: number) =>
+    (request.mock.calls[callIdx][0] as { data: Record<string, unknown> }).data;
+  const drain = async (stream: AsyncIterable<unknown>) => {
+    for await (const _chunk of stream) {
+      // read and dropped
+    }
+  };
+
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('with maxAttempts 1, the no-endpoints 404 ends the call and the request is not sent again without its schema', async () => {
+    const request = vi.fn().mockRejectedValueOnce(noEndpoints()).mockResolvedValue({ data: okResponse() });
+    const provider = makeProvider(request, 'key-a');
+    await expect(
+      provider.generateCompletion('m', messages, { responseFormat: schemaFormat, maxAttempts: 1 } as never),
+    ).rejects.toMatchObject({ httpStatus: 404 });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('with maxAttempts 2, the 404 leaves one attempt, and the request without its schema answers', async () => {
+    const request = vi.fn().mockRejectedValueOnce(noEndpoints()).mockResolvedValue({ data: okResponse() });
+    const provider = makeProvider(request, 'key-a');
+    const result = await provider.generateCompletion('m', messages, { responseFormat: schemaFormat, maxAttempts: 2 } as never);
+    expect(result.id).toBe('gen-1');
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(bodyOfCall(request, 1).response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('with maxAttempts 2, a 503 and then the 404 spend both attempts; no request goes without the schema', async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(axiosError(503, 'upstream down'))
+      .mockRejectedValueOnce(noEndpoints())
+      .mockResolvedValue({ data: okResponse() });
+    const provider = makeProvider(request, 'key-a');
+    await expect(
+      provider.generateCompletion('m', messages, { responseFormat: schemaFormat, maxAttempts: 2 } as never),
+    ).rejects.toMatchObject({ httpStatus: 404 });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('streamed, with maxAttempts 1, the no-endpoints 404 ends the stream and the request is not sent again', async () => {
+    const request = vi.fn().mockRejectedValueOnce(noEndpoints()).mockResolvedValue({ data: Readable.from(['data: [DONE]\n']) });
+    const provider = makeProvider(request, 'key-a');
+    await expect(
+      drain(provider.generateCompletionStream('m', messages, { responseFormat: schemaFormat, maxAttempts: 1 } as never)),
+    ).rejects.toMatchObject({ httpStatus: 404 });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('left out, the request is sent again without its schema', async () => {
+    const request = vi.fn().mockRejectedValueOnce(noEndpoints()).mockResolvedValue({ data: okResponse() });
+    const provider = makeProvider(request, 'key-a');
+    await provider.generateCompletion('m', messages, { responseFormat: schemaFormat } as never);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(bodyOfCall(request, 1).response_format).toEqual({ type: 'json_object' });
+  });
+});

@@ -1,0 +1,1154 @@
+// File: backend/agentos/core/llm/providers/implementations/RequestyProvider.ts
+/**
+ * @fileoverview Implements the IProvider interface for Requesty, an OpenAI-compatible
+ * LLM gateway that provides access to a wide variety of LLMs from different providers
+ * through a unified API. This provider handles routing requests to the specified models
+ * via Requesty.
+ * @module backend/agentos/core/llm/providers/implementations/RequestyProvider
+ * @implements {IProvider}
+ */
+
+import axios, { AxiosInstance, AxiosError, ResponseType } from 'axios';
+import {
+  IProvider,
+  ChatMessage,
+  ModelCompletionOptions,
+  ModelCompletionResponse,
+  ModelInfo,
+  ModelUsage,
+  ProviderEmbeddingOptions,
+  ProviderEmbeddingResponse,
+  ModelCompletionChoice,
+} from '../IProvider';
+import { RequestyProviderError } from '../errors/RequestyProviderError';
+import { ApiKeyPool, keyPoolStrategyFromEnv, type ApiKeyPoolConfig, type ProbeResult } from '../../../providers/ApiKeyPool.js';
+import { classifyKeyFailure, retryAfterMs, statusOfKinds, type KeyFailureKind } from '../../../providers/quotaErrors.js';
+import {
+  failedKeyProbeAnswer,
+  noModelKeyProbeAnswer,
+  readKeyProbeAnswer,
+  startKeyProbeDeadline,
+  type KeyProbeAnswer,
+  type KeyProbeOptions,
+} from '../../../providers/keyProbe.js';
+import { createGMIErrorFromError, GMIErrorCode } from '../../../utils/errors.js'; // Corrected import path
+import { clampMaxOutputTokens } from '../model-output-limits.js';
+import { createContentSafeConsole } from '../../../logging/contentSafeConsole.js';
+import { cheapestPricedChatModel } from './billing-probe-model.js';
+import { isReadableStream, maskCutSecretTail, parseErrorBody, readErrorStream } from '../stream-error-body.js';
+import { baseUrlCredentials, redactUrlSecrets } from '../url-secrets.js';
+
+/** This module's fixed diagnostic origin; no runtime name enters telemetry. */
+const console = createContentSafeConsole('requesty_provider');
+
+/**
+ * Requesty's router base URL, which requests go to when the config names no `baseURL`. `embedText` posts Requesty
+ * embeddings under it too: Requesty serves `POST https://router.requesty.ai/v1/embeddings`
+ * (https://docs.requesty.ai/api-reference/endpoint/embeddings-create, read 2026-10-25).
+ */
+export const REQUESTY_DEFAULT_BASE_URL = 'https://router.requesty.ai/v1';
+
+/**
+ * Configuration specific to the RequestyProvider.
+ */
+export interface RequestyProviderConfig {
+  apiKey: string;
+  baseURL?: string;
+  defaultModelId?: string;
+  siteUrl?: string;
+  appName?: string;
+  requestTimeout?: number;
+  streamRequestTimeout?: number;
+  /**
+   * The key pool behind a comma-separated `apiKey`: `ordered` prefers the
+   * earliest usable key (a cost order), `round-robin` spreads load (the
+   * default; `AGENTOS_KEY_POOL_STRATEGY=ordered` changes it when this is
+   * absent); `store` and `id` persist the keys' standing across restarts.
+   */
+  keyPool?: Pick<ApiKeyPoolConfig, 'strategy' | 'cooldownMs' | 'recheckMs' | 'maxRecheckMs' | 'maxRetryAfterMs' | 'loadTimeoutMs' | 'storeTimeoutMs' | 'store' | 'id'>;
+}
+
+interface RequestyChatChoice {
+  index: number;
+  message?: {
+    role: ChatMessage['role'];
+    content: string | null;
+    tool_calls?: ChatMessage['tool_calls'];
+  };
+  delta?: {
+    role?: ChatMessage['role'];
+    content?: string | null;
+    tool_calls?: Array<{
+      index: number;
+      id?: string;
+      type?: 'function';
+      function?: { name?: string; arguments?: string; };
+    }>;
+  };
+  finish_reason: string | null;
+  logprobs?: unknown;
+}
+
+interface RequestyChatCompletionAPIResponse {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: RequestyChatChoice[];
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    cost?: number;
+  };
+}
+
+interface RequestyEmbeddingAPIResponse {
+  object: 'list';
+  data: Array<{
+    object: 'embedding';
+    embedding: number[];
+    index: number;
+  }>;
+  model: string;
+  usage: {
+    prompt_tokens: number;
+    total_tokens: number;
+  };
+}
+
+/**
+ * One pricing band of a model: its prices apply once the prompt exceeds
+ * `prompt_tokens_threshold` tokens. Prices are USD per token.
+ */
+interface RequestyPricingBand {
+  prompt_tokens_threshold?: number;
+  input_price?: number;
+  output_price?: number;
+}
+
+/**
+ * One entry of Requesty's `GET /v1/models` response, as far as it is read here.
+ * The endpoint is an alias of `/v1/models/chat`, whose page holds the schema:
+ * https://docs.requesty.ai/api-reference/endpoint/models-list
+ * https://docs.requesty.ai/api-reference/endpoint/models-chat-list
+ *
+ * Prices are USD per token. The top-level prices are those of the first band
+ * in `pricing`; the example response on the page lists them only there. The
+ * endpoint returns `max_output_tokens: 0` for some models, read here as no
+ * listed limit.
+ */
+interface RequestyModelAPIObject {
+  id: string;
+  description?: string;
+  input_price?: number;
+  output_price?: number;
+  pricing?: RequestyPricingBand[];
+  context_window?: number;
+  max_output_tokens?: number;
+  supports_vision?: boolean;
+  supports_tool_calling?: boolean;
+  supports_output_json_object?: boolean;
+}
+
+/** Model-id patterns taken for tool calling and JSON mode when an entry carries no flag. */
+const TOOL_AND_JSON_MODEL_ID_PATTERNS = ['gpt-3.5', 'gpt-4', 'claude-2', 'claude-3', 'gemini', 'mistral', 'llama'];
+
+/**
+ * A price in USD per token as USD per million tokens, rounded to a millionth
+ * of a dollar so binary float noise does not reach the price. Anything but a
+ * finite number of at least 0 has no price.
+ */
+function pricePerMillionTokens(pricePerToken: unknown): number | undefined {
+  if (typeof pricePerToken !== 'number' || !Number.isFinite(pricePerToken) || pricePerToken < 0) {
+    return undefined;
+  }
+  return Math.round(pricePerToken * 1e12) / 1e6;
+}
+
+/** A count of tokens when it is a finite number above 0, else undefined. */
+function positiveTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** The band that prices the smallest prompts: the lowest `prompt_tokens_threshold`. */
+function basePricingBand(pricing: unknown): RequestyPricingBand | undefined {
+  if (!Array.isArray(pricing)) return undefined;
+  let base: RequestyPricingBand | undefined;
+  for (const band of pricing as unknown[]) {
+    if (band === null || typeof band !== 'object') continue;
+    const candidate = band as RequestyPricingBand;
+    if (!base || (candidate.prompt_tokens_threshold ?? 0) < (base.prompt_tokens_threshold ?? 0)) {
+      base = candidate;
+    }
+  }
+  return base;
+}
+
+interface RequestyListModelsAPIResponse {
+  data: RequestyModelAPIObject[];
+}
+
+export class RequestyProvider implements IProvider {
+  public readonly providerId: string = 'requesty';
+  public isInitialized: boolean = false;
+  public defaultModelId?: string;
+
+  // Corrected: Changed type of this.config to satisfy the Readonly<Required<...>> assignment by providing defaults
+  private config!: Readonly<Required<Omit<RequestyProviderConfig, 'defaultModelId' | 'siteUrl' | 'appName' | 'baseURL' | 'requestTimeout' | 'streamRequestTimeout' | 'keyPool'>> & RequestyProviderConfig>;
+  private keyPool: ApiKeyPool | null = null;
+  private client!: AxiosInstance;
+  private readonly availableModelsCache: Map<string, ModelInfo> = new Map();
+
+  constructor() {}
+
+  public async initialize(config: RequestyProviderConfig): Promise<void> {
+    if (!config.apiKey) {
+      throw new RequestyProviderError(
+        'Requesty API key (apiKey) is required for initialization.',
+        'INIT_FAILED_MISSING_API_KEY'
+      );
+    }
+    // The new pool is built before anything of the old state is touched: its construction makes no request, so a
+    // timing it refuses (a RangeError) leaves this provider as it was, its pool and its recheck timer included.
+    const keyPool = new ApiKeyPool(config.apiKey, {
+      ...(config.keyPool ?? {}),
+      ...(config.keyPool?.strategy ? {} : keyPoolStrategyFromEnv('requesty')),
+      probe: (key, kind) => this.probeKey(key, kind),
+    });
+    // A re-initialize replaces the configuration and the pool: the old pool first stops its timer, finishes its
+    // probes (which read this provider's configuration) and writes their results, so a late probe can neither use
+    // the new configuration nor overwrite what the new pool loads from the store.
+    await this.keyPool?.close();
+    // Corrected: Ensure all properties of Required<RequestyProviderConfig> are present
+    // by providing defaults for optional fields before freezing.
+    this.config = Object.freeze({
+      apiKey: config.apiKey,
+      baseURL: config.baseURL || REQUESTY_DEFAULT_BASE_URL,
+      defaultModelId: config.defaultModelId, // Can be undefined, but this.defaultModelId will store it
+      siteUrl: config.siteUrl, // Can be undefined
+      appName: config.appName, // Can be undefined
+      requestTimeout: config.requestTimeout || 60000,
+      streamRequestTimeout: config.streamRequestTimeout || 180000,
+    });
+    this.keyPool = keyPool;
+    await this.keyPool.ready();
+    this.defaultModelId = this.config.defaultModelId; // Store the potentially undefined value
+
+    // No Authorization header here: the key is resolved per request inside
+    // makeApiRequest (apiKeyOverride first, then the pool), so key rotation
+    // and per call overrides are honored instead of a key baked at init.
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': `AgentOS/1.0 (RequestyProvider; ${this.config.appName || 'UnknownApp'})`,
+    };
+    if (this.config.siteUrl) {
+      headers['HTTP-Referer'] = this.config.siteUrl;
+    }
+    if (this.config.appName) {
+      headers['X-Title'] = this.config.appName;
+    }
+
+    this.client = axios.create({
+      baseURL: this.config.baseURL,
+      headers,
+    });
+
+    // Every key of a pool of several is out (the store held them failed): the model listing would draw no key and
+    // fail the initialize, and a provider that never initializes runs no recheck timer, so nothing would probe the
+    // keys back until a fresh process forgot them. It initializes without the listing instead and its timer probes
+    // the keys at their recheck; the model cache fills on the first lookup that misses it.
+    if (keyPool.size > 1 && keyPool.usable() === 0) {
+      this.isInitialized = true;
+      keyPool.startRechecks();
+      console.warn('RequestyProvider: every API key of the pool is out of rotation; initialized without the model listing, and the keys are probed at their recheck.');
+      return;
+    }
+
+    try {
+      await this.refreshAvailableModels();
+      this.isInitialized = true;
+      // Failed keys are probed on the pool's own clock once the provider is up, so a provider the health
+      // breaker holds still gets its keys back; the timer never keeps the process alive.
+      if ((this.keyPool?.size ?? 0) > 1) this.keyPool?.startRechecks();
+      console.log(`RequestyProvider initialized. Default Model: ${this.defaultModelId || 'Not set'}. Found ${this.availableModelsCache.size} models via Requesty.`);
+    } catch (error: unknown) {
+      this.isInitialized = false;
+      const initError = error instanceof RequestyProviderError ? error :
+        createGMIErrorFromError( // Corrected: use imported createGMIErrorFromError
+          error instanceof Error ? error : new Error(String(error)),
+          GMIErrorCode.LLM_PROVIDER_ERROR, // Corrected: use imported GMIErrorCode
+          { providerId: this.providerId },
+          `RequestyProvider failed to initialize: ${error instanceof Error ? error.message : String(error)}`
+        );
+      console.error(initError.message, initError.details || initError);
+      throw initError;
+    }
+  }
+
+  /** Reads `/models` into the cache. `signal`, when given, ends the read in flight and throws `REQUEST_ABORTED`. */
+  private async refreshAvailableModels(signal?: AbortSignal): Promise<void> {
+    const responseData = await this.makeApiRequest<RequestyListModelsAPIResponse>(
+      '/models',
+      'GET',
+      this.config.requestTimeout,
+      undefined,
+      false,
+      signal ? { signal } : undefined,
+    );
+
+    this.availableModelsCache.clear();
+    if (responseData && Array.isArray(responseData.data)) {
+      responseData.data.forEach((apiModel: RequestyModelAPIObject) => {
+        const modelInfo = this.mapApiToModelInfo(apiModel);
+        this.availableModelsCache.set(modelInfo.modelId, modelInfo);
+      });
+    } else {
+      console.warn("RequestyProvider: Received no model data or malformed response from /models endpoint.");
+    }
+  }
+
+  /**
+   * Maps one `GET /v1/models` entry to a {@link ModelInfo}.
+   *
+   * Prices come from the entry's top-level `input_price` / `output_price`, or
+   * from its base pricing band when it lists them only under `pricing`. Vision,
+   * tool calling and JSON mode come from the `supports_*` flags; an entry with
+   * no flag falls back to the model-id patterns.
+   */
+  private mapApiToModelInfo(apiModel: RequestyModelAPIObject): ModelInfo {
+    const idMatchesPattern = TOOL_AND_JSON_MODEL_ID_PATTERNS.some(pattern =>
+      apiModel.id.toLowerCase().includes(pattern)
+    );
+    const supports = (flag: unknown, fallback: boolean): boolean =>
+      typeof flag === 'boolean' ? flag : fallback;
+
+    const capabilities: ModelInfo['capabilities'] = ['chat', 'completion'];
+    if (supports(apiModel.supports_vision, false)) {
+      capabilities.push('vision_input');
+    }
+    if (supports(apiModel.supports_tool_calling, idMatchesPattern)) {
+      capabilities.push('tool_use');
+    }
+    if (supports(apiModel.supports_output_json_object, idMatchesPattern)) {
+      capabilities.push('json_mode');
+    }
+    if (apiModel.id.includes('embedding') || apiModel.id.includes('embed')) {
+      capabilities.push('embeddings');
+    }
+
+    const baseBand = basePricingBand(apiModel.pricing);
+
+    return {
+      modelId: apiModel.id,
+      providerId: this.providerId,
+      description: typeof apiModel.description === 'string' ? apiModel.description : undefined,
+      capabilities: Array.from(new Set(capabilities)),
+      contextWindowSize: positiveTokenCount(apiModel.context_window),
+      outputTokenLimit: positiveTokenCount(apiModel.max_output_tokens),
+      pricePer1MTokensInput: pricePerMillionTokens(apiModel.input_price ?? baseBand?.input_price),
+      pricePer1MTokensOutput: pricePerMillionTokens(apiModel.output_price ?? baseBand?.output_price),
+      supportsStreaming: true,
+      status: 'active',
+    };
+  }
+
+  private ensureInitialized(): void {
+    if (!this.isInitialized) {
+      throw new RequestyProviderError(
+        'RequestyProvider is not initialized. Please call the initialize() method first.',
+        'PROVIDER_NOT_INITIALIZED'
+      );
+    }
+  }
+
+  private mapToRequestyMessages(messages: ChatMessage[]): Array<Partial<ChatMessage>> {
+    return messages.map(msg => {
+      const mappedMsg: Partial<ChatMessage> = { role: msg.role, content: msg.content };
+      if (msg.name) mappedMsg.name = msg.name;
+      if (msg.tool_calls) mappedMsg.tool_calls = msg.tool_calls;
+      if (msg.tool_call_id) mappedMsg.tool_call_id = msg.tool_call_id;
+      return mappedMsg;
+    });
+  }
+
+  public async generateCompletion(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions
+  ): Promise<ModelCompletionResponse> {
+    this.ensureInitialized();
+    const requestyMessages = this.mapToRequestyMessages(messages);
+
+    const payload: Record<string, unknown> = {
+      model: modelId,
+      messages: requestyMessages,
+      stream: false,
+      ...(options.temperature !== undefined && { temperature: options.temperature }),
+      ...(options.topP !== undefined && { top_p: options.topP }),
+      // Requesty reserves credits up to max_tokens at request time. When the
+      // caller doesn't specify a limit, it falls back to the model's full output
+      // capacity (e.g. 64000 for claude-haiku-4-5), which causes 402 credit-required
+      // errors on accounts without enough buffer. Default to 4096, the same value
+      // AnthropicProvider uses, so short prompts succeed without explicit tuning.
+      // Then clamp to the model's output ceiling so a request sized for a
+      // flagship model is not rejected when routed to a lower-ceiling OpenAI
+      // model (e.g. openai/gpt-4o caps at 16384, not 32000).
+      max_tokens: clampMaxOutputTokens(modelId, options.maxTokens) ?? 4096,
+      ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
+      ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
+      ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
+      ...(options.userId !== undefined && { user: options.userId }),
+      ...(options.tools !== undefined && { tools: options.tools }),
+      ...(options.toolChoice !== undefined && { tool_choice: options.toolChoice }),
+      ...(options.responseFormat?.type === 'json_object' && { response_format: { type: 'json_object' } }),
+      ...(options.customModelParams || {}),
+    };
+
+    const apiResponseData = await this.makeApiRequest<RequestyChatCompletionAPIResponse>(
+      '/chat/completions',
+      'POST',
+      // CR8: honor a per-call requestTimeout override over the provider default.
+      options.requestTimeout ?? this.config.requestTimeout,
+      payload,
+      false,
+      { apiKeyOverride: options.apiKeyOverride, signal: options.abortSignal }
+    );
+    return this.mapApiToCompletionResponse(apiResponseData, modelId);
+  }
+
+  public async *generateCompletionStream(
+    modelId: string,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions
+  ): AsyncGenerator<ModelCompletionResponse, void, undefined> {
+    this.ensureInitialized();
+    const requestyMessages = this.mapToRequestyMessages(messages);
+
+    const payload: Record<string, unknown> = {
+      model: modelId,
+      messages: requestyMessages,
+      stream: true,
+      // Requesty follows the OpenAI streaming convention: usage is omitted
+      // unless stream_options.include_usage is set, in which case a trailing
+      // usage-only chunk arrives before [DONE]. Without this flag,
+      // streamText({...}).usage resolves to all zeros even on success.
+      stream_options: { include_usage: true },
+      ...(options.temperature !== undefined && { temperature: options.temperature }),
+      ...(options.topP !== undefined && { top_p: options.topP }),
+      // Requesty reserves credits up to max_tokens at request time. When the
+      // caller doesn't specify a limit, it falls back to the model's full output
+      // capacity (e.g. 64000 for claude-haiku-4-5), which causes 402 credit-required
+      // errors on accounts without enough buffer. Default to 4096, the same value
+      // AnthropicProvider uses, so short prompts succeed without explicit tuning.
+      // Then clamp to the model's output ceiling so a request sized for a
+      // flagship model is not rejected when routed to a lower-ceiling OpenAI
+      // model (e.g. openai/gpt-4o caps at 16384, not 32000).
+      max_tokens: clampMaxOutputTokens(modelId, options.maxTokens) ?? 4096,
+      ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
+      ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
+      ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
+      ...(options.userId !== undefined && { user: options.userId }),
+      ...(options.tools !== undefined && { tools: options.tools }),
+      ...(options.toolChoice !== undefined && { tool_choice: options.toolChoice }),
+      ...(options.responseFormat?.type === 'json_object' && { response_format: { type: 'json_object' } }),
+      ...(options.customModelParams || {}),
+    };
+
+    const abortSignal = options.abortSignal;
+    if (abortSignal?.aborted) {
+      yield { id: `requesty-abort-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message: 'Stream aborted prior to first chunk', type: 'abort' }, isFinal: true };
+      return;
+    }
+
+    const accumulatedToolCalls: Map<number, { id?: string; type?: 'function'; function?: { name?: string; arguments?: string; } }> = new Map();
+
+    // Stream contract (see StreamingReconstructor.ts): exactly one chunk per
+    // stream carries isFinal:true. With stream_options.include_usage the API
+    // sends the finish_reason chunk and then a usage-only chunk, so the
+    // finish_reason chunk is buffered here and merged with the usage chunk
+    // before a single final chunk is emitted.
+    let pendingFinal: ModelCompletionResponse | undefined;
+    // Some upstreams routed through Requesty end the stream at [DONE] without
+    // ever sending finish_reason. Track whether a final chunk went out so one
+    // can be synthesized in that case.
+    let finalEmitted = false;
+
+    try {
+      const stream = await this.makeApiRequest<NodeJS.ReadableStream>(
+        '/chat/completions',
+        'POST',
+        // CR8: honor a per-call requestTimeout override over the stream default.
+        options.requestTimeout ?? this.config.streamRequestTimeout,
+        payload,
+        true,
+        { apiKeyOverride: options.apiKeyOverride, signal: abortSignal }
+      );
+
+      for await (const rawChunk of this.parseSseStream(stream)) {
+        if (abortSignal?.aborted) {
+          pendingFinal = undefined;
+          finalEmitted = true;
+          yield { id: `requesty-abort-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message: 'Stream aborted by caller', type: 'abort' }, isFinal: true };
+          break;
+        }
+        if (rawChunk.startsWith('data: ') && rawChunk.includes('[DONE]')) {
+          const doneData = rawChunk.substring('data: '.length).trim();
+          if (doneData === '[DONE]') break;
+        }
+        if (rawChunk === 'data: [DONE]') {
+          break;
+        }
+
+        if (rawChunk.startsWith('data: ')) {
+          const jsonData = rawChunk.substring('data: '.length);
+          let apiChunk: RequestyChatCompletionAPIResponse;
+          try {
+            apiChunk = JSON.parse(jsonData) as RequestyChatCompletionAPIResponse;
+          } catch (error: unknown) {
+            // Do not log or attach the raw payload: it can hold completion
+            // text or tool arguments. Only the length is safe metadata.
+            throw new RequestyProviderError(
+              `Malformed SSE data chunk from Requesty (${jsonData.length} bytes could not be parsed as JSON).`,
+              'STREAM_CHUNK_MALFORMED',
+              undefined,
+              undefined,
+              { payloadLength: jsonData.length, parseError: error instanceof Error ? error.message : String(error) }
+            );
+          }
+          const mapped = this.mapApiToStreamChunkResponse(apiChunk, modelId, accumulatedToolCalls);
+          // Don't break on finish_reason: with stream_options.include_usage,
+          // Requesty (like OpenAI) emits a trailing usage-only chunk AFTER
+          // the finish_reason chunk and BEFORE [DONE]. Breaking here would
+          // skip the usage chunk and zero out the caller's token totals. The
+          // [DONE] marker check above is the right termination signal.
+          if (!mapped.isFinal) {
+            yield mapped;
+          } else if (mapped.choices.length > 0) {
+            pendingFinal = mapped;
+          } else if (pendingFinal) {
+            finalEmitted = true;
+            yield { ...pendingFinal, usage: mapped.usage ?? pendingFinal.usage };
+            pendingFinal = undefined;
+          } else {
+            finalEmitted = true;
+            yield mapped;
+          }
+        }
+      }
+      if (pendingFinal) {
+        // [DONE] (or end of stream) arrived without a usage-only chunk.
+        finalEmitted = true;
+        yield pendingFinal;
+      } else if (!finalEmitted) {
+        // Stream ended without any finish_reason or usage chunk. Emit the
+        // terminal chunk the provider contract requires so consumers see
+        // completion.
+        yield {
+          id: `requesty-final-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          modelId,
+          choices: [{ index: 0, message: { role: 'assistant', content: null }, finishReason: 'stop' }],
+          isFinal: true,
+        };
+      }
+    } catch (error: unknown) {
+      // Provider contract (IProvider) requires a terminal isFinal:true chunk
+      // even on error. If request setup or SSE iteration throws, surface it as
+      // a final error chunk instead of letting the generator throw.
+      if (abortSignal?.aborted) {
+        yield { id: `requesty-abort-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message: 'Stream aborted by caller', type: 'abort' }, isFinal: true };
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      yield { id: `requesty-error-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message, type: 'api_error' }, isFinal: true };
+      return;
+    }
+  }
+
+  public async generateEmbeddings(
+    modelId: string,
+    texts: string[],
+    options?: ProviderEmbeddingOptions
+  ): Promise<ProviderEmbeddingResponse> {
+    this.ensureInitialized();
+    if (!texts || texts.length === 0) {
+      throw new RequestyProviderError('Input texts array cannot be empty for generating embeddings.', 'EMBEDDING_NO_INPUT');
+    }
+
+    // The lookup carries the call's signal: an aborted call sends nothing, and an abort ends a refresh in flight.
+    const modelInfo = await this.modelInfoForCall(modelId, options?.abortSignal);
+    if (modelInfo && !modelInfo.capabilities.includes('embeddings')) {
+      console.warn(`RequestyProvider: Model '${modelId}' is not explicitly listed with embedding capabilities. Attempting anyway.`);
+    }
+
+    const payload: Record<string, unknown> = {
+      model: modelId,
+      input: texts,
+      ...(options?.encodingFormat && { encoding_format: options.encodingFormat }),
+      ...(options?.dimensions && { dimensions: options.dimensions }),
+      ...(options?.inputType && { input_type: options.inputType }),
+      ...(options?.customModelParams || {}),
+    };
+
+    const apiResponseData = await this.makeApiRequest<RequestyEmbeddingAPIResponse>(
+      '/embeddings',
+      'POST',
+      this.config.requestTimeout,
+      payload,
+      false,
+      // The call's signal ends the request in flight (REQUEST_ABORTED).
+      { apiKeyOverride: options?.apiKeyOverride, signal: options?.abortSignal }
+    );
+
+    if (!Array.isArray(apiResponseData?.data) || !apiResponseData.usage) {
+      throw new RequestyProviderError(
+        'Malformed embeddings response from Requesty: missing data array or usage.',
+        'API_RESPONSE_MALFORMED',
+        undefined,
+        undefined,
+        { hasData: Array.isArray(apiResponseData?.data), hasUsage: !!apiResponseData?.usage }
+      );
+    }
+
+    return {
+      object: 'list',
+      data: apiResponseData.data.map(d => ({
+        object: 'embedding',
+        embedding: d.embedding,
+        index: d.index,
+      })),
+      model: apiResponseData.model,
+      usage: {
+        prompt_tokens: apiResponseData.usage.prompt_tokens,
+        total_tokens: apiResponseData.usage.total_tokens,
+      },
+    };
+  }
+
+  public async listAvailableModels(filter?: { capability?: string }): Promise<ModelInfo[]> {
+    this.ensureInitialized();
+    if (this.availableModelsCache.size === 0) {
+      try {
+        await this.refreshAvailableModels();
+      } catch (refreshError) {
+        console.warn("RequestyProvider: Failed to refresh models during listAvailableModels call after finding empty cache:", refreshError);
+      }
+    }
+    const models = Array.from(this.availableModelsCache.values());
+    if (filter?.capability) {
+      return models.filter(m => m.capabilities.includes(filter.capability!));
+    }
+    return models;
+  }
+
+  public async getModelInfo(modelId: string): Promise<ModelInfo | undefined> {
+    return this.modelInfoForCall(modelId);
+  }
+
+  /**
+   * The model lookup behind {@link getModelInfo}: a model missing from the cache refreshes the `/models` list first,
+   * and a refresh that fails is logged and the lookup answers from the cache. A call that carries the caller's
+   * signal passes it here: a call whose signal has aborted throws
+   * `REQUEST_ABORTED` before any request, and the `/models` refresh a model missing from the cache starts carries
+   * the signal, so an abort ends it at once with `REQUEST_ABORTED`. Any other refresh failure is logged and the
+   * lookup answers from the cache, as {@link getModelInfo} does.
+   */
+  private async modelInfoForCall(modelId: string, signal?: AbortSignal): Promise<ModelInfo | undefined> {
+    this.ensureInitialized();
+    const aborted = () => new RequestyProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+    if (signal?.aborted) throw aborted();
+    if (!this.availableModelsCache.has(modelId)) {
+      try {
+        console.log(`RequestyProvider: Model ${modelId} not in cache. Refreshing model list.`);
+        await this.refreshAvailableModels(signal);
+      } catch (error) {
+        if (signal?.aborted) throw aborted();
+        console.warn(`RequestyProvider: Failed to refresh models list while trying to get info for ${modelId}:`, error);
+      }
+    }
+    return this.availableModelsCache.get(modelId);
+  }
+
+  public async checkHealth(): Promise<{ isHealthy: boolean; details?: unknown }> {
+    if (!this.client) {
+      return { isHealthy: false, details: { message: "RequestyProvider not initialized (HTTP client missing)."}};
+    }
+    try {
+      // Auth rides per request since the key is no longer on the axios
+      // instance; keep the health probe representative of real traffic.
+      const apiKey = await this.resolveApiKey();
+      await this.client.get('/models', {
+        timeout: Math.min(this.config.requestTimeout || 10000, 10000),
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      return { isHealthy: true, details: { message: "Successfully connected to Requesty /models endpoint." } };
+    } catch (error: unknown) {
+      const err = error as AxiosError;
+      return {
+        isHealthy: false,
+        details: {
+          message: `Requesty health check failed: ${err.message}`,
+          status: err.response?.status,
+          responseData: err.response?.data,
+        },
+      };
+    }
+  }
+
+  public async shutdown(): Promise<void> {
+    // Stops the recheck timer, waits for the probes in flight (each under the probe timeout), then writes the keys' standing.
+    await this.keyPool?.close();
+    this.isInitialized = false;
+    this.availableModelsCache.clear();
+    console.log('RequestyProvider shutdown: Instance marked as uninitialized and cache cleared.');
+  }
+
+  private mapApiToCompletionResponse(
+    apiResponse: RequestyChatCompletionAPIResponse,
+    requestedModelId: string
+  ): ModelCompletionResponse {
+    const choice = apiResponse.choices[0];
+    if (!choice) {
+      throw new RequestyProviderError("Received empty choices array from Requesty.", "API_RESPONSE_MALFORMED", undefined, undefined, { responseId: apiResponse.id });
+    }
+    const choiceWithoutMessage = apiResponse.choices.find(c => !c.message || typeof c.message !== 'object');
+    if (choiceWithoutMessage) {
+      throw new RequestyProviderError(
+        `Choice ${choiceWithoutMessage.index} in Requesty response has no message object.`,
+        "API_RESPONSE_MALFORMED",
+        undefined,
+        undefined,
+        { responseId: apiResponse.id, choiceIndex: choiceWithoutMessage.index }
+      );
+    }
+
+    const usage: ModelUsage | undefined = apiResponse.usage ? {
+      promptTokens: apiResponse.usage.prompt_tokens,
+      completionTokens: apiResponse.usage.completion_tokens,
+      totalTokens: apiResponse.usage.total_tokens,
+      costUSD: apiResponse.usage.cost,
+    } : undefined;
+
+    return {
+      id: apiResponse.id,
+      object: apiResponse.object,
+      created: apiResponse.created,
+      modelId: apiResponse.model || requestedModelId,
+      choices: apiResponse.choices.map(c => ({
+        index: c.index,
+        message: { 
+          role: c.message!.role,
+          content: c.message!.content,
+          tool_calls: c.message!.tool_calls,
+        },
+        finishReason: c.finish_reason,
+        logprobs: c.logprobs,
+      })),
+      usage,
+    };
+  }
+
+  private mapApiToStreamChunkResponse(
+      apiChunk: RequestyChatCompletionAPIResponse,
+      requestedModelId: string,
+      accumulatedToolCalls: Map<number, { id?: string; type?: 'function'; function?: { name?: string; arguments?: string; } }>
+  ): ModelCompletionResponse {
+      const choice = apiChunk.choices[0];
+
+      // With stream_options.include_usage, Requesty (like OpenAI) emits a
+      // trailing chunk with an empty choices array and a populated usage
+      // object. Recognize it as a final usage-only chunk so callers see real
+      // token totals after the stream resolves. Without this, the empty-choices
+      // path below would mark it as a malformed-response error.
+      if ((!apiChunk.choices || apiChunk.choices.length === 0) && apiChunk.usage) {
+        return {
+          id: apiChunk.id,
+          object: apiChunk.object,
+          created: apiChunk.created,
+          modelId: apiChunk.model || requestedModelId,
+          choices: [],
+          isFinal: true,
+          usage: {
+            promptTokens: apiChunk.usage.prompt_tokens,
+            completionTokens: apiChunk.usage.completion_tokens,
+            totalTokens: apiChunk.usage.total_tokens,
+            costUSD: apiChunk.usage.cost,
+          },
+        };
+      }
+
+      if (!choice) {
+        return {
+          id: apiChunk.id, object: apiChunk.object, created: apiChunk.created,
+          modelId: apiChunk.model || requestedModelId, choices: [], isFinal: true,
+          error: { message: "Stream chunk contained no choices.", type: "invalid_response" }
+        };
+      }
+
+      let responseTextDelta: string | undefined;
+      let toolCallsDeltas: ModelCompletionResponse['toolCallsDeltas'];
+      
+      if (choice.delta?.content) {
+        responseTextDelta = choice.delta.content;
+      }
+
+      if (choice.delta?.tool_calls) {
+        toolCallsDeltas = [];
+        choice.delta.tool_calls.forEach(tcDelta => {
+          let currentToolCallState = accumulatedToolCalls.get(tcDelta.index);
+          if (!currentToolCallState) {
+            currentToolCallState = { function: { name: '', arguments: ''} };
+          }
+
+          if (tcDelta.id) currentToolCallState.id = tcDelta.id;
+          if (tcDelta.type) currentToolCallState.type = tcDelta.type as 'function';
+          if (tcDelta.function?.name) currentToolCallState.function!.name = (currentToolCallState.function!.name || '') + tcDelta.function.name;
+          if (tcDelta.function?.arguments) currentToolCallState.function!.arguments = (currentToolCallState.function!.arguments || '') + tcDelta.function.arguments;
+           
+          accumulatedToolCalls.set(tcDelta.index, currentToolCallState);
+
+          toolCallsDeltas!.push({
+            index: tcDelta.index,
+            id: tcDelta.id,
+            type: tcDelta.type as 'function',
+            function: tcDelta.function ? {
+              name: tcDelta.function.name,
+              arguments_delta: tcDelta.function.arguments
+            } : undefined,
+          });
+        });
+      }
+
+      const isFinal = !!choice.finish_reason;
+      let finalUsage: ModelUsage | undefined;
+      const finalChoices: ModelCompletionChoice[] = [];
+
+      if (isFinal) {
+        if (apiChunk.usage) {
+          finalUsage = {
+            promptTokens: apiChunk.usage.prompt_tokens,
+            completionTokens: apiChunk.usage.completion_tokens,
+            totalTokens: apiChunk.usage.total_tokens,
+            costUSD: apiChunk.usage.cost,
+          };
+        }
+        const finalMessage: ChatMessage = {
+          role: choice.delta?.role || (accumulatedToolCalls.size > 0 ? 'assistant' : (choice.message?.role || 'assistant')),
+          content: responseTextDelta || (choice.message?.content || null),
+          tool_calls: Array.from(accumulatedToolCalls.values())
+            .filter(tc => tc.id && tc.function?.name)
+            .map(accTc => ({
+              id: accTc.id!,
+              type: accTc.type!,
+              function: { name: accTc.function!.name!, arguments: accTc.function!.arguments! }
+            })),
+        };
+        if (!finalMessage.tool_calls || finalMessage.tool_calls.length === 0) {
+          delete finalMessage.tool_calls;
+        }
+        if (responseTextDelta && !choice.message?.content && accumulatedToolCalls.size === 0) {
+          finalMessage.content = responseTextDelta;
+        } else if (accumulatedToolCalls.size > 0 && !responseTextDelta && !choice.message?.content) {
+          finalMessage.content = null;
+        }
+
+        finalChoices.push({
+          index: choice.index,
+          message: finalMessage,
+          finishReason: choice.finish_reason,
+          logprobs: choice.logprobs,
+        });
+      } else {
+        finalChoices.push({
+          index: choice.index,
+          message: {
+            role: choice.delta?.role || 'assistant',
+            content: responseTextDelta || null,
+          },
+          finishReason: null,
+        });
+      }
+      
+      return {
+        id: apiChunk.id,
+        object: apiChunk.object,
+        created: apiChunk.created,
+        modelId: apiChunk.model || requestedModelId,
+        choices: finalChoices,
+        responseTextDelta: isFinal ? undefined : responseTextDelta,
+        toolCallsDeltas: isFinal ? undefined : toolCallsDeltas,
+        isFinal,
+        usage: finalUsage,
+      };
+  }
+
+  /**
+   * Resolve the bearer key for one request: a per call override wins,
+   * otherwise the next key from the pool (weighted rotation). With no usable
+   * key while a probe of a failed key is in flight (its recheck came due), the
+   * draw waits for that probe, bounded by the pool's probe timeout, so the
+   * first request after a recheck is served by a key that came back; the
+   * caller's signal ends that wait at once.
+   */
+  private async resolveApiKey(apiKeyOverride?: string, signal?: AbortSignal): Promise<string> {
+    if (apiKeyOverride) return apiKeyOverride;
+    if (this.keyPool?.hasKeys) {
+      const key = await this.keyPool.nextAfterProbes(signal);
+      if (signal?.aborted) throw new RequestyProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+      if (key === '') throw this.allKeysFailedError();
+      return key;
+    }
+    return this.config.apiKey;
+  }
+
+  /**
+   * Probes one API key and reports what its answer showed: the verdict (`ok`, the failure kind it still shows, or
+   * `unknown`), the HTTP status, the vendor's message, the model and the Retry-After. Any kind but `billing` sends the
+   * models list, which rejects a revoked key with 403 "Invalid authorization token". `kind: 'billing'` sends the
+   * smallest billable completion, since a list need not refuse a key whose balance is spent: on `options.model`, else
+   * the default model, else the cheapest chat model the catalog lists with a price, never a free one. A provider
+   * without its catalog (one not initialized, or one that started with every key out) lists it with the probing key
+   * first and keeps it, when the probe goes to the provider's own endpoint (a probe of another base URL lists that
+   * one's catalog and keeps it to itself); with no priced model to send, the probe has no verdict
+   * (`failure: 'no_model'`). Every answer goes through the same classifier as a request's. It works before
+   * `initialize()`: the base URL is
+   * `options.baseURL`, else the configured one, else Requesty's own. The key pool's probe of a failed key is this
+   * method's verdict.
+   */
+  public async probeApiKey(apiKey: string, options: KeyProbeOptions = {}): Promise<KeyProbeAnswer> {
+    const deadline = startKeyProbeDeadline(options);
+    const baseURL = options.baseURL || this.config?.baseURL || REQUESTY_DEFAULT_BASE_URL;
+    const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+    try {
+      const listModels = () => fetch(`${baseURL}/models`, { method: 'GET', headers, signal: deadline.signal });
+      if (options.kind !== 'billing') return await readKeyProbeAnswer(await listModels(), { apiKey, signal: deadline.signal });
+      // The provider's catalog is its own endpoint's: a probe of another endpoint lists that one's and keeps it to itself.
+      const catalog = baseURL === (this.config?.baseURL || REQUESTY_DEFAULT_BASE_URL) ? this.availableModelsCache : new Map<string, ModelInfo>();
+      let model = options.model || this.defaultModelId || cheapestPricedChatModel(catalog.values());
+      if (!model && catalog.size === 0) {
+        const listed = await listModels();
+        if (!listed.ok) return await readKeyProbeAnswer(listed, { apiKey, signal: deadline.signal });
+        const body = (await listed.json().catch((error: unknown) => {
+          // A read the deadline or the caller's abort ended is the probe's failure, not an empty catalog.
+          if (deadline.signal.aborted) throw error;
+          return {};
+        })) as Partial<RequestyListModelsAPIResponse>;
+        if (Array.isArray(body.data) && catalog.size === 0) {
+          for (const apiModel of body.data) {
+            const modelInfo = this.mapApiToModelInfo(apiModel);
+            catalog.set(modelInfo.modelId, modelInfo);
+          }
+        }
+        model = cheapestPricedChatModel(catalog.values());
+      }
+      if (!model) return noModelKeyProbeAnswer();
+      return await readKeyProbeAnswer(
+        await fetch(`${baseURL}/chat/completions`, {
+          method: 'POST',
+          headers,
+          // 16: the router hands max_tokens to the model's own provider, and some providers enforce a minimum of 16
+          // (OpenRouter's chat reference says so of the providers it routes to; Requesty's names no floor).
+          body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'ping' }] }),
+          signal: deadline.signal,
+        }),
+        { model, apiKey, signal: deadline.signal },
+      );
+    } catch (error) {
+      return failedKeyProbeAnswer(error, deadline, { apiKey, baseURL });
+    } finally {
+      deadline.dispose();
+    }
+  }
+
+  /** Probes a key the pool took out of rotation, off the request path: the verdict of `probeApiKey()`. */
+  private async probeKey(apiKey: string, kind: KeyFailureKind | undefined): Promise<ProbeResult> {
+    return (await this.probeApiKey(apiKey, { kind })).verdict;
+  }
+
+  /** The error thrown when every key of the pool is out: no credential is sent again until one returns. */
+  private allKeysFailedError(message?: string, status?: number, errorType?: string): RequestyProviderError {
+    const kinds = Array.from(
+      new Set((this.keyPool?.snapshot() ?? []).map((state) => state.kind).filter((kind): kind is KeyFailureKind => kind !== undefined)),
+    );
+    const retryAfter = this.keyPool?.soonestReturnMs();
+    return new RequestyProviderError(
+      message ?? `Every Requesty API key is out of rotation (${kinds.join(', ') || 'unknown'}).`,
+      'ALL_KEYS_FAILED',
+      status ?? statusOfKinds(kinds),
+      errorType,
+      { kinds, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) },
+    );
+  }
+
+  /**
+   * Reduce an unknown thrown value to fields that are safe to attach to
+   * error details and to log. The raw Axios error keeps the request config
+   * (Authorization header, serialized body), so it is never stored as is.
+   */
+  private sanitizeUnderlyingError(error: unknown): { name?: string; code?: string; message?: string } {
+    if (error instanceof Error) {
+      const code = (error as Error & { code?: unknown }).code;
+      return {
+        name: error.name,
+        ...(typeof code === 'string' ? { code } : {}),
+        message: error.message,
+      };
+    }
+    return { message: String(error) };
+  }
+
+  /** Every configured secret: the raw key setting, each pooled key, and base-URL credentials. */
+  private configuredSecrets(): string[] {
+    const rawKeys = this.config?.apiKey ?? '';
+    return [rawKeys, ...rawKeys.split(',').map((key) => key.trim()), baseUrlCredentials(this.config?.baseURL) ?? ''].filter(
+      (secret) => secret.length > 0,
+    );
+  }
+
+  private async makeApiRequest<T = unknown>(
+    endpoint: string,
+    method: 'GET' | 'POST',
+    timeout?: number,
+    body?: Record<string, unknown>,
+    expectStream: boolean = false,
+    perRequest?: { apiKeyOverride?: string; signal?: AbortSignal }
+  ): Promise<T> {
+    let apiKey = await this.resolveApiKey(perRequest?.apiKeyOverride, perRequest?.signal);
+    // Key hops this request has made: a key-scoped failure on a pool of several keys re-sends the request with the
+    // next usable key at once, at most once per key. A per-request override is the caller's choice and is never
+    // hopped; a single key and a failure that is not the key's leave the request as it was.
+    let keyHops = 0;
+    for (;;) {
+      const attemptStartedAt = Date.now();
+      try {
+        const response = await this.client.request<T>({
+          url: endpoint,
+          method,
+          data: body,
+          timeout: timeout,
+          headers: { Authorization: `Bearer ${apiKey}` },
+          // Forward the caller's AbortSignal so an abort settles the request
+          // while Axios is still waiting for headers or the next body chunk.
+          ...(perRequest?.signal ? { signal: perRequest.signal } : {}),
+          responseType: expectStream ? 'stream' as ResponseType : 'json' as ResponseType,
+        });
+        if (this.keyPool?.has(apiKey)) this.keyPool.markSuccess(apiKey, attemptStartedAt);
+        return response.data;
+      } catch (error: unknown) {
+        // An abort is the caller's verdict, not the provider's or the key's: no key hop, no key marked.
+        if (perRequest?.signal?.aborted) {
+          throw new RequestyProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+        }
+        let statusCode: number | undefined;
+        let errorData: any;
+        let errorMessage = 'Unknown Requesty API error';
+        let errorType = 'UNKNOWN_API_ERROR';
+        let retryAfterHeader: unknown;
+
+        if (axios.isAxiosError(error)) {
+          statusCode = error.response?.status;
+          errorData = error.response?.data;
+          // A streamed request's error body is the live response stream, whose `req` holds the request head with the
+          // Authorization header: serializing it for the classifier throws (the response and its request refer to
+          // each other), so the key was never marked and the request never moved on, and keeping it in the error's
+          // details kept the key. Read a bounded prefix with the configured keys masked, then drop the stream.
+          if (isReadableStream(errorData)) {
+            const { text, complete } = await readErrorStream(errorData, perRequest?.signal);
+            // An abort during the read is the caller's verdict, as above: the answer is not classified, no key is marked.
+            if (perRequest?.signal?.aborted) {
+              throw new RequestyProviderError('Request aborted by caller.', 'REQUEST_ABORTED');
+            }
+            const secrets = this.configuredSecrets();
+            const masked = redactUrlSecrets(text, this.config?.baseURL, secrets);
+            errorData = parseErrorBody(complete ? masked : maskCutSecretTail(masked, secrets));
+          }
+          retryAfterHeader = error.response?.headers?.['retry-after'];
+          if (errorData?.error && typeof errorData.error === 'object') {
+            errorMessage = errorData.error.message || errorMessage;
+            errorType = errorData.error.type || errorType;
+          } else if (typeof errorData === 'string') {
+            errorMessage = errorData;
+          } else if ((error as Error).message) {
+            errorMessage = (error as Error).message;
+          }
+        } else if (error instanceof Error) {
+          errorMessage = error.message;
+        }
+
+        // A key-scoped failure (a bad or revoked key, an unpaid account, a
+        // throttle) takes this key out of rotation; with another usable key the
+        // request is sent again at once with it, so the caller gets an answer
+        // instead of the key's error.
+        const keyFailure = typeof statusCode === 'number' ? classifyKeyFailure(statusCode, typeof errorData === 'string' ? errorData : JSON.stringify(errorData ?? {})) : null;
+        if (keyFailure && this.keyPool?.has(apiKey)) {
+          const serverRetryAfterMs = retryAfterMs(typeof retryAfterHeader === 'string' ? retryAfterHeader : null, undefined, this.config.keyPool?.maxRetryAfterMs);
+          this.keyPool.markFailed(apiKey, keyFailure, {
+            status: statusCode,
+            at: attemptStartedAt,
+            ...(serverRetryAfterMs !== null ? { retryAfterMs: serverRetryAfterMs } : {}),
+          });
+          if (!perRequest?.apiKeyOverride && this.keyPool.size > 1 && this.keyPool.usable() > 0 && ++keyHops < this.keyPool.size && !perRequest?.signal?.aborted) {
+            const nextKey = this.keyPool.next();
+            if (nextKey !== '') {
+              apiKey = nextKey;
+              continue;
+            }
+          }
+          // This answer took out the pool's last usable key for auth or billing: every key is out, and the request
+          // ends as the other providers' do, with ALL_KEYS_FAILED carrying this answer's status and the kinds seen.
+          // A throttle (quota) leaves the key resting, and an override's answer stays the caller's own.
+          if (!perRequest?.apiKeyOverride && this.keyPool.size > 1 && this.keyPool.usable() === 0 && keyFailure !== 'quota') {
+            throw this.allKeysFailedError(statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage, statusCode, errorType);
+          }
+        }
+
+        // Prefix the status code into the message so downstream retry/fallback
+        // logic (e.g. isRetryableError, which greps for \b402\b) can route on it
+        // even when the Requesty API body provides a friendlier description.
+        const decoratedMessage = statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage;
+        throw new RequestyProviderError(
+          decoratedMessage,
+          'API_REQUEST_FAILED',
+          statusCode,
+          errorType,
+          { requestEndpoint: endpoint, requestBodyKeys: body ? Object.keys(body) : undefined, responseData: errorData, underlyingError: this.sanitizeUnderlyingError(error) }
+        );
+      }
+    }
+  }
+
+  private async *parseSseStream(stream: NodeJS.ReadableStream): AsyncGenerator<string, void, undefined> {
+    let buffer = '';
+    const readableStream = stream as NodeJS.ReadableStream & { destroy?: () => void };
+
+    try {
+      for await (const chunk of readableStream) {
+        buffer += chunk.toString();
+        let eolIndex;
+        while ((eolIndex = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.substring(0, eolIndex).trim();
+          buffer = buffer.substring(eolIndex + 1);
+          if (line) {
+            yield line;
+          }
+        }
+      }
+      if (buffer.trim()) {
+        yield buffer.trim();
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Requesty stream parsing/reading error";
+      console.error("RequestyProvider: Error reading or parsing SSE stream:", message);
+      if (error instanceof RequestyProviderError) throw error;
+      throw new RequestyProviderError(message, 'STREAM_PARSING_ERROR', undefined, undefined, this.sanitizeUnderlyingError(error));
+    } finally {
+      if (typeof readableStream.destroy === 'function') {
+        readableStream.destroy();
+      } else if (typeof (readableStream as any).close === 'function') {
+        (readableStream as any).close();
+      }
+    }
+  }
+}

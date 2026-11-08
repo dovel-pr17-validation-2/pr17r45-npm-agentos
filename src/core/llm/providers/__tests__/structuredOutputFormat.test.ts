@@ -1,0 +1,199 @@
+/**
+ * @file structuredOutputFormat.test.ts
+ * @description Tests for the provider-format adapter that maps a Zod schema
+ *              + provider id to the per-provider structured-output payload.
+ */
+import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
+import { buildResponseFormat, ensureAnthropicObjectSchema } from '../structuredOutputFormat.js';
+
+const schema = z.object({
+  verdict: z.enum(['yes', 'no']),
+  confidence: z.number().min(0).max(1),
+});
+
+describe('buildResponseFormat', () => {
+  it('openai returns json_schema with strict=true and a sanitized name', () => {
+    const r = buildResponseFormat({ provider: 'openai', schema, schemaName: 'My.Schema' });
+    expect((r as any).type).toBe('json_schema');
+    expect((r as any).json_schema.name).toBe('My_Schema');
+    expect((r as any).json_schema.strict).toBe(true);
+    expect(typeof (r as any).json_schema.schema).toBe('object');
+  });
+
+  it('anthropic returns the _agentosUseToolForStructuredOutput marker plus tool shape', () => {
+    const r = buildResponseFormat({ provider: 'anthropic', schema, schemaName: 'X' });
+    expect((r as any)._agentosUseToolForStructuredOutput).toBe(true);
+    expect((r as any).tool.name).toBe('X');
+    expect(typeof (r as any).tool.input_schema).toBe('object');
+  });
+
+  it('anthropic: object schema input_schema carries a top-level type:"object" (no regression)', () => {
+    const r = buildResponseFormat({ provider: 'anthropic', schema, schemaName: 'X' });
+    expect((r as any).tool.input_schema.type).toBe('object');
+    expect(typeof (r as any).tool.input_schema.properties).toBe('object');
+  });
+
+  it('anthropic: a top-level discriminated union is merged into a flat object (Anthropic forbids top-level anyOf)', () => {
+    // Anthropic's tool input_schema must be a JSON Schema object and REJECTS a
+    // top-level anyOf/oneOf/allOf ("input_schema does not support … at the top
+    // level"). A discriminated union is therefore merged into one object:
+    // discriminant enum + variant fields optional, only always-required fields
+    // in `required`. The caller's Zod schema re-validates the exact variant.
+    const union = z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('freeform'), action: z.string() }),
+      z.object({ kind: z.literal('choice'), index: z.number() }),
+    ]);
+    const r = buildResponseFormat({ provider: 'anthropic', schema: union, schemaName: 'PersonaAction' });
+    const inputSchema = (r as any).tool.input_schema;
+    expect(inputSchema.type).toBe('object');
+    // No top-level union keyword — that was the Anthropic 400 source.
+    expect(inputSchema.anyOf).toBeUndefined();
+    expect(inputSchema.oneOf).toBeUndefined();
+    expect(inputSchema.allOf).toBeUndefined();
+    // Discriminant enum unions every variant's literal.
+    expect(inputSchema.properties.kind).toEqual({ enum: ['freeform', 'choice'] });
+    // Variant-specific fields are present and optional; only `kind` is required.
+    expect(inputSchema.properties.action).toEqual({ type: 'string' });
+    expect(inputSchema.properties.index).toEqual({ type: 'number' });
+    expect(inputSchema.required).toEqual(['kind']);
+  });
+
+  it('anthropic: a property two variants type differently keeps both schemas under a nested anyOf', () => {
+    // Keeping only the first variant's schema told the model that variant b's
+    // `value` is a string, and a reply that followed it failed the Zod check.
+    const union = z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('a'), value: z.string(), note: z.string() }),
+      z.object({ kind: z.literal('b'), value: z.number(), note: z.string() }),
+    ]);
+    const inputSchema = (buildResponseFormat({ provider: 'anthropic', schema: union, schemaName: 'X' }) as any)
+      .tool.input_schema;
+
+    expect(inputSchema.anyOf).toBeUndefined();
+    expect(inputSchema.properties.kind).toEqual({ enum: ['a', 'b'] });
+    expect(inputSchema.properties.value).toEqual({ anyOf: [{ type: 'string' }, { type: 'number' }] });
+    // The same schema in every variant stays a single schema.
+    expect(inputSchema.properties.note).toEqual({ type: 'string' });
+    expect(inputSchema.required).toEqual(['kind', 'value', 'note']);
+  });
+
+  it('anthropic: a shared enum property merges to the schema a plain enum of all its values gets', () => {
+    const union = z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('a'), mode: z.enum(['x']).describe('The mode') }),
+      z.object({ kind: z.literal('b'), mode: z.enum(['y']).describe('The mode') }),
+    ]);
+    const inputSchema = (buildResponseFormat({ provider: 'anthropic', schema: union, schemaName: 'X' }) as any)
+      .tool.input_schema;
+    const alone = (buildResponseFormat({
+      provider: 'anthropic',
+      schema: z.object({ mode: z.enum(['x', 'y']).describe('The mode') }),
+      schemaName: 'X',
+    }) as any).tool.input_schema;
+
+    // The lowering gives an enum no other fields, so this checks the merged values;
+    // the next test covers the fields the variants share.
+    expect(inputSchema.properties.mode).toEqual(alone.properties.mode);
+  });
+
+  it('anthropic: a merged enum keeps the fields every variant shares and drops the rest', () => {
+    const variant = (title: string, value: string) => ({
+      type: 'object',
+      properties: { mode: { type: 'string', description: 'The mode', title, enum: [value] } },
+      required: ['mode'],
+    });
+    const merged = ensureAnthropicObjectSchema({ anyOf: [variant('A', 'x'), variant('B', 'y')] });
+
+    expect(merged.properties).toEqual({ mode: { type: 'string', description: 'The mode', enum: ['x', 'y'] } });
+    expect(merged.required).toEqual(['mode']);
+  });
+
+  it('anthropic: a property only one variant has keeps its whole schema', () => {
+    const union = z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('a'), mode: z.enum(['x', 'y']) }),
+      z.object({ kind: z.literal('b') }),
+    ]);
+    const merged = (buildResponseFormat({ provider: 'anthropic', schema: union, schemaName: 'X' }) as any)
+      .tool.input_schema;
+    const alone = (buildResponseFormat({
+      provider: 'anthropic',
+      schema: z.object({ mode: z.enum(['x', 'y']) }),
+      schemaName: 'X',
+    }) as any).tool.input_schema;
+
+    expect(merged.properties.mode).toEqual(alone.properties.mode);
+    expect(merged.required).toEqual(['kind']);
+  });
+
+  it('gemini returns json_object with _gemini.responseSchema populated', () => {
+    const r = buildResponseFormat({ provider: 'gemini', schema, schemaName: 'X' });
+    expect((r as any).type).toBe('json_object');
+    expect(typeof (r as any)._gemini.responseSchema).toBe('object');
+  });
+
+  it('gemini-cli is treated like gemini', () => {
+    const r = buildResponseFormat({ provider: 'gemini-cli', schema, schemaName: 'X' });
+    expect((r as any).type).toBe('json_object');
+    expect(typeof (r as any)._gemini.responseSchema).toBe('object');
+  });
+
+  it('openrouter degrades to bare json_object (no enforcement available)', () => {
+    const r = buildResponseFormat({ provider: 'openrouter', schema, schemaName: 'X' });
+    expect(r).toEqual({ type: 'json_object' });
+  });
+
+  it('unknown provider degrades to bare json_object', () => {
+    const r = buildResponseFormat({ provider: 'fictional', schema, schemaName: 'X' });
+    expect(r).toEqual({ type: 'json_object' });
+  });
+
+  it('schemaName: replaces non-word chars with underscore', () => {
+    const r = buildResponseFormat({ provider: 'openai', schema, schemaName: 'a.b/c d!' });
+    expect((r as any).json_schema.name).toBe('a_b_c_d_');
+  });
+
+  it('schemaName: truncates to 64 chars', () => {
+    const long = 'a'.repeat(80);
+    const r = buildResponseFormat({ provider: 'openai', schema, schemaName: long });
+    expect(((r as any).json_schema.name as string).length).toBe(64);
+  });
+
+  it('schemaName: empty after sanitization falls back to "response"', () => {
+    const r = buildResponseFormat({ provider: 'openai', schema, schemaName: '!!!' });
+    expect((r as any).json_schema.name).toBe('response');
+  });
+});
+
+describe('buildResponseFormat for anthropic carries the route for the model it is built for', () => {
+  const schema = z.object({ city: z.string() });
+
+  it('json_schema on a model with the JSON output format, forced_tool on Claude Sonnet 4, none for a record, and by the schema alone without a model id', () => {
+    expect(buildResponseFormat({ provider: 'anthropic', modelId: 'claude-sonnet-5-5', schema, schemaName: 'place' })).toMatchObject({
+      _agentosUseToolForStructuredOutput: true,
+      route: 'json_schema',
+      tool: { name: 'place', input_schema: { type: 'object' } },
+    });
+    expect(buildResponseFormat({ provider: 'anthropic', modelId: 'claude-sonnet-4-20250514', schema, schemaName: 'place' })).toMatchObject({
+      route: 'forced_tool',
+    });
+    expect(
+      buildResponseFormat({
+        provider: 'anthropic',
+        modelId: 'claude-sonnet-5-5',
+        schema: z.object({ scores: z.record(z.string(), z.number()) }),
+        schemaName: 'place',
+      }),
+    ).toMatchObject({ route: 'none' });
+    // No model id (a fallback entry resolved later): the schema alone decides.
+    expect(buildResponseFormat({ provider: 'anthropic', schema, schemaName: 'place' })).toMatchObject({ route: 'json_schema' });
+  });
+
+  it('a record on a model that accepts a forced choice, and a record with no model id, take the forced tool', () => {
+    const recordSchema = z.object({ scores: z.record(z.string(), z.number()) });
+    expect(
+      buildResponseFormat({ provider: 'anthropic', modelId: 'claude-sonnet-4-6', schema: recordSchema, schemaName: 'place' }),
+    ).toMatchObject({ route: 'forced_tool', tool: { name: 'place' } });
+    expect(buildResponseFormat({ provider: 'anthropic', schema: recordSchema, schemaName: 'place' })).toMatchObject({
+      route: 'forced_tool',
+    });
+  });
+});

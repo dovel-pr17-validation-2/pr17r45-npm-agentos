@@ -1,0 +1,381 @@
+import { describe, it, expect, afterEach, vi } from 'vitest';
+
+const hoisted = vi.hoisted(() => ({
+  spawnSync: vi.fn((_cmd: string, _args?: string[]) => ({ status: 1 })),
+}));
+
+vi.mock('node:child_process', () => ({
+  spawnSync: hoisted.spawnSync,
+}));
+
+import { PROVIDER_DEFAULTS, autoDetectProvider } from '../provider-defaults.js';
+import { resolveModelOption, resolveProvider } from '../model.js';
+import { clearDefaultProvider, setDefaultProvider } from '../global-default.js';
+
+describe('PROVIDER_DEFAULTS', () => {
+  it('has text model for all major providers', () => {
+    for (const id of ['openai', 'anthropic', 'ollama', 'openrouter', 'gemini', 'requesty']) {
+      expect(PROVIDER_DEFAULTS[id]?.text).toBeDefined();
+    }
+  });
+
+  it('includes CLI providers with text defaults', () => {
+    expect(PROVIDER_DEFAULTS['claude-code-cli']?.text).toBe('claude-sonnet-4-6');
+    expect(PROVIDER_DEFAULTS['gemini-cli']?.text).toBe('gemini-3.5-flash');
+  });
+
+  it('has image model for image providers', () => {
+    for (const id of ['openai', 'stability', 'replicate', 'ollama']) {
+      expect(PROVIDER_DEFAULTS[id]?.image).toBeDefined();
+    }
+  });
+});
+
+describe('autoDetectProvider', () => {
+  const origEnv = { ...process.env };
+
+  afterEach(() => {
+    hoisted.spawnSync.mockReset();
+    hoisted.spawnSync.mockReturnValue({ status: 1 });
+
+    // Restore env after each test
+    for (const key of [
+      'OPENROUTER_API_KEY',
+      'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'GEMINI_API_KEY',
+      'GROQ_API_KEY',
+      'TOGETHER_API_KEY',
+      'MISTRAL_API_KEY',
+      'XAI_API_KEY',
+      'REQUESTY_API_KEY',
+      'OLLAMA_BASE_URL',
+      'STABILITY_API_KEY',
+      'REPLICATE_API_TOKEN',
+      'MINIMAX_API_KEY',
+    ]) {
+      if (origEnv[key] !== undefined) {
+        process.env[key] = origEnv[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+  });
+
+  it('detects openai from OPENAI_API_KEY', () => {
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    process.env.OPENAI_API_KEY = 'test';
+    expect(autoDetectProvider()).toBe('openai');
+  });
+
+  it('prefers openrouter over openai when both are set', () => {
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    process.env.OPENAI_API_KEY = 'openai-test';
+    expect(autoDetectProvider()).toBe('openrouter');
+  });
+
+  it('detects requesty from REQUESTY_API_KEY', () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.TOGETHER_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
+    delete process.env.XAI_API_KEY;
+    process.env.REQUESTY_API_KEY = 'requesty-test';
+    expect(autoDetectProvider()).toBe('requesty');
+  });
+
+  it('detects anthropic from ANTHROPIC_API_KEY', () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'test';
+    expect(autoDetectProvider()).toBe('anthropic');
+  });
+
+  it('skips providers without image defaults when detecting for image tasks', () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test';
+    process.env.STABILITY_API_KEY = 'stability-test';
+
+    expect(autoDetectProvider('image')).toBe('stability');
+  });
+
+  it('returns undefined when no keys set', () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.TOGETHER_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
+    delete process.env.XAI_API_KEY;
+    delete process.env.OLLAMA_BASE_URL;
+    delete process.env.STABILITY_API_KEY;
+    delete process.env.REPLICATE_API_TOKEN;
+    expect(autoDetectProvider()).toBeUndefined();
+  });
+
+  it('detects claude-code-cli from PATH when no API-key provider is configured', () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.TOGETHER_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
+    delete process.env.XAI_API_KEY;
+    delete process.env.OLLAMA_BASE_URL;
+
+    hoisted.spawnSync.mockImplementation((_cmd: string, args?: string[]) => ({
+      status: args?.[0] === 'claude' ? 0 : 1,
+    }));
+
+    expect(autoDetectProvider()).toBe('claude-code-cli');
+  });
+
+  const API_KEYS_BEFORE_MINIMAX = [
+    'OPENROUTER_API_KEY',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'GEMINI_API_KEY',
+    'GROQ_API_KEY',
+    'TOGETHER_API_KEY',
+    'MISTRAL_API_KEY',
+    'XAI_API_KEY',
+    'REQUESTY_API_KEY',
+  ];
+
+  it('ranks a MiniMax key with the other API keys for text, ahead of the CLIs and Ollama', () => {
+    for (const key of API_KEYS_BEFORE_MINIMAX) delete process.env[key];
+    process.env.MINIMAX_API_KEY = 'minimax-test';
+    process.env.OLLAMA_BASE_URL = 'http://localhost:11434';
+    // Both CLI binaries are on PATH.
+    hoisted.spawnSync.mockReturnValue({ status: 0 });
+
+    expect(autoDetectProvider('text')).toBe('minimax');
+    expect(autoDetectProvider()).toBe('minimax');
+    expect(resolveModelOption({}, 'text')).toEqual({ providerId: 'minimax', modelId: 'MiniMax-M3.1-Flash' });
+
+    // The API keys listed before it still come first.
+    process.env.REQUESTY_API_KEY = 'requesty-test';
+    expect(autoDetectProvider('text')).toBe('requesty');
+  });
+
+  it('keeps MiniMax after the other image providers', () => {
+    for (const key of API_KEYS_BEFORE_MINIMAX) delete process.env[key];
+    process.env.MINIMAX_API_KEY = 'minimax-test';
+    process.env.STABILITY_API_KEY = 'stability-test';
+    process.env.OLLAMA_BASE_URL = 'http://localhost:11434';
+
+    expect(autoDetectProvider('image')).toBe('ollama');
+    delete process.env.OLLAMA_BASE_URL;
+    expect(autoDetectProvider('image')).toBe('stability');
+    delete process.env.STABILITY_API_KEY;
+    expect(autoDetectProvider('image')).toBe('minimax');
+  });
+});
+
+describe('resolveModelOption', () => {
+  it('resolves provider-only for Gemini CLI to the model the CLI serves', () => {
+    expect(resolveModelOption({ provider: 'gemini-cli' }, 'text')).toEqual({
+      providerId: 'gemini-cli',
+      modelId: 'gemini-3.5-flash',
+    });
+  });
+
+  it('resolves provider-only to default text model', () => {
+    const result = resolveModelOption({ provider: 'openai' }, 'text');
+    expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o' });
+  });
+
+  it('resolves provider + explicit model override', () => {
+    const result = resolveModelOption({ provider: 'openai', model: 'gpt-4o-mini' }, 'text');
+    expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o-mini' });
+  });
+
+  it('keeps a gateway model id under the provider the caller named', () => {
+    expect(resolveModelOption({ provider: 'openrouter', model: 'openai/gpt-5.6-sol' }, 'text')).toEqual({
+      providerId: 'openrouter',
+      modelId: 'openai/gpt-5.6-sol',
+    });
+    expect(resolveModelOption({ provider: 'openrouter', model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'openrouter',
+      modelId: 'anthropic/claude-sonnet-5',
+    });
+  });
+
+  it('reads a vendor prefix as the provider when none is named, and drops one that repeats it', () => {
+    expect(resolveModelOption({ model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'anthropic',
+      modelId: 'claude-sonnet-5',
+    });
+    expect(resolveModelOption({ provider: 'anthropic', model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'anthropic',
+      modelId: 'claude-sonnet-5',
+    });
+  });
+
+  it('resolves legacy model string (backwards compat)', () => {
+    const result = resolveModelOption({ model: 'openai:gpt-4o-mini' }, 'text');
+    expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o-mini' });
+  });
+
+  it('resolves provider-only for image task', () => {
+    const result = resolveModelOption({ provider: 'stability' }, 'image');
+    expect(result).toEqual({ providerId: 'stability', modelId: 'stable-diffusion-xl-1024-v1-0' });
+  });
+
+  it('resolves provider-only for Claude Code CLI', () => {
+    const result = resolveModelOption({ provider: 'claude-code-cli' }, 'text');
+    expect(result).toEqual({ providerId: 'claude-code-cli', modelId: 'claude-sonnet-4-6' });
+  });
+
+  it('throws for unknown provider', () => {
+    expect(() => resolveModelOption({ provider: 'nonexistent' }, 'text')).toThrow(/unknown provider/i);
+  });
+
+  it('throws for provider without matching task model', () => {
+    expect(() => resolveModelOption({ provider: 'stability' }, 'text')).toThrow(/no default text model/i);
+  });
+
+  it('throws when neither provider nor model given and no env', () => {
+    const saved: Record<string, string | undefined> = {};
+    const keys = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'OLLAMA_BASE_URL'];
+    for (const k of keys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      expect(() => resolveModelOption({}, 'text')).toThrow(/required/i);
+    } finally {
+      for (const k of keys) {
+        if (saved[k] !== undefined) process.env[k] = saved[k];
+      }
+    }
+  });
+
+  it('uses task-aware auto-detection for plain image model names', () => {
+    const saved = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      STABILITY_API_KEY: process.env.STABILITY_API_KEY,
+    };
+
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test';
+    process.env.STABILITY_API_KEY = 'stability-test';
+
+    try {
+      expect(resolveModelOption({ model: 'stable-image-core' }, 'image')).toEqual({
+        providerId: 'stability',
+        modelId: 'stable-image-core',
+      });
+    } finally {
+      if (saved.ANTHROPIC_API_KEY === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = saved.ANTHROPIC_API_KEY;
+      }
+      if (saved.STABILITY_API_KEY === undefined) {
+        delete process.env.STABILITY_API_KEY;
+      } else {
+        process.env.STABILITY_API_KEY = saved.STABILITY_API_KEY;
+      }
+    }
+  });
+
+  it('resolves CLI providers without requiring API keys', () => {
+    expect(resolveProvider('claude-code-cli', 'claude-sonnet-4-6')).toEqual({
+      providerId: 'claude-code-cli',
+      modelId: 'claude-sonnet-4-6',
+    });
+    expect(resolveProvider('gemini-cli', 'gemini-2.5-flash')).toEqual({
+      providerId: 'gemini-cli',
+      modelId: 'gemini-2.5-flash',
+    });
+  });
+});
+
+describe('resolveProvider: an Anthropic call with no Anthropic key, sent to OpenRouter', () => {
+  afterEach(() => {
+    clearDefaultProvider();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  function withOnlyOpenRouterKey(): void {
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
+    vi.stubEnv('ANTHROPIC_BASE_URL', '');
+    vi.stubEnv('OPENROUTER_API_KEY', 'sk-or-test');
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  }
+
+  it('carries the OpenRouter base URL the environment sets, as a direct OpenRouter call does', () => {
+    withOnlyOpenRouterKey();
+    vi.stubEnv('OPENROUTER_BASE_URL', ' http://127.0.0.1:9/api/v1 ');
+
+    const remapped = resolveProvider('anthropic', 'claude-sonnet-4-5');
+    const direct = resolveProvider('openrouter', 'anthropic/claude-sonnet-4-5');
+
+    expect(remapped).toEqual({
+      providerId: 'openrouter',
+      modelId: 'anthropic/claude-sonnet-4-5',
+      apiKey: 'sk-or-test',
+      baseUrl: 'http://127.0.0.1:9/api/v1',
+      poolId: 'openrouter:OPENROUTER_API_KEY',
+    });
+    expect(remapped.baseUrl).toBe(direct.baseUrl);
+  });
+
+  it('carries no base URL when the variable is unset or blank, so the call goes to OpenRouter itself', () => {
+    withOnlyOpenRouterKey();
+    for (const value of ['', '   ']) {
+      vi.stubEnv('OPENROUTER_BASE_URL', value);
+      const remapped = resolveProvider('anthropic', 'claude-haiku-4-5-20251001');
+      expect(remapped).toEqual({
+        providerId: 'openrouter',
+        modelId: 'anthropic/claude-haiku-4-5',
+        apiKey: 'sk-or-test',
+        poolId: 'openrouter:OPENROUTER_API_KEY',
+      });
+    }
+  });
+
+  it('goes to the base URL a global default that names OpenRouter sets, as a direct OpenRouter call does', () => {
+    withOnlyOpenRouterKey();
+    vi.stubEnv('OPENROUTER_BASE_URL', '');
+    setDefaultProvider({ provider: 'openrouter', baseUrl: 'http://127.0.0.1:9/gateway/v1' });
+
+    const remapped = resolveProvider('anthropic', 'claude-sonnet-4-5');
+    const direct = resolveProvider('openrouter', 'anthropic/claude-sonnet-4-5');
+
+    expect(remapped).toEqual({
+      providerId: 'openrouter',
+      modelId: 'anthropic/claude-sonnet-4-5',
+      apiKey: 'sk-or-test',
+      baseUrl: 'http://127.0.0.1:9/gateway/v1',
+      poolId: 'openrouter:OPENROUTER_API_KEY',
+    });
+    expect(remapped).toEqual(direct);
+  });
+
+  it("sends a global default's OpenRouter key to that default's base URL, never OPENROUTER_API_KEY", () => {
+    withOnlyOpenRouterKey();
+    vi.stubEnv('OPENROUTER_BASE_URL', '');
+    setDefaultProvider({ provider: 'openrouter', apiKey: 'sk-or-default', baseUrl: 'http://127.0.0.1:9/gateway/v1' });
+
+    const remapped = resolveProvider('anthropic', 'claude-sonnet-4-5');
+    const direct = resolveProvider('openrouter', 'anthropic/claude-sonnet-4-5');
+
+    expect(remapped).toEqual({
+      providerId: 'openrouter',
+      modelId: 'anthropic/claude-sonnet-4-5',
+      apiKey: 'sk-or-default',
+      baseUrl: 'http://127.0.0.1:9/gateway/v1',
+    });
+    expect(remapped.poolId).toBeUndefined();
+    expect(remapped).toEqual(direct);
+  });
+});

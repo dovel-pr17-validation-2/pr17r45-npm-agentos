@@ -1,0 +1,323 @@
+# Cost Optimization
+
+What an AgentOS application spends is set by which model answers, how many tokens each call sends and receives, and how many calls a turn makes. This page lists the controls for each, and how to measure spend before changing anything.
+
+## Measure
+
+Every text call returns its usage:
+
+```typescript
+import { generateText } from '@framers/agentos';
+
+const result = await generateText({
+  provider: 'openai',
+  model: 'gpt-4o-mini',
+  prompt: 'Summarize the attached notes in three bullets.',
+});
+
+console.log(result.usage);
+// { promptTokens, completionTokens, totalTokens, costUSD?, cacheReadTokens?, cacheCreationTokens?, ... }
+```
+
+`usage` sums every step of the call, tool rounds included. `costUSD` is set when the provider reports or prices the call and is absent otherwise, so read an absent value as unknown. The cache fields are described in [Prompt Caching](../features/PROMPT_CACHING.md).
+
+An agent keeps a running total for itself and for each session:
+
+```typescript
+import { agent } from '@framers/agentos';
+
+const assistant = agent({ provider: 'openai', model: 'gpt-4o-mini' });
+const session = assistant.session('user-42');
+
+await session.send('What changed in the last release?');
+
+console.log(await session.usage());   // this session
+console.log(await assistant.usage()); // every call this agent made
+// { promptTokens, completionTokens, totalTokens, costUSD, calls }
+```
+
+These totals live in process memory. To keep them across restarts, turn on the usage ledger, an append-only JSONL file:
+
+```typescript
+const assistant = agent({
+  provider: 'openai',
+  model: 'gpt-4o-mini',
+  usageLedger: { enabled: true }, // ~/.framers/usage-ledger.jsonl
+  // usageLedger: { enabled: true, path: './usage.jsonl' },
+});
+```
+
+`generateText()` and `streamText()` take the same `usageLedger` option. Setting `AGENTOS_USAGE_LEDGER_PATH` makes every helper call write to that file without a code change. With `enabled: true`, `usage()` returns the ledger's totals instead of the in-memory tally: a session's total covers the events recorded under its session id, and the agent's total covers every event in the file. Set `enabled: true` whenever a ledger path is in effect, by option or by environment variable, so the in-memory tally and the ledger are not added together.
+
+[`getRecordedAgentOSUsage()`](https://github.com/framerslab/agentos/blob/master/src/api/runtime/usageLedger.ts) reads the same file outside an agent, and `readRecordedAgentOSUsageEvents()` returns the individual events, each with its provider, model, source and session id.
+
+## Limit one call
+
+| Option | Where | Effect |
+|--------|-------|--------|
+| `maxTokens` | `generateText()`, `streamText()`, `agent()`, `session.send()` | Caps the completion tokens of each model call. |
+| `maxSteps` | `generateText()`, `streamText()`, `agent()` | Caps the model calls of one tool loop. `generateText()` and `streamText()` default to 1; `agent()` defaults to 5. |
+| `effort` | `generateText()`, `streamText()`, `agent()` | Reasoning depth on models that take it. Lower levels spend fewer reasoning tokens. |
+| `thinking` | `generateText()`, `streamText()`, `agent()` | `false` turns extended thinking off on Claude models that allow it ([LLM Providers](../features/LLM_PROVIDERS.md#anthropic)). |
+| `history` | `agent()` | Bounds what a session resends on every turn. The default keeps about 120,000 estimated tokens; `history: { maxTokens: 20_000 }` keeps less, and `history: false` keeps none. |
+
+A session sends its whole kept history with each `send()`, so `history.maxTokens` is the main control on the input side of a long conversation.
+
+## Limit a run
+
+`agency()` checks the limits in `controls` against each run:
+
+```typescript
+import { agency } from '@framers/agentos';
+
+const team = agency({
+  provider: 'openai',
+  model: 'gpt-4o-mini',
+  agents: {
+    researcher: { instructions: 'Find the facts.' },
+    writer: { instructions: 'Write the summary.' },
+  },
+  controls: {
+    maxCostUSD: 0.25,
+    maxTotalTokens: 100_000,
+    maxDurationMs: 60_000,
+    maxAgentCalls: 8,
+    onLimitReached: 'error',
+  },
+  on: {
+    limitReached: (e) => console.warn(`${e.metric}: ${e.value} > ${e.limit}`),
+  },
+});
+```
+
+`agency()` compares a run's own totals with the limits when the run ends, and the agency's cumulative token and cost totals with them before each run starts. A breach calls `on.limitReached`; with `onLimitReached: 'error'` it throws an `AgencyConfigError` instead, so an agency whose cumulative cost has passed `maxCostUSD` refuses further runs. No limit interrupts a run in progress.
+
+`agent()` reads two of these fields and applies them to each model call: `controls.maxTotalTokens` becomes `maxTokens` when the agent sets none, and `controls.maxDurationMs` becomes the request timeout. It does not read `maxCostUSD`; its `budget` option caps its spend ([A spend budget for a run of calls](#a-spend-budget-for-a-run-of-calls)).
+
+## Budget across calls
+
+[`CostGuard`](https://github.com/framerslab/agentos/blob/master/src/safety/runtime/CostGuard.ts) keeps a per-key spend total for the session and the day and answers whether an operation fits. Given a `budget` ([A spend budget for a run of calls](#a-spend-budget-for-a-run-of-calls)), `generateText()`, `streamText()`, `generateObject()` and `embedText()` check each provider call against it before the call is sent and record the call's cost in it afterwards, and `agent()` does the same for the calls of its `generate()`, `stream()` and sessions. Without one, the host calls the guard itself, checking before a call and recording after it:
+
+```typescript
+import { agent, CostGuard } from '@framers/agentos';
+
+const guard = new CostGuard({
+  maxSessionCostUsd: 1.0,          // default 1.00
+  maxDailyCostUsd: 5.0,            // default 5.00
+  maxSingleOperationCostUsd: 0.5,  // default 0.50
+});
+
+const assistant = agent({ provider: 'openai', model: 'gpt-4o-mini' });
+
+const ESTIMATED_COST_USD = 0.01; // a conservative estimate for one call
+
+async function ask(userId: string, prompt: string): Promise<string> {
+  const check = guard.canAfford(userId, ESTIMATED_COST_USD);
+  if (!check.allowed) throw new Error(check.reason);
+
+  const result = await assistant.generate(prompt);
+  // An absent costUSD means the cost is unknown, not zero: record the estimate.
+  guard.recordCost(userId, result.usage.costUSD ?? ESTIMATED_COST_USD);
+  return result.text;
+}
+```
+
+`canAfford()` and `recordCost()` are separate calls, so two calls for one key that run at the same time can both pass the check before either records its cost. When a cap must hold exactly, run one call per key at a time. `getSnapshot(key)` returns the current totals and whether a cap is reached, `resetSession(key)` clears the session total, and the daily total resets at local midnight. The totals are in process memory. [Safety Primitives](./SAFETY_PRIMITIVES.md) covers the guard with the circuit breaker and the stuck detector.
+
+## A spend budget for a run of calls
+
+`generateText()`, `streamText()`, `generateObject()`, `embedText()` and `agent()` take a `budget`: a cap in US dollars, and optionally in tokens, on the provider calls they make. Before each provider call, the budget prices the call at the model's listed rates, counting one prompt token for every four characters of its messages and of the tool definitions it sends (of an embedding, its input) and the call's `maxTokens` of output, held to the model's output ceiling where a lower one is known (16,384 tokens for `gpt-4o`, as the request is sent), or 4,096 when the call sets none or sets `NaN` (an embedding has no output), and refuses the call when that estimate would take what the budget has spent past `maxCostUSD`. After the call, it records the cost the provider reported, or else (when it reports none, or one that is not a number zero or more) the call's tokens at the listed rates: a stream is charged what its chunks reported, and a request that fails is charged what its error reports it was billed. A refused call is never sent. It is not tried on a fallback provider or in another `generateObject()` attempt, and it does not count against the provider's health. The check uses the estimate and the record uses the reported cost, so a call that costs more than its estimate can take the total past `maxCostUSD`, and every later call is then refused. One such call is a prompt of more than 272,000 tokens on an OpenAI model with a 1,050,000-token context window: OpenAI bills the whole call at twice the input rate and one and a half times the output rate, which the cost `OpenAIProvider` reports carries, while the estimate uses the model's listed row.
+
+Pass one `SpendBudget` to every call that should share it. Settings in its place (`budget: { maxCostUSD: 0.25 }`) make a budget for that one call, its steps, `generateObject()` attempts and fallback hops included. On `agent()` they make one budget that the agent and all its sessions share, and a `budget` passed to the agent's `generate()` or `stream()`, or to a session's `send()` or `stream()`, replaces it for that call; settings passed there make one budget for the call, the validation retries of a `generate()` or `send()` with a `responseSchema` included. `spentUSD()` reads the dollars spent under the budget's id, and `tokensUsed()` the tokens it has counted. A `maxCostUSD` or a `maxTotalTokens` below zero, or one that is not a number, throws a `RangeError`.
+
+```ts
+import { agent, SpendBudget, CostCapExceededError } from '@framers/agentos';
+
+const budget = new SpendBudget({ maxCostUSD: 0.25, onLimitReached: 'throw' });
+const helper = agent({ provider: 'openai', model: 'gpt-6-luna', budget });
+const session = helper.session('call-42');
+session.recordExternalCost(0.003, { kind: 'stt' }); // a minute of speech-to-text billed outside AgentOS
+try {
+  await session.send('Summarise the last ten minutes.');
+} catch (error) {
+  if (error instanceof CostCapExceededError) {
+    // the run is out of budget: the call was refused before it was made
+  }
+}
+```
+
+`session.recordExternalCost(usd, { kind })` charges a cost made outside AgentOS, such as speech-to-text billed by the minute, to the agent's budget. A cost of zero or below records nothing, and a cost that is not a number throws a `RangeError`, since a cost left uncounted would let the run spend past its cap. On an agent without a budget the call does nothing. A refusal rejects a call to `generateText()`, `generateObject()`, `embedText()`, an agent's `generate()` or a session's `send()` with its error; a stream from `streamText()` or from an agent ends its `fullStream` with an `error` part that carries it.
+
+**On a GMI.** `agent({ runtime: 'gmi' })` and `gmi()` take the same `budget` and check every completion call their GMIs make against it ([GMIs from agent()](../GMI.md#gmis-from-agent)): the completion gateway checks each step before it is sent, a fallback hop's at the output cap that hop sends, and the GMI's provider manager checks each metaprompt call against the budget of the turn that queued it, whenever the call runs; the budget records each finished step, each attempt that failed and was billed, and each metaprompt call. A refused step is not sent or tried on a fallback hop, and it ends the turn: the agent's `generate()` and a session's `send()` reject with the GMI's error, whose code is `LLM_PROVIDER_ERROR` and whose message carries the budget's, in place of `CostCapExceededError` or `UnpricedModelError`, and a stream ends with an `error` part that carries it. A refused metaprompt leaves the turn's reply as it is, and is warned about on the console with its id and the refusal. The `SpendLimitInfo` an `onLimitReached` function receives names the call `gmi.step` or `gmi.metaprompt`. The calls the agent's cognitive memory makes to its embedding model are not checked or counted. A member seated in a team is held to its own budget beside the one its team's call carries, where a send's `budget` would replace it, and a call charges the total the two keep on one guard and one `budgetId` once ([GMIs from agent()](../GMI.md#gmis-from-agent)). On the full runtime, each completion call the GMI of a `launch_agency` seat makes, its steps and its persona's metaprompts alike, is checked against the launch's budget before it is sent and charged to that budget after, an attempt that failed at what its error reports it was billed, and a step of a turn that has already stopped is not sent.
+
+**The shared guard.** A budget keeps its dollar total in a [`CostGuard`](https://github.com/framerslab/agentos/blob/master/src/safety/runtime/CostGuard.ts) under its id: `budgetId`, or one it makes when none is given. Without a `guard` option, the budget makes its own guard, capped only by `maxCostUSD`. Given a `guard`, it sets the session cap the guard holds for its id to `maxCostUSD` and keeps the id's daily cap: one set for that id with `setAgentLimits()`, or else the guard's own. The guard's other caps apply to its calls too: `maxSingleOperationCostUsd` to each call's estimate, and the daily cap to the id's total for the day, which resets at the process's local midnight (a `new CostGuard()` caps a call at 0.50 US dollars and a day at 5.00). Budgets made on one guard with one `budgetId` share one total, so a run split across several calls or several agents stops at one cap. As with a guard called by hand, the check and the record are separate steps: two calls that run at the same time can both pass the check before either records its cost. A guard keeps the limits and totals of every id it has seen, and a record of each cost under an id until `resetSession()` clears that id, so its memory grows over a long run on one budget and with every new id on a shared guard. The guard's totals live in process memory; [a day's bound](#a-days-bound-across-processes) holds a cap across processes.
+
+**`parent`** makes a budget draw on another. Every check asks the parent first, with the same estimate, and every record and outside cost is added to the parent after the budget itself, so a call is held to the caps of every budget above it; `remaining()` reports what is left under the budget's own caps. A refusal by the parent, or by any budget above it, runs the budget's own `onLimitReached` function with the refusing budget's `SpendLimitInfo` before the error goes on. A budget given a `guard` and a `budgetId` that a budget in its parent chain also keeps its spending under throws `RangeError`: the two would keep one total and charge every call to it twice.
+
+**`meter`** and **`accountId`** hold a budget's calls in a persisted [spend meter](./SAFETY_PRIMITIVES.md#spend-meter), which several processes share and which concurrent calls cannot pass together, as they can pass an in-memory check. Name the call, and the budget reserves the most it can cost before it is sent and settles it at what it cost after it:
+
+```ts
+const budget = new SpendBudget({ maxCostUSD: Number.POSITIVE_INFINITY, meter, accountId });
+
+// Reserves estimateMaxCallCostUSD() in micro-dollars, behind a fence. A refusal sends nothing.
+await budget.assertCanSpend('proxy.call', { providerId, modelId, request: { messages, tools, maxOutputTokens: 1024 }, operationId });
+
+let response;
+try {
+  response = await provider.generateCompletion(modelId, messages, { tools, maxTokens: 1024 });
+} catch (error) {
+  // A provider's own 4xx refusal before any output frees the reservation. A timeout, a 5xx or a broken stream settles nothing yet.
+  if (refusedBeforeOutput(error)) await budget.record(undefined, 0, 'proxy.call', { operationId, outcome: 'released' });
+  throw error;
+}
+await budget.record(costOfUsageUSD(providerId, modelId, response.usage), response.usage?.totalTokens ?? 0, 'proxy.call', { operationId });
+```
+
+The budget's own caps are checked first, at the call's largest cost, and then the meter. A meter's refusal runs `onLimitReached` with `capType: 'usd'` and the meter's word as the `reason` (`allowance_exhausted`, `in_flight`, `already_consumed` or `retries_exhausted`), and throws `CostCapExceededError` with the `capType` `session`, the budget's own numbers and a message that names the meter's word. A model with no price row, or a request `estimateMaxCallCostUSD()` returns `undefined` for, is refused with `UnpricedModelError`, since a meter cannot hold a cost nothing bounds. A call whose largest cost is zero, on a row the host priced at nothing, holds nothing. A store that cannot answer rejects with `SpendMeterUnavailableError`, and the call does not run. `'warn'` runs a refused call with nothing held for it in that meter, and its settle there finds no reservation of its own; give every call its own operation id, since a settle under an id another call holds settles that call's reservation.
+
+`record()` charges the budget's caps at once and returns a promise for the settle, which runs even when the charge throws (a guard's `onCapReached` function), the promise then rejecting with what it threw; every other budget the call is held to still counts it. The cost is settled in whole micro-dollars, the meter holding it to the reservation and freeing the rest; a finished call whose cost is not known (no usage and no price) takes its whole reservation. A settle that fails rejects, and the reservation stays held, behind its fence, until a later `settle()` or a `reconcile()` with `resolveExpired` settles it ([Settlement](./SAFETY_PRIMITIVES.md#settlement)).
+
+A budget with a `parent`, or a call held to two budgets, reserves in every meter above it, once for each meter and account, and settles in each. A meter's refusal goes to every budget that names that meter and account, each deciding by its own `onLimitReached`. When the call is refused, or a meter cannot answer, what the others hold is freed. One operation id holds one reservation in a meter, so a call that two accounts would hold on one meter is refused.
+
+The generation helpers make these two calls themselves. On a budget with a meter, `generateText()`, `streamText()`, `generateObject()`, `embedText()`, `agent()`, `gmi()` and a launched team's seats reserve each provider call's largest cost before the provider is called, under an operation id of the call's own that covers the provider's retries of it, and settle the reservation when the call ends, by how it ended ([Settlement](./SAFETY_PRIMITIVES.md#settlement)). The provider sends that id in its operation id header when one is named (`AGENTOS_OPERATION_ID_HEADER`, or the provider's `operationIdHeader`), on every attempt of the call; `embedText()` sends its own requests and puts the id on each of them, as the paragraph after the table says. So a proxy's record of the call and the meter's reservation carry one id, which a `resolveExpired` can match:
+
+| How the call ended | The reservation |
+|---|---|
+| It answered | Consumed at what its usage cost, the rest freed; at its whole reservation when it reported no usage, or a usage that names only a total and no cost |
+| It answered after an earlier attempt of it that may have been billed: one that got no answer, or one that answered and was sent again | Held and counted until a `reconcile()` with `resolveExpired` decides it from evidence: its usage counts its last request alone |
+| It was never sent: its signal fired while the reservation was made or before its stream was read, the provider failed before building its request (`PROVIDER_NOT_INITIALIZED`, `INIT_FAILED_MISSING_API_KEY`, `API_KEY_MISSING`), or it was refused before its request was built | Freed |
+| The provider itself refused it before any output: a 4xx on every attempt it reported (a bad request, a refused key or model, a rate limit), a 408 aside | Freed, or consumed at what an error that reports its bill says it cost |
+| Its request went out and no usage came back: a timeout, a 5xx (a gateway or the provider can answer one after the model ran), a dropped connection, a stream stopped or left after it was sent | Held and counted until a `reconcile()` with `resolveExpired` decides it from evidence; usage the provider reports after the stop settles it at that |
+
+One operation holds one reservation, the bound of one request: when the provider retried a call after an attempt that may have been billed and both attempts were billed, a reconcile settles the call at most at that one reservation, so the bill of the other attempt is not counted. A call where that matters sets `maxAttempts: 1`, so the provider sends it once.
+
+`embedText()` reserves once for its whole request, whatever the number of batches, at the model's input rate, and a request that fails after earlier batches answered settles at what those batches were billed. Every request it sends for the call carries that reservation's id in the header `AGENTOS_OPERATION_ID_HEADER` names, a name read once before the reservation is made, so a change to the variable during the call moves no header: each batch to an OpenAI-compatible endpoint (OpenAI, OpenRouter, Mistral, Requesty or a base URL you set), the request to Ollama's `/api/embed`, and each batch and retry of Gemini's `batchEmbedContents`. A name the providers refuse rejects with a `RangeError` before anything is reserved or sent. With the variable unset, or with no reservation (no budget, or a budget without a meter), its requests carry no header. A batch whose answer omits its token count is charged at the bound of its inputs, and a request whose answers count no tokens at all takes its whole reservation. While a call's request runs, its hold renews the reservation's lease in every meter (`heartbeat()`) at a third of the shortest lease the meters gave it, so a reconcile never asks `resolveExpired` about a call still running; the renewals stop when the call settles or is held for a reconcile, and when a stream's reader has held one chunk for a whole lease.
+
+The bound counts what the request sends, `customModelParams` included, since the provider spreads those fields onto its request after its own: their text is counted as input; a structured-output format among them (`response_format`, `output_config`) counts as `responseFormat` does, as one more tool definition; an output cap among them (`max_tokens`, `max_completion_tokens`, `max_output_tokens`) counts beside `maxTokens`, the larger of the two bounding the output; and on Gemini a `generationConfig` replaces the one the provider builds, so its `maxOutputTokens` is the call's cap and its `candidateCount` the number of completions, while a `generation_config` goes beside the provider's, whose cap still counts. A call that names no output cap, one whose fields send a cap that is not a number zero or more, one whose fields name a model of their own (`model`, `models`) or draw in what the request does not carry (a stored prompt, conversation or `cachedContent`), a Gemini call whose generation config asks for output other than text (a `responseModalities` naming anything but text, or a `speechConfig`), which the bound would price at the text rate, or one `estimateMaxCallCostUSD()` cannot bound otherwise, is refused with `UnpricedModelError` before it is sent. A meter that cannot answer refuses the call with `SpendMeterUnavailableError` before it is sent; the helpers count that against no provider's health and try no fallback for it. A settle the meter cannot answer is logged, and the reservation stays held, its lease no longer renewed, until a reconcile settles it, while the call's answer or error goes on as it would. Under `'warn'` a call the meter refused runs, and the meter does not count it. `accountId` without a `meter` holds nothing and stays on `budget.options` for the host to read; with or without one, it names the account on the call's [usage events](../observability/OBSERVABILITY.md#the-usage-observer). A `meter` without an `accountId` throws `RangeError`.
+
+**`maxTotalTokens`** caps the prompt and completion tokens the budget counts. A call is refused with `CostCapExceededError` when the tokens counted so far plus its estimate (its prompt and its `maxTokens` of output, counted as above) would pass the cap. The guard has no cap type for tokens, so that error's `capType` is `session` and its message names the token cap and the token counts. After the call the tokens the provider reported are counted; a count reported as `NaN` counts as none. Each `SpendBudget` instance keeps its own count, so budgets that share a guard and a `budgetId` share their dollars but not their tokens. It is separate from `controls.maxTotalTokens`, which `agent()` applies as each call's `maxTokens` when the agent sets none.
+
+**`onLimitReached`** decides what the budget does with a call it would refuse. `'throw'`, the default, refuses it: with `CostCapExceededError` at a cap, and with `UnpricedModelError` for a model with no price row. At one of the guard's caps the error names the cap that refused the call in `capType` (`session`, `daily` or `single_operation`) and carries that cap's numbers in `currentCost` and `limit`: the id's total for the session or the day, or the call's estimate at `single_operation`, and the cap. `'warn'` logs a warning and lets the call run, and the budget records the call afterwards as usual. A function is called with a `SpendLimitInfo` (the budget's id; the cap, one of `session`, `daily`, `single_operation`, `tokens`, `unpriced` and `usd`, the last a budget's spend meter; the call, such as `generate_text.step`, `stream_text` or `embed_text`; and the reason), and the call is then refused as with `'throw'`. A function that throws refuses the call with what it throws, an error or any other value, and the budgets that draw on that budget hear of the refusal as of any other: each one's own function runs with the refusing budget's `SpendLimitInfo`.
+
+**`unpriced`** decides what happens to a call on a model with no price row. The rows are OpenAI's, the table `OpenAIProvider` prices its calls with (a dated snapshot without a row of its own takes its base model's), Anthropic's catalog, and a table the host registers for any other provider with `registerModelPricing()` ([Pricing a call before it is sent](./SAFETY_PRIMITIVES.md#pricing-a-call-before-it-is-sent)), so a call to a provider with no table, or to a model its table does not price, has no estimate. `'refuse'`, the default, refuses it before it is sent with `UnpricedModelError`, which names the provider and the model, because its cost could not be counted. `'allow'` lets it run and checks it as costing nothing: the token cap still applies, a budget already past `maxCostUSD` still refuses it, and a cost the provider reports for it is recorded after the call. A budget with a `meter` refuses it either way.
+
+**`hookErrors`** decides what an error thrown by `onBeforeGeneration`, `onAfterGeneration` or `onBeforeToolExecution` does, on `generateText()` and `streamText()` and, per call, on an agent's `generate()` and `stream()`. `'warn'`, the default, logs it and the call goes on. `'throw'` ends the call with that error, so a guard written as a hook can stop a call, and a tool whose `onBeforeToolExecution` hook throws does not run. A call a hook stops, like one the budget refuses, is not tried on a fallback provider and does not count against the provider's health.
+
+## A day's bound across processes
+
+A budget and a `CostGuard` keep their totals in one process's memory. To hold a day's spending under a cap across processes and restarts, a service reserves each admission's largest cost before it starts and settles it once its use is known, in a store it keeps on its own tables. `reserveSpend(store, admission)` has the store lock the UTC day the admission starts in and read that day's committed total, its open reservations plus its settled ones. When the total plus the admission's `micro` would pass its `capMicro`, it throws `CostCapExceededError` with the cap type `daily` and reserves nothing; otherwise it records the reservation and returns its id. `releaseSpend(store, id, settledMicro, at)` settles a reservation once, at what its use cost and never above the amount reserved, and returns `false` when the reservation is already settled or unknown. `releaseExpiredSpend(store, at)` settles, at its whole amount, each open reservation whose time is up at `at`, since its use was never confirmed, and returns how many it settled; a service runs it on a timer. A reservation made with `requireFence: true` is left to a sweep given a resolver, `releaseExpiredSpend(store, at, { resolve })`, which settles it as the host decides and may defer it, still open and counted, until its work has stopped ([Deferred expiry](./SAFETY_PRIMITIVES.md#deferred-expiry)). The store is a `SpendDayStore`, four methods that each run inside the caller's transaction:
+
+- `lockDay(day)` makes the day's row when it is missing, locks it for the transaction and returns the committed total. The lock is what keeps two admissions in different processes from reading the same total.
+- `addReservation(reservation)` records a reservation, adds its amount to the day's open total and returns its id.
+- `settleReservation(id, settledMicro, at)` settles an open reservation once: it takes the reservation's amount off the open total and adds what it settled at, held to that amount, to the settled total. It returns `false`, changing nothing, for a reservation already settled or unknown.
+- `expiredReservations(at)` lists the open reservations whose time is up.
+
+A store that holds fenced reservations also sets `fencedReservations: true` and implements `addFencedReservation(reservation)`, which records a reservation made with `requireFence`, and `deferReservation(id, retryAt, evidence)`, which keeps a deferred reservation's next check and evidence; its `expiredReservations` leaves a deferred reservation out until that check comes. `reserveSpend` refuses an admission with `requireFence` on any other store, and `releaseExpiredSpend` refuses a resolver there.
+
+An admission can also be bound to an operation that may run more than once under one reservation, such as a request a client sends again after a lost answer. The operation keeps one row, which a process finds again by the operation's name after a restart; the row holds a recorded figure, the runs begun and a lease that one run holds at a time. `reserveOperationSpend(store, admission)` admits it under the day's cap as `reserveSpend` does, with three more fields: `operation`, its name, unique among the store's reservations; `runMicro`, the first run's bound, at most `micro`; and `leaseUntil`, when the first run's lease ends. It records the row with the first run counted and holding the lease, and returns `{ status: 'reserved', id, run: 1 }`, or `{ status: 'in_flight' }`, reserving nothing, when the operation has a row already. The recorded figure is what the row settles at: each ended run's settled figure plus each other run's whole bound, so a run that a process lost counts whole.
+
+- `beginOperationRun(store, id, { runMicro, leaseUntil, maxRuns, at })` returns `{ status: 'gone' }` for a settled row or one whose time is up, then `{ status: 'in_flight', leaseUntil }` while another run's lease is live, then `{ status: 'gone' }` once the row has had `maxRuns` runs or the run's bound would take the recorded figure past `micro`. Otherwise it adds the run's bound to the recorded figure, gives the run the lease and returns `{ status: 'begun', run }`. Run numbers only grow, so a run's number is a fencing token.
+- `endOperationRun(store, id, { run, settledMicro, at, close })` writes the run's settled figure on the run's own row, held to its bound. When the run still holds the lease, that figure takes the place of the run's bound in the recorded figure, the lease is cleared, and the row settles in the same step when its time is up or `close` is set. A run whose lease passed to a later run changes neither the lease nor the recorded figure. It returns `{ holder, settled }`; a figure that is not a finite number, zero or more, settles the run at its whole bound.
+- `renewOperationRun(store, id, { run, leaseUntil, at })` moves the lease forward only for the run that holds it while it is live, and returns `false` otherwise, so a run can settle what it holds elsewhere before another run may begin.
+- `releaseExpiredSpend(store, at)` settles an operation's row once its time is up and no run holds a live lease, at its recorded figure.
+
+A store that holds operation reservations sets `operationReservations: true` and implements `addOperationReservation(row)`, `openOperationReservation(operation)`, `beginRun(id, run)`, `endRun(id, end)` and `renewRun(id, renew)`, each in one locked step of the caller's transaction; its `expiredReservations` lists an operation's row at its recorded figure, and only once no run holds a live lease. `reserveOperationSpend` and the three run functions refuse any other store with an `Error`. `reserveOperationSpend` throws a `RangeError` for an admission with `requireFence`, since the runs' lease fences the row, and each of the four throws one for an amount that is not whole micro-dollars, a run number or run count that is not a whole number from 1, or a time that is not a valid date.
+
+```ts
+import { InMemorySpendDayStore, beginOperationRun, endOperationRun, reserveOperationSpend } from '@framers/agentos';
+
+const store = new InMemorySpendDayStore();
+const at = new Date();
+const after = (seconds: number) => new Date(at.getTime() + seconds * 1000);
+const admitted = await reserveOperationSpend(store, {
+  kind: 'answer',
+  operation: 'answer:7d1f0c', // the client's id for the request, sent again with a retry
+  micro: 6_000, // two runs of at most 3,000 micro-dollars each
+  runMicro: 3_000,
+  at,
+  expires: after(600), // a retry is admitted for ten minutes
+  leaseUntil: after(45),
+  capMicro: 60_000_000,
+});
+if (admitted.status === 'reserved') {
+  // ... the first run's answer cost 800 micro-dollars ...
+  await endOperationRun(store, admitted.id, { run: 1, settledMicro: 800, at: after(20), close: false });
+  // A retry inside the window begins run 2, which takes the lease: the row now records 800 plus 3,000.
+  const retry = await beginOperationRun(store, admitted.id, { runMicro: 3_000, leaseUntil: after(90), maxRuns: 2, at: after(30) });
+  if (retry.status === 'begun') {
+    // The retry cost 700; with close, the row settles now at 1,500.
+    await endOperationRun(store, admitted.id, { run: retry.run, settledMicro: 700, at: after(60), close: true });
+  }
+}
+```
+
+`InMemorySpendDayStore` keeps the rows in memory, fenced and operation reservations included, and takes no lock, so two admissions awaited at the same time can both read the same total: it is for tests and for a process that admits one reservation at a time.
+
+Each admission names its own cap in `capMicro`: the whole day's limit, or a share of it for one class of admission. Every admission is checked against the same committed total, so an admission of a class given a lower cap (sessions on a free plan, say) is refused once it would take the day's total past that share, while admissions given the whole limit are admitted until the total would pass the limit.
+
+```ts
+import { InMemorySpendDayStore, minutesMicro, openAITranscriptionPricing, releaseSpend, reserveSpend, toMicro } from '@framers/agentos';
+
+const store = new InMemorySpendDayStore(); // a service implements SpendDayStore on its own tables, locking the day's row
+const usdPerMinute = openAITranscriptionPricing('gpt-4o-mini-transcribe');
+if (usdPerMinute === undefined) throw new Error('no price for the transcription model');
+const at = new Date();
+const id = await reserveSpend(store, {
+  kind: 'session',
+  micro: minutesMicro(3600, toMicro(usdPerMinute)), // an hour, the most the session can run
+  at,
+  expires: new Date(at.getTime() + 3_600_000),
+  capMicro: 60_000_000, // 60 US dollars a day; a CostCapExceededError ('daily') past it, with nothing reserved
+});
+// ... the session ends after 754 seconds ...
+await releaseSpend(store, id, minutesMicro(754, toMicro(usdPerMinute)), new Date());
+```
+
+Amounts are whole micro-dollars, millionths of a US dollar. `toMicro(usd)` converts dollars, rounded to the micro-dollar. `minutesMicro(seconds, microPerMinute)` prices seconds at a rate per minute, and `tokensMicro(promptTokens, outputTokens, price)` prices tokens at a price row in US dollars per 1,000 tokens, both rounding up. `minutesMicro` throws a `RangeError` for a rate that is not a whole number of micro-dollars, zero or more, such as a price in US dollars passed in its place. `settledTokensMicro()` returns what a finished call settles at: its reported tokens at the price, never above its reservation, and the whole reservation when a count is missing or is not a whole number. In the example, the hour reserves 180,000 micro-dollars (0.18 US dollars), and the release settles the session at 37,700 for its 754 seconds, so the rest of the reservation leaves the day's total. `reserveSpend` throws a `RangeError` for an amount that is not a whole number of micro-dollars, zero or more, and for a start or an expiry that is not a valid date. It refuses every admission while the store returns a committed total that is not a whole number of micro-dollars, zero or more, since the day's spending is then not known, and it refuses an admission whose cap is not a whole number of micro-dollars, zero or more, such as `NaN` or infinity. A cost that is not a finite number, zero or more, settles the whole reservation in `releaseSpend`, as an expired one does, since the cost was never known; any other cost is rounded down to the micro-dollar.
+
+`openAITranscriptionPricing(model)` returns the price per minute of audio, in US dollars, that [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing) lists for five transcription models: `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `gpt-transcribe`, `gpt-realtime-whisper` and `gpt-live-transcribe`. For `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`, which OpenAI prices by token, it is the page's estimated cost of a minute. A dated snapshot without a row of its own takes its base model's, and any other model returns `undefined`. `openAIModelPricing(model)` returns the row, in US dollars per 1,000 tokens, that a budget estimates with. Both read only their tables' own rows, so a model named after a property every object inherits, such as `constructor`, has none. `OPENAI_MODEL_PRICING`, each of its rows and `OPENAI_TRANSCRIPTION_PRICING` are frozen, so a caller cannot change the prices that `OpenAIProvider` and the spend budgets use. `deepgramStreamingPricing(model)` returns the price per minute of streamed audio, in US dollars, that [Deepgram's pricing page](https://deepgram.com/pricing) lists for `nova-3` in one language, pay as you go: the regular price, 0.0077, and not the lower price the page shows for a limited time, so a reservation priced from it still covers its minutes when the offer ends. `deepgramPreRecordedPricing(model)` returns the price per minute of pre-recorded audio from the same page, 0.0043 for `nova-3`, for a batch request; a streamed session is never priced from it. A row covers a request only while the request turns on no add-on: Deepgram bills diarization, key terms and its other add-ons a minute on top of the row, and `DeepgramStreamingSTT` turns on diarization (`diarize_model`, or the legacy `diarize`) and, on Nova-3, `keyterm` from `providerOptions`, which a reservation priced from the row alone does not cover; [Speech providers](../features/SPEECH_PROVIDERS.md#a-speech-to-text-chain-from-entries) gives diarization's streaming add-on and the voice pipeline's price lookup that adds it to a row. Neither row establishes the price of a request sent with `mip_opt_out=true`: Deepgram's API reference asks callers to check the pricing impact of opting out of its Model Improvement Program before sending it, and Deepgram's pages, as read on 15 October 2026, state no price for an opted-out request, so a host that opts out verifies its account's tariff before it reserves from a row. Any other model returns `undefined`, and `DEEPGRAM_STREAMING_PRICING` and `DEEPGRAM_PRE_RECORDED_PRICING` are frozen as well. [Speech providers](../features/SPEECH_PROVIDERS.md#a-speech-to-text-chain-from-entries) lists every row with its source. Everything in this section is exported from `@framers/agentos` and from `@framers/agentos/safety/runtime`.
+
+The [spend meter](./SAFETY_PRIMITIVES.md#spend-meter) is the other limit that outlives a process: an allowance of units per account and period, which the full runtime's `processRequest()` checks and `SqlSpendMeter` keeps on tables it can create itself.
+
+## Choose a cheaper model
+
+A provider named without a model uses that provider's default text model (`gpt-4o` for OpenAI, `claude-sonnet-4-6` for Anthropic; [the full table](../features/LLM_PROVIDERS.md#provider-matrix)). Name the model to choose a cheaper one:
+
+```typescript
+const assistant = agent({ provider: 'openai', model: 'gpt-4o-mini' });
+
+// One call on a larger model, the rest on the agent's model:
+const hard = await assistant.generate('Work through this proof.', { model: 'gpt-4o' });
+```
+
+To choose per request in code, pass a `router`. `generateText()`, `streamText()` and `agent()` call its `selectModel()` at the start of a call with the task hint, required capabilities and `routerParams`, and use the provider and model it returns. A router that returns `null` or throws leaves the configured model in place. A structured session send the router moves to another provider or model is sent the structured-output format of the router's pick, as a fallback provider is ([Tool Calling Support](../features/LLM_PROVIDERS.md#tool-calling-support)). [`IModelRouter`](https://github.com/framerslab/agentos/blob/master/src/core/llm/routing/IModelRouter.ts) is the interface, and [`ModelRouter`](https://github.com/framerslab/agentos/blob/master/src/core/llm/routing/ModelRouter.ts) is a rule-based implementation.
+
+Two providers cost nothing per token: the [CLI providers](../getting-started/CLI_PROVIDERS.md) run on a Claude or Google subscription, and Ollama runs models on your own hardware.
+
+## Know what a fallback costs
+
+When a call fails with a retryable error, the fallback chain retries it on another provider. The chain AgentOS builds from the environment uses flagship models: `gpt-5.6-sol` on OpenAI and OpenRouter, `claude-sonnet-5-5` on Anthropic and `gemini-3.1-pro-preview` on Gemini ([Fallback Behavior](../features/LLM_PROVIDERS.md#fallback-behavior)). A primary on a small model can therefore fail over to a model that costs many times more per token. Set the chain yourself to keep fallbacks in the same price class, or pass an empty array to turn fallback off:
+
+```typescript
+const assistant = agent({
+  provider: 'openai',
+  model: 'gpt-4o-mini',
+  fallbackProviders: [{ provider: 'anthropic', model: 'claude-haiku-4-5-20251001' }],
+  onFallback: (error, provider) => console.warn(`fell back to ${provider}: ${error.message}`),
+});
+```
+
+An entry whose model id carries a provider prefix goes to that provider, and a structured call is sent that provider's format there: `{ provider: 'anthropic', model: 'openrouter:anthropic/claude-sonnet-4.5' }` is an OpenRouter call at OpenRouter's price ([Tool Calling Support](../features/LLM_PROVIDERS.md#tool-calling-support)).
+
+## Send fewer tokens
+
+- **Prompt caching** is on by default: stable prompt prefixes are billed at the provider's cache-read rate on later calls. [Prompt Caching](../features/PROMPT_CACHING.md) covers the per-provider behavior and the `cache` option, and [Cache Diagnostics](../features/CACHE_DIAGNOSTICS.md) explains a cache miss.
+- **Capability discovery**, on the full runtime, replaces a prompt that lists every tool schema with a per-turn selection ([Capability Discovery](../extensions/CAPABILITY_DISCOVERY.md)).
+- **Memory routing** picks the retrieval, ingest and reader strategy per message, with presets that trade accuracy against cost: [Memory Router](../MEMORY_ROUTER.md), [Ingest Router](../INGEST_ROUTER.md) and [Read Router](../READ_ROUTER.md).
+
+## Related
+
+- [LLM Providers](../features/LLM_PROVIDERS.md): providers, default models and the fallback chain
+- [Prompt Caching](../features/PROMPT_CACHING.md)
+- [Safety Primitives](./SAFETY_PRIMITIVES.md)
+- [Evaluation Guide](../observability/EVALUATION.md): measure quality before moving to a cheaper model

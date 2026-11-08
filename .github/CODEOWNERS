@@ -1,0 +1,10 @@
+# Code owners are requested for review automatically.
+# Every owner listed here has write access to this repository.
+# Maintainer list: MAINTAINERS.md
+
+# Default owners
+*                                   @jddunn @Victor-Evogor
+
+# LLM provider integrations. A maintainer adds a provider's owner here
+# once that person has write access.
+/src/core/llm/providers/            @jddunn @Victor-Evogor

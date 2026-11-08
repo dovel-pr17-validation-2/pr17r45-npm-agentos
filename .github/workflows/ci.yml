@@ -1,0 +1,571 @@
+name: CI
+
+# A pull request, a dispatched run and the daily release run the whole suite. A push to master
+# runs the quick checks alone (lint, the type check and the tests the push affects), since the
+# release workflow (release.yml) runs this whole file on master's commit, through workflow_call
+# with release: true, before it publishes, and only on a day with a change to release.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  # A dispatched run can read any secret a step references, and the ref it runs on can carry
+  # changes nobody has read yet, so no step that runs on a dispatch of this workflow may reference
+  # a repository secret. The release's call passes the Codecov token, and release.yml runs on
+  # master only.
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      release:
+        description: The daily release's run on master, which sends the coverage the badge reads
+        type: boolean
+        default: false
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+# A newer push to a pull request cancels the run of the commit it replaces. Every
+# other run keys a group of its own, its run id, so it never waits behind another run
+# and nothing cancels it: each push to master, a dispatched run and the release's call
+# (whose run id is the release run's; release.yml's own group is named release). A
+# re-run keys its own group too, so re-running an older commit's run never cancels
+# the newest one.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
+
+# The workflow's token can read the repository and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Lint
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    # Postgres service container for the Brain.openPostgres integration tests
+    # (gated on AGENTOS_TEST_POSTGRES_URL — tests skip when env var is absent).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: ci_test_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AGENTOS_TEST_POSTGRES_URL: postgresql://postgres:ci_test_password@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # master's rules refuse a direct push (GH006), so a workflow step that pushes a commit there fails after
+      # everything before it has run. This fails the pull request that adds such a push; its tests show each kind
+      # of push it reads. It reads the YAML with yq, which the Ubuntu runner carries.
+      - name: No workflow pushes to master
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          node --test .github/scripts/check-workflow-pushes.test.mjs
+          node .github/scripts/check-workflow-pushes.mjs
+
+      # The bump workflow fails a lockfile refresh that drops or changes an integrity the lockfile
+      # pins. Its tests run here, on every pull request; the bump's dry run runs only when the bump
+      # changes.
+      - name: The bump's lockfile integrity check
+        run: node --test .github/scripts/check-lockfile-integrity.test.mjs
+
+      # release.yml runs semantic-release a second time when npm publish failed on a transparency-log 409 after the tag
+      # was pushed; this script decides whether that tag goes. Its tests run it on run 41126134054's output in a git
+      # repository of their own, with stand-ins for gh and npm.
+      - name: The release's tag cleanup after a transparency-log conflict
+        run: node --test .github/scripts/drop-unpublished-release-tag.test.mjs
+
+      # The daily release's gate decides from git alone whether master holds a change to release;
+      # its tests run it on repositories of their own.
+      - name: The daily release's gate
+        run: node --test .github/scripts/release-gate.test.mjs
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install
+
+      # The extensions registry, a dev dependency, installs the curated @framers/agentos-ext-*
+      # packages, which declare @framers/agentos as a peer. package.json's dev dependency on
+      # "link:." resolves those peers to this checkout, so the tests that load them run this tree;
+      # this fails when the lockfile or the install gives them a published AgentOS instead, or
+      # when the install lacks a curated package the lockfile lists. It also fails when the
+      # lockfile gives a curated package another first-party peer (account-sources, for the
+      # account-source connectors) at a version outside the range the package declares.
+      - name: The curated extensions resolve AgentOS to this checkout
+        run: node --test scripts/curated-extensions-peer.test.mjs
+
+      # release.yml publishes with this npm, and npm publish reruns the build and the package checks under it.
+      - name: Use the npm the release publishes with
+        run: |
+          npm install -g npm@11.20.0
+          test "$(npm --version)" = 11.20.0
+
+      - name: Build
+        id: build
+        run: pnpm run build
+
+      - name: Package exports point at built files
+        run: pnpm run verify:exports
+
+      # The tags module as an application installs it: the packed candidate in an empty project, imported through
+      # its subpath, @framers/agentos/cognition/library/tags, compiled against the installed declarations under
+      # NodeNext and run with network access refused (scripts/fixtures/tags-consumer.ts).
+      - name: The tags module runs from the packed package
+        timeout-minutes: 10
+        run: node --test scripts/tags-package.test.mjs
+
+      # The executor from the built package, as a host loads it: its prelude and
+      # bindings are compiled source, and its engine resolves from node_modules.
+      - name: The QuickJS executor runs from the built package
+        run: |
+          node --input-type=module -e "
+          import { QuickJSExecutor } from './dist/cognition/emergent/executor/QuickJSExecutor.js';
+          const executor = await QuickJSExecutor.create();
+          const ran = await executor.run({ code: 'function execute(input) { return input.a + input.b; }', input: { a: 2, b: 3 }, globals: {}, timeoutMs: 2000, memoryMB: 16 });
+          if (ran.status !== 'ok' || ran.output !== 5) { console.error(ran); process.exit(1); }
+          console.log('QuickJSExecutor from dist:', ran.status, ran.output);
+          "
+
+      # The document reader from the built package: a worker cannot load the TypeScript the tests import, so its entry
+      # is the compiled module beside loadIsolated.js.
+      - name: The isolated document read runs from the built package
+        run: |
+          node --input-type=module -e "
+          import { loadIsolated } from './dist/cognition/memory/io/ingestion/loadIsolated.js';
+          const read = await loadIsolated('text', Buffer.from('read in a worker thread'));
+          if (read.content !== 'read in a worker thread' || read.format !== 'txt') { console.error(read); process.exit(1); }
+          console.log('loadIsolated from dist:', read.format, read.content);
+          "
+
+      - name: Built library exports preserve personal-source delivery policy
+        run: |
+          node --input-type=module <<'JS'
+          import { createSourceDerivation, canDeliverSourceDerivation } from './dist/cognition/library/index.js';
+          const dependency = {
+            tenantId: 'tenant-a', ownerId: 'owner-a', connectionId: 'connection-a',
+            generation: 1, sourceId: 'source-a', messageIds: ['message-a'],
+            version: 'version-a', expiresAt: 1000,
+          };
+          const answer = createSourceDerivation([dependency]);
+          const current = [{ ...dependency, connected: true, paused: false, searchAskEnabled: true, liveEnabled: false }];
+          const context = { tenantId: 'tenant-a', ownerId: 'owner-a', surface: 'ask', liveOptIn: false };
+          if (!canDeliverSourceDerivation(answer, context, current, 999)) throw new Error('private_delivery_refused');
+          if (canDeliverSourceDerivation(answer, { ...context, surface: 'share' }, current, 999)) throw new Error('shared_delivery_allowed');
+          if (canDeliverSourceDerivation(answer, context, current, 1000)) throw new Error('expired_delivery_allowed');
+          JS
+
+      - name: Built Postgres vectors accept the SQL adapter
+        run: |
+          node --input-type=module <<'JS'
+          import { createPostgresAdapter } from '@framers/sql-storage-adapter';
+          import { PostgresVectorStore } from './dist/cognition/rag/vector_stores/PostgresVectorStore.js';
+          const db = createPostgresAdapter({ connectionString: process.env.AGENTOS_TEST_POSTGRES_URL });
+          await db.open();
+          try {
+            const store = new PostgresVectorStore({ id: 'contract', type: 'postgres', adapter: db, manageSchema: false });
+            await store.initialize();
+            if (!await store.healthCheck()) throw new Error('adapter_health_failed');
+            await db.transaction((tx) => store.withStorageTransaction(tx, async (view) => {
+              if (!await view.healthCheck()) throw new Error('transaction_health_failed');
+            }));
+            await store.close();
+            if ((await db.get('SELECT 1 AS n'))?.n !== 1) throw new Error('adapter_closed');
+          } finally {
+            await db.close();
+          }
+          JS
+
+      - name: Built source derivation store enforces inactive owners
+        run: |
+          node --input-type=module <<'JS'
+          import { randomUUID } from 'node:crypto';
+          import { createPostgresAdapter } from '@framers/sql-storage-adapter';
+          import { sourceDerivationSchema, SqlSourceDerivationStore } from './dist/cognition/library/index.js';
+          const prefix = `bc_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+          const db = createPostgresAdapter({ connectionString: process.env.AGENTOS_TEST_POSTGRES_URL });
+          await db.open();
+          try {
+            for (const statement of sourceDerivationSchema(prefix)) await db.exec(statement);
+            const store = new SqlSourceDerivationStore(db, {
+              tablePrefix: prefix,
+              bindings: {
+                readCurrent: async () => [], purgeResults: async () => {}, purgeSources: async () => {},
+              },
+            });
+            const scope = { tenantId: 'tenant-a', ownerId: 'owner-a' };
+            if (await store.capture(scope) !== null) throw new Error('inactive_owner_admitted');
+            if (await store.activateOwner(scope, async () => false)) throw new Error('authorization_bypassed');
+            await store.activateOwner(scope, async () => true);
+            const ticket = await store.capture(scope);
+            if (!ticket) throw new Error('active_owner_missing');
+            await store.invalidate(scope, { kind: 'owner' }, async () => {}, { disableOwner: true });
+            const result = await store.apply(ticket, async () => { throw new Error('stale_callback_entered'); });
+            if (result.kind !== 'stale') throw new Error('stale_ticket_accepted');
+          } finally {
+            for (const suffix of ['edges', 'results', 'tombstones', 'journal', 'owners']) {
+              await db.exec(`DROP TABLE IF EXISTS "${prefix}_${suffix}" CASCADE`);
+            }
+            await db.close();
+          }
+          JS
+
+      - name: Built content-safe logging export
+        run: |
+          node --input-type=module <<'JS'
+          import { enableContentSafeTelemetry, createLogger, PinoLogger, CONTENT_SAFE_COMPONENTS } from '@framers/agentos/logging';
+          const events = [];
+          const before = new PinoLogger().child({ opaque: 'fixture-private-binding' });
+          const early = createLogger('fixture-private-component');
+          enableContentSafeTelemetry((event) => events.push(event), { minLevel: 'info' });
+          before.debug('fixture-private-content');
+          early.debug('fixture-private-content');
+          before.error('fixture-private-content', { err: new Error('fixture-private-error') });
+          early.warn('fixture-private-content');
+          if (events.length === 2) {
+            if (events[0].component === 'pino_logger' && events[1].component === 'logger_factory') {
+              if (JSON.stringify(events).includes('fixture-private')) throw new Error('unsafe_event');
+              for (const event of events) {
+                if ((Object.keys(event).sort().join(',') === 'component,kind,n,state') === false) throw new Error('unexpected_safe_event_keys');
+                if (Object.isFrozen(event) === false) throw new Error('mutable_safe_event');
+              }
+            } else throw new Error('unexpected_component');
+          } else throw new Error('unexpected_safe_event_count');
+          if (Object.isFrozen(CONTENT_SAFE_COMPONENTS) === false || CONTENT_SAFE_COMPONENTS.includes('listen_session') === false) throw new Error('missing_component_contract');
+          JS
+
+      # The examples the text processing and search pages link to. They need no key and no
+      # network, so each one runs against the build exactly as the pages tell a reader to run it.
+      - name: The text processing and search examples run from the built package
+        run: |
+          set -euo pipefail
+          for example in text-processing-pipeline text-search-bm25 text-hybrid-search text-statistics; do
+            echo "::group::examples/$example.mjs"
+            node "examples/$example.mjs"
+            echo "::endgroup::"
+          done
+
+      # The office loader's example, through its own entry, @framers/agentos/cognition/memory/office,
+      # as the document ingestion page tells a reader to run it. It writes the documents it reads with
+      # officeparser, a dev dependency here, so it needs no key and no network.
+      - name: The office documents example runs from the built package
+        timeout-minutes: 5
+        run: node examples/office-documents.mjs
+
+      # The transcript readers' example, through the library's browser entry, as the library index page
+      # tells a reader to run it. Its transcripts are written in the script, so it needs no key and no network.
+      - name: The transcript files example runs from the built package
+        timeout-minutes: 5
+        run: node examples/transcript-files.mjs
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Documentation states only what the code enforces
+        run: |
+          set -euo pipefail
+          # Words the published pages may not use for the in-process node:vm executor.
+          if grep -rn -i -E 'hardened|domain-restricted|host-realm escape is blocked|isolated context|security guarantees|safe[- ]by[- ]construction' \
+              docs/architecture/EMERGENT_CAPABILITIES.md docs/architecture/ARCHITECTURE.md \
+              src/cognition/emergent/SandboxedToolForge.ts src/cognition/emergent/ComposableToolBuilder.ts \
+              src/cognition/emergent/EmergentCapabilityEngine.ts src/cognition/emergent/types.ts \
+              src/safety/sandbox/executor/CodeSandbox.ts src/safety/sandbox/executor/ICodeSandbox.ts \
+              src/cognition/emergent/executor/types.ts src/cognition/emergent/executor/InProcessExecutor.ts \
+              src/cognition/emergent/executor/QuickJSExecutor.ts src/cognition/emergent/executor/guest-surface.ts \
+              src/cognition/emergent/executor/guest-prelude.ts README.md docs/SELF_EXTENSION.md; then
+            echo "::error::the documentation claims an isolation the executor does not provide (see docs/architecture/EMERGENT_CAPABILITIES.md, Sandbox Mode)"
+            exit 1
+          fi
+
+      - name: Type check
+        run: pnpm run typecheck
+
+      # The Moonshine browser provider's integration test runs the real
+      # @moonshine-ai/moonshine-wasm in Node on its tiny streaming model and a
+      # recorded clip, fetched once and kept in the cache. The fetch checks each
+      # file against the sha256 pinned here, and the cache key ends in a digest
+      # of the pins, so a copy cached under other pins is never restored. A file
+      # that differs fails the job with its actual sha256; to move to another
+      # model or clip, change its URL and its line together.
+      - name: Pin the Moonshine test model's checksums
+        id: moonshine-sums
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/moonshine-test-model.sha256" <<'SUMS'
+          22ecc949e146c49667fda28d102d4e30749a107dc88a396292aa8f277ef1347c  tiny-streaming-en/adapter.ort
+          143a36667b8d05fd9d04e8c337b7ee121f37ef299aea6b3d82bdb3d3401950b4  tiny-streaming-en/cross_kv.ort
+          8852553f312adb6c9aa4d17418015049b30f412209ee569d336548c0044627de  tiny-streaming-en/decoder_kv.ort
+          a8414e1a5dedf9f2093d7680601dd8a9b0433e7020260eafe0e370ead91134ca  tiny-streaming-en/encoder.ort
+          271a563251f11e6311949530f8025ed4d345c5d69d4ac1efa74093779927d636  tiny-streaming-en/frontend.ort
+          74fe5ddebd63b17caf59e8a3b18c17547ff7bce1642050edbb1c3962674f8950  tiny-streaming-en/streaming_config.json
+          6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d  tiny-streaming-en/tokenizer.bin
+          14a5a09479cab470db7de4fd16c0e18a8a88c03cc6d92a09a658e857ee1f73a5  two_cities_16k.wav
+          SUMS
+          echo "digest=$(sha256sum "$RUNNER_TEMP/moonshine-test-model.sha256" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Moonshine test model
+        uses: actions/cache@v5
+        with:
+          path: .cache/moonshine
+          key: moonshine-test-tiny-streaming-en-quantized_26_07_30-cd95be77-${{ steps.moonshine-sums.outputs.digest }}
+
+      - name: Fetch the Moonshine test model
+        run: |
+          set -euo pipefail
+          dir=.cache/moonshine
+          sums="$RUNNER_TEMP/moonshine-test-model.sha256"
+          mkdir -p "$dir/tiny-streaming-en"
+          for f in adapter.ort cross_kv.ort decoder_kv.ort encoder.ort frontend.ort streaming_config.json tokenizer.bin; do
+            [ -s "$dir/tiny-streaming-en/$f" ] || curl -fsSL --retry 3 -o "$dir/tiny-streaming-en/$f" \
+              "https://download.moonshine.ai/model/tiny-streaming-en/quantized_26_07_30/$f"
+          done
+          [ -s "$dir/two_cities_16k.wav" ] || curl -fsSL --retry 3 -o "$dir/two_cities_16k.wav" \
+            "https://raw.githubusercontent.com/moonshine-ai/moonshine/cd95be7728c5141b581a3fb8837742687c06c6d1/test-assets/two_cities_16k.wav"
+          # A file that differs from its pin is deleted, so the next run fetches it again, and the job fails.
+          if ! (cd "$dir" && sha256sum --check --strict "$sums"); then
+            while read -r sum file; do
+              if ! echo "$sum  $dir/$file" | sha256sum --check --status; then
+                echo "::error::$dir/$file has sha256 $(sha256sum "$dir/$file" | cut -d' ' -f1), not the pinned $sum; deleted, so the next run fetches it again"
+                rm -f -- "$dir/$file"
+              fi
+            done < "$sums"
+            exit 1
+          fi
+          echo "AGENTOS_TEST_MOONSHINE_DIR=$PWD/$dir" >> "$GITHUB_ENV"
+
+      # The whole suite with coverage on. A run under the thresholds in vitest.config.ts
+      # fails here. The totals print at the end of the step; coverage/ holds
+      # coverage-summary.json (the totals and each file's figures) and lcov.info.
+      - name: Test with coverage
+        run: pnpm run test:coverage
+
+      # The logging surface as an application installs it: the packed candidate in an empty project, imported through
+      # @framers/agentos/logging and @framers/agentos/logging/kit, compiled against the installed declarations under
+      # NodeNext and run (scripts/fixtures/logging-kit-consumer.ts). It runs whenever the build passed, after a failed
+      # test step too, so one push reports both.
+      - name: The logging kit runs from the packed package
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: node --test scripts/logging-kit-package.test.mjs
+
+      # Each file's figures, for a run that Codecov does not keep. A re-run of the job
+      # replaces the artifact an earlier attempt kept.
+      - name: Keep the coverage summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage/coverage-summary.json
+            coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
+
+      # Codecov keeps master's figure, which the coverage badge in the README reads,
+      # and compares a pull request opened from a branch of this repository with its
+      # base. master's figure comes from the daily release's run of this suite, the one
+      # run of the whole suite on master. A pull request from a fork gets no token and
+      # uploads nothing, and a dispatch of this workflow reads no secret (see the note on
+      # workflow_dispatch above). It runs after a test step that failed too, so a commit
+      # whose coverage fell under the thresholds still sends its lower figure and the
+      # badge shows it. In the release's run a failed upload fails the job, so the badge
+      # never goes stale unnoticed; on a pull request it is reported in the step's log.
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() && hashFiles('coverage/lcov.info') != '' && ((inputs.release && github.ref == 'refs/heads/master') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: ${{ inputs.release == true && github.ref == 'refs/heads/master' }}
+
+  # A push to master: lint, the type check and the tests the push affects, against a
+  # build, since some tests read dist/. vitest's --changed runs the test files that
+  # import a file the push changed, and every test when a file vitest.config.ts's
+  # forceRerunTriggers names (package.json, the vitest config, the global setup and the
+  # knowledge corpus script) changed. The Moonshine model test skips here, as it does
+  # without its folder; the daily release's run of the whole suite runs it before it
+  # publishes. A push to another branch runs the whole suite, as before.
+  quick:
+    name: Quick checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    # The Postgres suites fail in CI without their database rather than skip, so an affected
+    # one runs against the same service Test & Lint starts.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: ci_test_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AGENTOS_TEST_POSTGRES_URL: postgresql://postgres:ci_test_password@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Type check
+        run: pnpm run typecheck
+
+      # The push's first commit is the one after `before`; a push that created the branch
+      # or rewrote it has no usable `before`, so it compares with the previous commit.
+      - name: The tests the push affects
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="$BEFORE"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "Tests affected by the changes since $base"
+          pnpm exec vitest run --changed "$base" --passWithNoTests
+
+  browser:
+    name: Browser tests
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install browsers
+        run: pnpm exec playwright install --with-deps chromium webkit
+
+      - name: Browser tests
+        run: pnpm run test:browser
+
+  # Fast targeted gate for the batch-1 hardening test set: fails in minutes
+  # without waiting on the coverage matrix. The full suite above is
+  # failure-gating too (44-red burn-down completed 2026-07-20).
+  batch1-tests:
+    name: Batch-1 gated tests
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Batch-1 tests (failure-gating)
+        run: >-
+          pnpm vitest run
+          src/core/llm/providers/__tests__/openai-cache-params.test.ts
+          src/core/llm/providers/__tests__/default-judge.test.ts
+          src/core/llm/providers/__tests__/openai-streaming-usage.test.ts
+          src/core/llm/providers/implementations/__tests__/openai-typed-cache-options.test.ts
+          src/api/__tests__/observability.genai.test.ts
+          src/api/__tests__/inclusive-input-tokens.test.ts
+          src/api/__tests__/hitl.llmJudge.test.ts
+          src/cognition/emergent/__tests__/decay-for-agent.test.ts
+          src/cognition/emergent/__tests__/adapt-personality.test.ts
+          src/cognition/rag/__tests__/neo4j-graphrag-export.test.ts
+
+  # Exercises the release configuration without tagging or publishing: the
+  # commit analyser and the release-notes generator read the commits since
+  # the last release tag, fed the way the Release workflow feeds them.
+  release-dry-run:
+    name: Release dry run
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Analyse the commits since the last release tag
+        run: node scripts/release-dry-run.mjs

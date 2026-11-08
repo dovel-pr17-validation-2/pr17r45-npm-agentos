@@ -1,0 +1,34 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "module": "ESNext",
+    "target": "ES2020",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "preserveSymlinks": true,
+    "allowSyntheticDefaultImports": true,
+    "emitDeclarationOnly": false,
+    "skipLibCheck": true,
+    "noEmitOnError": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.d.ts",
+    "src/**/*.json"
+  ],
+  "exclude": [
+    "src/memory_lifecycle/**/*",
+    "src/server/**/*",
+    "src/server_integration/**/*",
+    "src/server_utils/**/*",
+    "src/examples/**/*",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "**/__tests__/**"
+  ]
+}

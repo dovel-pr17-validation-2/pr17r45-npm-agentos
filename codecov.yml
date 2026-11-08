@@ -1,0 +1,39 @@
+codecov:
+  require_ci_to_pass: true
+
+ignore:
+  - "*.config.js"
+  - "*.config.ts"
+  - "*.config.mjs"
+  - "**/*.config.js"
+  - "**/*.config.ts"
+  - "**/*.config.mjs"
+  - "**/scripts/**"
+  - "**/dist/**"
+  - "**/node_modules/**"
+
+coverage:
+  precision: 2
+  round: down
+  range: "60...90"
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: auto
+        threshold: 5%
+
+parsers:
+  gcov:
+    branch_detection:
+      conditional: yes
+      loop: yes
+      method: no
+      macro: no
+
+# A pull request's figures are in the codecov/project and codecov/patch statuses
+# and the CI job's log; no comment is posted.
+comment: false

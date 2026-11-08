@@ -1,0 +1,72 @@
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+
+/** What an import of gray-matter outside the front-matter module is told. */
+const FRONT_MATTER_MODULE =
+  'Read and write front matter with readFrontMatter and writeFrontMatter from src/core/utils/frontMatter.ts.';
+
+export default tseslint.config(
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  {
+    ignores: ['dist/**', 'node_modules/**', '**/*.spec.ts', '**/*.test.ts', '**/tests/**'],
+  },
+  {
+    files: ['src/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unused-vars': ['warn', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+        destructuredArrayIgnorePattern: '^_',
+        caughtErrorsIgnorePattern: '^_'
+      }],
+      '@typescript-eslint/no-empty-function': 'off',
+      '@typescript-eslint/ban-ts-comment': 'off',
+      '@typescript-eslint/no-unused-expressions': 'off',
+      'no-console': 'off',
+      // These three entered js.configs.recommended in ESLint 10. They report
+      // at warning level, like no-unused-vars above, until the code they flag
+      // is cleaned up in a sweep of its own.
+      'no-useless-assignment': 'warn',
+      'preserve-caught-error': 'warn',
+      'no-unassigned-vars': 'warn',
+    },
+  },
+  {
+    // gray-matter's own engines evaluate a front-matter block marked as
+    // JavaScript, so one module reads and writes front matter for the rest.
+    // The pattern covers the files inside the package (gray-matter/index.js,
+    // gray-matter/lib/engines.js), which reach the same engines.
+    files: ['src/**/*.ts'],
+    ignores: ['src/core/utils/frontMatter.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        paths: [{
+          name: 'gray-matter',
+          message: FRONT_MATTER_MODULE,
+        }],
+        patterns: [{
+          regex: '^gray-matter/',
+          message: FRONT_MATTER_MODULE,
+        }],
+      }],
+    },
+  },
+  {
+    // These files write their diagnostics as logging events: no console call, and no direct write to standard
+    // output or standard error, which only src/core/utils/terminal.ts makes. no-console reports the global console
+    // alone, so a binding of their own named console, which would hide its calls from it, is refused too.
+    files: ['src/core/logging/**/*.ts', 'src/core/llm/providers/implementations/OpenAIProvider.ts', 'src/core/llm/providers/implementations/OpenRouterProvider.ts'],
+    rules: {
+      'no-console': 'error',
+      'no-restricted-syntax': ['error', {
+        selector: "CallExpression[callee.object.object.name='process'][callee.object.property.name=/^(stdout|stderr)$/][callee.property.name='write']",
+        message: 'Write standard streams only through src/core/utils/terminal.ts.',
+      }, {
+        selector: "VariableDeclarator[id.name='console'], ImportSpecifier[local.name='console'], ImportDefaultSpecifier[local.name='console'], ImportNamespaceSpecifier[local.name='console']",
+        message: 'Write a logging event; a binding named console hides its calls from no-console.',
+      }],
+    },
+  }
+);

@@ -1,0 +1,260 @@
+name: Bump @framers/* deps
+
+# Weekly cron + manual trigger. Bumps every @framers/* explicit version pin
+# in package.json to the latest npm-published version, refreshes
+# pnpm-lock.yaml, and opens a single Pull Request with the diff. Copied from
+# agentos-extensions; the same workflow runs in every repo of the family.
+#
+# The pull request's title decides whether merging it releases: `fix(deps)`
+# when a runtime dependency moved (semantic-release publishes a patch, so the
+# published package carries the new range), `chore(deps)` when only a
+# devDependency did (nothing a consumer installs changed).
+#
+# The branch is pushed and the pull request opened with FRAMERS_BUMP_TOKEN, a
+# personal token held as a framerslab organization secret, never with
+# GITHUB_TOKEN. GitHub holds the pull_request runs of a pull request that
+# GITHUB_TOKEN opens or pushes to until someone with write access approves
+# them, while a pull request that a personal token or a GitHub App token opens
+# or pushes to runs its workflows as any pull request does:
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow
+# The checks master's ruleset requires come from the pull request's own runs: a
+# pull request's checks leave out the check runs of a CI run dispatched on its
+# branch. Pull request 559, opened with GITHUB_TOKEN on 19 October 2026, had its
+# six pull_request runs held for approval and stayed blocked.
+#
+# The pull request's own runs can read repository secrets, as the runs of a
+# pull request from any branch of this repository can (ci.yml's Codecov upload
+# reads CODECOV_TOKEN), so a step in a pull_request workflow that reads a secret
+# runs next to dependency updates nobody has read yet.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Monday 06:00 UTC weekly
+  workflow_dispatch: {}
+  # A pull request that changes this workflow or its scripts runs the dry-run job at the end of
+  # this file: the script, the lockfile refresh and its integrity check run for real, and no pull
+  # request is opened.
+  pull_request:
+    paths:
+      - .github/workflows/bump-framers-deps.yml
+      - .github/scripts/bump-framers-deps.py
+      - .github/scripts/check-lockfile-integrity.mjs
+
+# A second bump run waits for the first, so two runs never push the branch over
+# each other.
+concurrency:
+  group: bump-framers-deps-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'run' }}
+  cancel-in-progress: false
+
+# Each job states what it needs; the dry run needs nothing beyond reading the repository.
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The branch push and the pull request go through FRAMERS_BUMP_TOKEN, so the
+    # job's own GITHUB_TOKEN only reads.
+    permissions:
+      contents: read
+    # FRAMERS_BUMP_TOKEN reaches past this repository, and a step can change what a
+    # later step of its job runs, so no install script runs in this job and its
+    # third-party actions are pinned to a commit, with the release that commit
+    # carries named beside it.
+    steps:
+      # First, before anything is installed: with the secret empty,
+      # create-pull-request stops with "Input 'token' not supplied", but only after
+      # the install.
+      - name: FRAMERS_BUMP_TOKEN is available
+        env:
+          FRAMERS_BUMP_TOKEN: ${{ secrets.FRAMERS_BUMP_TOKEN }}
+        run: |
+          if [ -z "$FRAMERS_BUMP_TOKEN" ]; then
+            echo "::error::FRAMERS_BUMP_TOKEN is not available to this repository; a pull request opened with GITHUB_TOKEN gets no CI job."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # master, whichever branch a manual run names: the pull request goes into
+          # master, and a bump of another branch's manifests is not master's.
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # create-pull-request sets up its own authentication to push, so the token
+          # is not left in .git/config for the install steps, which run package code.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up pnpm
+        # package.json names no packageManager, so this is the version ci.yml installs with.
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          # No pnpm store comes back from the Actions cache, so the refresh below starts on an empty
+          # store. pnpm writes a git-hosted tarball's integrity into the lockfile only when it
+          # downloads the tarball: pull request 559 was refreshed on a restored store and dropped
+          # libsignal's (the integrity check's script names the places in pnpm). setup-node caches
+          # pnpm only when cache names it, and this keeps it from caching anything on its own.
+          package-manager-cache: false
+
+      - name: Bump @framers/* deps to latest published versions
+        run: python3 .github/scripts/bump-framers-deps.py
+
+      - name: Refresh pnpm-lock.yaml
+        run: |
+          # For this job only: a third-party release must be a day old before the lockfile takes it
+          # (minimumReleaseAge is in minutes; pnpm 10.16 and later), and first-party packages are
+          # exempt, since the point of this run is to pick up a version published minutes ago.
+          # The file is removed again: the pull request commits package.json and pnpm-lock.yaml only.
+          printf "packages:\n  - '.'\nminimumReleaseAge: 1440\nminimumReleaseAgeExclude:\n  - '@framers/*'\n" > pnpm-workspace.yaml
+          # Fails here, before any install, if pnpm does not pick the setting up from that file.
+          age=$(pnpm config get minimumReleaseAge)
+          echo "minimumReleaseAge in effect: $age"
+          [ "$age" = 1440 ]
+          # Refreshing the lockfile needs no package's install script. With the lockfile already up to
+          # date with package.json (no pin moved), pnpm skips the resolution step and leaves the
+          # lockfile as it is; --no-prefer-frozen-lockfile runs that step anyway, so on the empty store
+          # it puts back a git-hosted integrity an earlier refresh dropped.
+          pnpm install --no-frozen-lockfile --no-prefer-frozen-lockfile --ignore-scripts
+          rm pnpm-workspace.yaml
+          # The lockfile has to stand without that file, as every other workflow reads it.
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      # pnpm installs a git-hosted entry whose integrity is gone without a word, so a refresh that
+      # drops one passes every check after it. This fails the run when an entry the refresh kept
+      # lost or changed the integrity the checked-out lockfile pins.
+      - name: The refresh keeps every integrity the lockfile pins
+        run: |
+          git show HEAD:pnpm-lock.yaml > "$RUNNER_TEMP/pnpm-lock.before.yaml"
+          node .github/scripts/check-lockfile-integrity.mjs "$RUNNER_TEMP/pnpm-lock.before.yaml" pnpm-lock.yaml
+
+      - name: Pick the pull request title
+        id: title
+        run: |
+          # A runtime dependency that moved has to reach npm; a devDependency that moved does not.
+          runtime=$(node -e '
+            const { execFileSync } = require("node:child_process");
+            const before = JSON.parse(execFileSync("git", ["show", "HEAD:package.json"], { encoding: "utf8" }));
+            const after = JSON.parse(require("node:fs").readFileSync("package.json", "utf8"));
+            const fields = ["dependencies", "optionalDependencies"];
+            const moved = fields.some((f) => JSON.stringify(before[f] || {}) !== JSON.stringify(after[f] || {}));
+            process.stdout.write(moved ? "yes" : "no");
+          ')
+          if [ "$runtime" = yes ]; then type=fix; else type=chore; fi
+          echo "title=$type(deps): bump @framers/* deps to latest published versions" >> "$GITHUB_OUTPUT"
+
+      - name: Create Pull Request
+        id: cpr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          # The personal token, so the pull request's own events start its workflows
+          # (see the top of this file). branch-token defaults to it, so the branch
+          # push goes through it too.
+          token: ${{ secrets.FRAMERS_BUMP_TOKEN }}
+          commit-message: ${{ steps.title.outputs.title }}
+          title: ${{ steps.title.outputs.title }}
+          body: |
+            Automated weekly bump of the `@framers/*` dependencies to their
+            latest npm-published versions: the ranges in `package.json`
+            (caret of latest; peerDependencies are left alone) and a
+            refreshed `pnpm-lock.yaml`, in which a third-party release must
+            be a day old.
+
+            A `fix(deps)` title means a runtime dependency moved and merging
+            publishes a patch; a `chore(deps)` title means only a
+            devDependency moved and merging publishes nothing. Review the
+            diff for an unexpected major-version jump before merging.
+          branch: chore/bump-framers-deps
+          base: master
+          delete-branch: true
+          # Only files this repository has: the action's git add stops on a
+          # pathspec that matches nothing.
+          add-paths: |
+            package.json
+            pnpm-lock.yaml
+
+  # The bump, end to end, on a pull request that changes it: the script against this repository's
+  # manifests and the npm registry, then the lockfile refresh and its integrity check. The steps are
+  # the bump job's, less the token check and the master checkout; keep the two in step. Nothing is
+  # committed and no pull request is opened.
+  dry-run:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          # An empty store, as in the bump job.
+          package-manager-cache: false
+
+      - name: Bump @framers/* deps to latest published versions
+        run: python3 .github/scripts/bump-framers-deps.py
+
+      - name: Refresh pnpm-lock.yaml
+        run: |
+          # For this job only: a third-party release must be a day old before the lockfile takes it
+          # (minimumReleaseAge is in minutes; pnpm 10.16 and later), and first-party packages are
+          # exempt, since the point of this run is to pick up a version published minutes ago.
+          # The file is removed again: the pull request commits package.json and pnpm-lock.yaml only.
+          printf "packages:\n  - '.'\nminimumReleaseAge: 1440\nminimumReleaseAgeExclude:\n  - '@framers/*'\n" > pnpm-workspace.yaml
+          # Fails here, before any install, if pnpm does not pick the setting up from that file.
+          age=$(pnpm config get minimumReleaseAge)
+          echo "minimumReleaseAge in effect: $age"
+          [ "$age" = 1440 ]
+          # Refreshing the lockfile needs no package's install script. With the lockfile already up to
+          # date with package.json (no pin moved), pnpm skips the resolution step and leaves the
+          # lockfile as it is; --no-prefer-frozen-lockfile runs that step anyway, so on the empty store
+          # it puts back a git-hosted integrity an earlier refresh dropped.
+          pnpm install --no-frozen-lockfile --no-prefer-frozen-lockfile --ignore-scripts
+          rm pnpm-workspace.yaml
+          # The lockfile has to stand without that file, as every other workflow reads it.
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      # pnpm installs a git-hosted entry whose integrity is gone without a word, so a refresh that
+      # drops one passes every check after it. This fails the run when an entry the refresh kept
+      # lost or changed the integrity the checked-out lockfile pins.
+      - name: The refresh keeps every integrity the lockfile pins
+        run: |
+          git show HEAD:pnpm-lock.yaml > "$RUNNER_TEMP/pnpm-lock.before.yaml"
+          node .github/scripts/check-lockfile-integrity.mjs "$RUNNER_TEMP/pnpm-lock.before.yaml" pnpm-lock.yaml
+
+      - name: Only package.json and pnpm-lock.yaml changed
+        run: |
+          git status --porcelain
+          other=$(git status --porcelain | awk '{print $2}' | grep -vxE 'package\.json|pnpm-lock\.yaml' || true)
+          if [ -n "$other" ]; then
+            echo "::error::The bump changed files outside package.json and pnpm-lock.yaml:"
+            echo "$other"
+            exit 1
+          fi
+          git diff --stat

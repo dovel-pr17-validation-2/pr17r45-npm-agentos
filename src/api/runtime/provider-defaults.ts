@@ -1,0 +1,269 @@
+/**
+ * @file provider-defaults.ts
+ * Default model mappings for each supported provider.
+ *
+ * When a user specifies `provider: 'openai'` without an explicit `model`,
+ * the system looks up the default model for the requested task type here.
+ */
+
+import { spawnSync } from 'node:child_process';
+import { getProviderPriority } from './provider-priority.js';
+import { OPENAI_IMAGE_GENERATION_MODEL } from '../../io/media/images/providers/OpenAIImageProvider.js';
+
+/**
+ * Default model identifiers for a given provider, keyed by task type.
+ * Only fields relevant to the provider need to be populated.
+ */
+export interface ProviderDefaults {
+  /** Default model for generateText / streamText */
+  text?: string;
+  /** Default model for generateImage */
+  image?: string;
+  /** Default embedding model */
+  embedding?: string;
+  /** Cheapest model for internal/discovery use */
+  cheap?: string;
+}
+
+/** Task keys supported by the default-model registry. */
+export type ProviderDefaultTask = 'text' | 'image' | 'embedding';
+
+/**
+ * Registry of default models per provider, keyed by provider identifier.
+ *
+ * These defaults are used when a caller specifies `provider: 'openai'` without
+ * an explicit `model` field.  The task type (`'text'`, `'image'`, `'embedding'`)
+ * selects which sub-key to read.
+ */
+export const PROVIDER_DEFAULTS: Record<string, ProviderDefaults> = {
+  minimax: {
+    text: 'MiniMax-M3.1-Flash',
+    image: 'image-01',
+    cheap: 'MiniMax-M3.1-Flash',
+  },
+  openai: {
+    text: 'gpt-4o',
+    image: OPENAI_IMAGE_GENERATION_MODEL,
+    embedding: 'text-embedding-3-small',
+    cheap: 'gpt-4o-mini',
+  },
+  anthropic: {
+    text: 'claude-sonnet-4-6',
+    cheap: 'claude-haiku-4-5-20251001',
+  },
+  ollama: {
+    text: 'llama3.2',
+    image: 'stable-diffusion',
+    embedding: 'nomic-embed-text',
+    cheap: 'llama3.2',
+  },
+  openrouter: {
+    text: 'openai/gpt-4o',
+    cheap: 'openai/gpt-4o-mini',
+  },
+  requesty: {
+    text: 'openai/gpt-4o',
+    cheap: 'openai/gpt-4o-mini',
+  },
+  gemini: {
+    text: 'gemini-2.5-flash',
+    // gemini-2.0-flash returns HTTP 404 "no longer available" (probed
+    // 2026-09-29). gemini-2.5-flash-lite is the cheapest Gemini model served.
+    cheap: 'gemini-2.5-flash-lite',
+  },
+  'claude-code-cli': {
+    text: 'claude-sonnet-4-6',
+    cheap: 'claude-haiku-4-5-20251001',
+  },
+  'gemini-cli': {
+    // The CLI answers gemini-2.5-flash with gemini-3.5-flash (probed
+    // 2026-09-30), so the default names the model that runs.
+    text: 'gemini-3.5-flash',
+    // gemini-2.0-flash-lite fails in the CLI with ModelNotFoundError (probed
+    // 2026-09-29), while gemini-2.5-flash-lite is served as requested
+    // (re-probed 2026-09-30).
+    cheap: 'gemini-2.5-flash-lite',
+  },
+  stability: {
+    image: 'stable-diffusion-xl-1024-v1-0',
+  },
+  replicate: {
+    image: 'black-forest-labs/flux-1.1-pro',
+  },
+  'stable-diffusion-local': {
+    image: 'v1-5-pruned-emaonly',
+  },
+  bfl: {
+    image: 'flux-pro-1.1',
+  },
+  fal: {
+    image: 'fal-ai/flux/dev',
+  },
+  groq: {
+    text: 'llama-3.3-70b-versatile',
+    cheap: 'gemma2-9b-it',
+  },
+  together: {
+    // The Llama 3.1 Turbo ids left Together serverless in 2026-02/03. The
+    // cheap slot stays on a non-reasoning model: the cheaper served picks
+    // reason by default and can spend a small maxTokens budget on the trace.
+    text: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    cheap: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+  },
+  mistral: {
+    text: 'mistral-large-latest',
+    cheap: 'mistral-small-latest',
+  },
+  xai: {
+    text: 'grok-2',
+    cheap: 'grok-2-mini',
+  },
+};
+
+/**
+ * Embedding model used when Gemini is the effective provider and no embedding
+ * model is named (`embedText`, and the cognitive memory `agent({ runtime: 'gmi' })`
+ * builds). It is kept out of {@link PROVIDER_DEFAULTS}: those defaults also decide
+ * embedding auto-detection, where Gemini comes before Ollama, so a registry entry
+ * would silently move a caller who has a Gemini key and embeds through Ollama
+ * onto a different vector space.
+ */
+export const GEMINI_DEFAULT_EMBEDDING_MODEL = 'gemini-embedding-2';
+
+/**
+ * Runtime probes checked for auto-detection, in priority order. A probe with
+ * `tasks` is checked only for those tasks and for a call that names none.
+ */
+type AutoDetectProbe =
+  | { provider: string; envKey: string; tasks?: readonly ProviderDefaultTask[] }
+  | { provider: string; binaryName: string };
+
+/**
+ * Auto-detection priority order for providers.
+ *
+ * OpenAI is first because it supports ALL task types (text, image, embedding).
+ * OpenRouter is second — it supports text but NOT embeddings, so putting it
+ * first caused embedding failures when both keys were set.
+ * Anthropic third — it supports text but not image/embedding.
+ *
+ * The task filter in autoDetectProvider() skips providers that don't support
+ * the requested task type, so the order matters most for the default (text) case.
+ */
+const AUTO_DETECT_ORDER: AutoDetectProbe[] = [
+  // OpenRouter first: users who set OPENROUTER_API_KEY alongside a
+  // direct-provider key typically intend the OpenRouter aggregator
+  // to mediate (failover, cost routing, etc.). Matches the documented
+  // priority comment below and the provider-defaults.test.ts pin that
+  // "openrouter wins when both OPENROUTER_API_KEY and OPENAI_API_KEY
+  // are set".
+  { envKey: 'OPENROUTER_API_KEY', provider: 'openrouter' },
+  { envKey: 'OPENAI_API_KEY', provider: 'openai' },
+  { envKey: 'ANTHROPIC_API_KEY', provider: 'anthropic' },
+  { envKey: 'GEMINI_API_KEY', provider: 'gemini' },
+  { envKey: 'GROQ_API_KEY', provider: 'groq' },
+  { envKey: 'TOGETHER_API_KEY', provider: 'together' },
+  { envKey: 'MISTRAL_API_KEY', provider: 'mistral' },
+  { envKey: 'XAI_API_KEY', provider: 'xai' },
+  { envKey: 'REQUESTY_API_KEY', provider: 'requesty' },
+  // A MiniMax key is an API key: for text it comes before the CLI binaries
+  // and Ollama, as the documented order puts API keys first. For images it
+  // keeps its place after the other image providers, at the end of the list.
+  { envKey: 'MINIMAX_API_KEY', provider: 'minimax', tasks: ['text'] },
+  { binaryName: 'claude', provider: 'claude-code-cli' },
+  { binaryName: 'gemini', provider: 'gemini-cli' },
+  { envKey: 'OLLAMA_BASE_URL', provider: 'ollama' },
+  { envKey: 'STABILITY_API_KEY', provider: 'stability' },
+  { envKey: 'REPLICATE_API_TOKEN', provider: 'replicate' },
+  { envKey: 'STABLE_DIFFUSION_LOCAL_BASE_URL', provider: 'stable-diffusion-local' },
+  { envKey: 'BFL_API_KEY', provider: 'bfl' },
+  { envKey: 'FAL_API_KEY', provider: 'fal' },
+  { envKey: 'MINIMAX_API_KEY', provider: 'minimax' },
+];
+
+/**
+ * Whether the variable a probe reads configures its provider: a key variable
+ * that is set, or a base-URL variable (`OLLAMA_BASE_URL`,
+ * `STABLE_DIFFUSION_LOCAL_BASE_URL`) that holds more than whitespace. An empty
+ * or whitespace-only base URL is unset, as resolveProvider and
+ * resolveMediaProvider read it (`baseUrlIfSet` in `model.ts`), so detection
+ * goes on to the next provider instead of choosing one whose call is then
+ * refused for want of a base URL.
+ *
+ * @param envKey - The variable's name.
+ * @returns True when the variable configures its provider.
+ */
+function probeVariableIsSet(envKey: string): boolean {
+  const value = process.env[envKey];
+  return envKey.endsWith('_BASE_URL') ? value !== undefined && value.trim() !== '' : Boolean(value);
+}
+
+function isBinaryOnPath(binaryName: string): boolean {
+  const lookupCommand = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSync(lookupCommand, [binaryName], { stdio: 'ignore' });
+  return result.status === 0;
+}
+
+const binaryProbeCache = new Map<string, boolean>();
+
+/**
+ * Whether `binaryName` is on `PATH`, probed once per process. Seating uses it
+ * for the CLI providers' availability.
+ *
+ * @param binaryName - The executable to look for, such as `'claude'`.
+ * @returns True when the lookup found it the first time it was asked.
+ */
+export function isBinaryOnPathCached(binaryName: string): boolean {
+  const cached = binaryProbeCache.get(binaryName);
+  if (cached !== undefined) return cached;
+  const found = isBinaryOnPath(binaryName);
+  binaryProbeCache.set(binaryName, found);
+  return found;
+}
+
+// Provider-id → probe lookup so a custom priority list (just provider
+// ids) can be resolved back to its env-var or CLI-binary probe. Stays
+// in sync automatically with `AUTO_DETECT_ORDER`. A provider in a custom
+// list is checked for every task, so its task-scoped probe is left out.
+const PROBE_BY_PROVIDER: Record<string, AutoDetectProbe> = Object.fromEntries(
+  AUTO_DETECT_ORDER.filter((probe) => !('envKey' in probe && probe.tasks)).map((probe) => [probe.provider, probe])
+);
+
+/**
+ * Auto-detects the active provider by scanning well-known environment variables
+ * and CLI binaries in priority order.
+ *
+ * Returns the identifier of the first provider whose key env var is non-empty,
+ * whose base-URL env var holds more than whitespace (an empty or whitespace-only
+ * one is unset, as the call that follows reads it), or whose CLI binary is on
+ * PATH, or `undefined` when no recognisable runtime is present.
+ *
+ * Default priority: openrouter → openai → anthropic → gemini → groq → together → mistral → xai → requesty →
+ * minimax (text only) → claude-code-cli → gemini-cli → ollama → the image providers, minimax last among them.
+ *
+ * The order can be overridden process-wide via `setProviderPriority(['anthropic', 'openai', ...])`.
+ * When a custom list is installed, only the providers in that list are
+ * considered (in the order given); pass the full set you want detection
+ * to consider.
+ */
+export function autoDetectProvider(task?: ProviderDefaultTask): string | undefined {
+  const customOrder = getProviderPriority();
+  const order: AutoDetectProbe[] = customOrder
+    ? customOrder
+        .map((p) => PROBE_BY_PROVIDER[p])
+        .filter((probe): probe is AutoDetectProbe => Boolean(probe))
+    : AUTO_DETECT_ORDER;
+
+  for (const probe of order) {
+    const scopedTasks = 'envKey' in probe ? probe.tasks : undefined;
+    if (task && scopedTasks && !scopedTasks.includes(task)) continue;
+    const available = 'envKey' in probe
+      ? probeVariableIsSet(probe.envKey)
+      : isBinaryOnPath(probe.binaryName);
+
+    if (!available) continue;
+    const { provider } = probe;
+    if (task && !PROVIDER_DEFAULTS[provider]?.[task]) continue;
+    return provider;
+  }
+  return undefined;
+}

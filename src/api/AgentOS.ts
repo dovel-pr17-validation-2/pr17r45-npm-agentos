@@ -1,0 +1,2979 @@
+// File: backend/agentos/api/AgentOS.ts
+/**
+ * @file AgentOS.ts
+ * @module backend/agentos/api/AgentOS
+ * @version 1.1.0
+ *
+ * @description
+ * This file implements the primary public-facing service facade for the AgentOS platform,
+ * the `AgentOS` class. It acts as the unified entry point for all high-level interactions
+ * with the AI agent ecosystem. The `AgentOS` class orchestrates operations by delegating
+ * to specialized managers and services such as `AgentOSOrchestrator`, `GMIManager`,
+ * `StreamingManager`, and others.
+ *
+ * The architecture emphasizes:
+ * - **Interface-Driven Design:** `AgentOS` implements the `IAgentOS` interface, ensuring
+ * a clear contract for its consumers.
+ * - **Robust Initialization:** A comprehensive initialization sequence configures all core
+ * components and dependencies.
+ * - **Streaming-First Operations:** Core interaction methods (`processRequest`, `handleToolResult`)
+ * are designed as asynchronous generators, enabling real-time, chunked data flow.
+ * - **Structured Error Handling:** Custom error types (`AgentOSServiceError`) derived from
+ * a base `GMIError` provide detailed and context-aware error reporting.
+ * - **Comprehensive Configuration:** The system's behavior is managed through a detailed
+ * `AgentOSConfig` object.
+ *
+ * Key responsibilities of this module include:
+ * - Managing the lifecycle of the AgentOS service.
+ * - Providing methods for initiating chat turns, handling tool results, listing personas,
+ * retrieving conversation history, and processing user feedback.
+ * - Bridging the gap between high-level API calls and the underlying orchestration and
+ * cognitive processing layers.
+ * - Ensuring adherence to TypeScript best practices, including strict type safety,
+ * comprehensive JSDoc documentation, and robust error management.
+ *
+ * @see {@link IAgentOS} for the public interface contract.
+ * @see {@link AgentOSOrchestrator} for the orchestration logic.
+ * @see {@link GMIManager} for GMI lifecycle management.
+ * See `StreamingManager` for real-time data streaming internals.
+ * See `@framers/agentos/utils/errors` for shared error definitions.
+ */
+
+import { IAgentOS } from './interfaces/IAgentOS';
+import { AgentOSInput, UserFeedbackPayload } from './types/AgentOSInput';
+import type {
+  AgentOSPendingExternalToolRequest,
+  AgentOSResumeExternalToolRequestOptions,
+} from './types/AgentOSExternalToolRequest';
+import { AGENTOS_PENDING_EXTERNAL_TOOL_REQUEST_METADATA_KEY } from './types/AgentOSExternalToolRequest';
+import type { AgentOSToolResultInput } from './types/AgentOSToolResult';
+import {
+  AgentOSResponse,
+  AgentOSErrorChunk,
+  AgentOSResponseChunkType,
+  isActionableToolCallRequestChunk,
+  type AgentOSFinalResponseChunk,
+} from './types/AgentOSResponse';
+import {
+  AgentOSOrchestrator,
+  type AgentOSOrchestratorDependencies,
+  type AgentOSOrchestratorConfig,
+  type ITaskOutcomeTelemetryStore,
+} from './runtime/AgentOSOrchestrator';
+import { GMIManager, GMIManagerConfig } from '../cognition/substrate/GMIManager';
+import { createLearningLayer } from '../cognition/learning/LearningLayer.js';
+import { resolveLearningConfig } from '../cognition/learning/config.js';
+import type { HostLoopName, ILearningLayer, LearningConfig, LearningMemoryTools, LoopState } from '../cognition/learning/types.js';
+import {
+  AIModelProviderManager,
+  AIModelProviderManagerConfig,
+} from '../core/llm/providers/AIModelProviderManager';
+import { PromptEngine } from '../core/llm/PromptEngine';
+import { PromptEngineConfig, IPromptEngineUtilityAI } from '../core/llm/IPromptEngine';
+import type { ITool } from '../core/tools/ITool';
+import { IToolOrchestrator, type ToolDefinitionForLLM } from '../core/tools/IToolOrchestrator';
+import { ToolOrchestratorConfig } from '../core/config/ToolOrchestratorConfig';
+import { ToolOrchestrator } from '../core/tools/ToolOrchestrator';
+import { ToolExecutor } from '../core/tools/ToolExecutor';
+import {
+  IToolPermissionManager,
+  ToolPermissionManagerConfig,
+} from '../core/tools/permissions/IToolPermissionManager';
+import { ToolPermissionManager } from '../core/tools/permissions/ToolPermissionManager';
+import type { IAuthService, ISubscriptionService } from '../core/types/auth';
+import type { IHumanInteractionManager } from '../orchestration/hitl/IHumanInteractionManager';
+import { IUtilityAI } from '../cognition/nlp/ai_utilities/IUtilityAI';
+import { LLMUtilityAI } from '../cognition/nlp/ai_utilities/LLMUtilityAI';
+import {
+  ConversationManager,
+  ConversationManagerConfig,
+} from '../core/conversation/ConversationManager';
+import { conversationTableNames, type ConversationTableNames } from '../core/conversation/conversationTables';
+import { isTableProtected } from '../safety/provenance/enforcement/ProvenanceStorageHooks.js';
+import type { StoragePolicyConfig } from '../safety/provenance/types.js';
+import { ConversationContext } from '../core/conversation/ConversationContext';
+import type { IRollingSummaryMemorySink } from '../core/conversation/IRollingSummaryMemorySink';
+import type { ILongTermMemoryRetriever } from '../core/conversation/ILongTermMemoryRetriever';
+import type { IRetrievalAugmentor } from '../cognition/rag/IRetrievalAugmentor';
+import type { EmbeddingManagerConfig } from '../core/config/EmbeddingManagerConfiguration';
+import type { RetrievalAugmentorServiceConfig } from '../core/config/RetrievalAugmentorConfiguration';
+import type {
+  RagDataSourceConfig,
+  VectorStoreManagerConfig,
+} from '../core/config/VectorStoreConfiguration';
+import type { PrismaClient } from '../core/storage/prismaClient.js';
+import type { StorageAdapter } from '@framers/sql-storage-adapter';
+import { IPersonaDefinition } from '../cognition/substrate/personas/IPersonaDefinition';
+import {
+  StreamingManager,
+  StreamingManagerConfig,
+  StreamId,
+} from '../core/streaming/StreamingManager';
+// IStreamClient and StreamClientId reserved for streaming integration
+import { GMIError, GMIErrorCode } from '../core/utils/errors.js';
+import { uuidv4 } from '../core/utils/uuid.js';
+import { ILogger } from '../core/logging/ILogger';
+import { createLogger } from '../core/logging/loggerFactory';
+import {
+  configureAgentOSObservability,
+  type AgentOSObservabilityConfig,
+} from '../safety/evaluation/observability/otel';
+import type { IGuardrailService, GuardrailContext } from '../safety/guardrails/IGuardrailService';
+import type { GuardrailOutputVerdict } from '../safety/guardrails/guardrailDispatcher';
+import { MessageRole } from '../core/conversation/ConversationMessage';
+import {
+  assertRequiredGuardrails,
+  checkRequiredGuardrails,
+  withRequiredPosture,
+  type ActiveGuardrail,
+  type RequiredGuardrailReport,
+  type RequiredGuardrailSpec,
+} from '../safety/guardrails/requiredGuardrails';
+import { SpendMeterUnavailableError, type ISpendMeter, type SpendDenyReason } from '../safety/runtime/SpendMeter';
+import {
+  recheckStructuredReply,
+  resolveStructuredReply,
+  resolveStructuredReplySpec,
+  StructuredReplyConfigError,
+  type IStructuredSchemaRegistry,
+  type ResolvedStructuredReply,
+  type StructuredReplySpec,
+} from './runtime/structuredReply';
+import type { EmergentConfig } from '../cognition/emergent/types.js';
+// SelfImprovementToolDeps reserved for emergent capability integration
+import { GuardrailAction } from '../safety/guardrails/IGuardrailService';
+import {
+  evaluateInputGuardrails,
+  createGuardrailBlockedStream,
+  createToolCallGate,
+  wrapOutputGuardrails,
+} from '../safety/guardrails/guardrailDispatcher';
+import type { IPersonaLoader } from '../cognition/substrate/personas/IPersonaLoader';
+import {
+  ExtensionManager,
+  EXTENSION_KIND_GUARDRAIL,
+  EXTENSION_KIND_HTTP_HANDLER,
+  EXTENSION_KIND_PROVENANCE,
+  EXTENSION_KIND_TOOL,
+  EXTENSION_KIND_WORKFLOW,
+  type ExtensionLifecycleContext,
+  type ExtensionManifest,
+  type ExtensionOverrides,
+  type HttpHandlerPayload,
+} from '../extensions';
+import type { MemoryToolsExtensionOptions } from '../cognition/memory/io/extension/MemoryToolsExtension.js';
+import type { Memory } from '../cognition/memory/io/facade/Memory.js';
+import type {
+  StandaloneMemoryLongTermRetrieverOptions,
+  StandaloneMemoryRollingSummarySinkOptions,
+} from '../cognition/memory/io/integration/StandaloneMemoryBridge.js';
+import {
+  listExternalToolDefinitionsForLLM,
+  normalizeExternalToolRegistry,
+  type ExternalToolRegistry,
+} from './runtime/externalToolRegistry';
+import { adaptTools, adaptToolsToMap, type AdaptableToolInput } from './runtime/toolAdapter';
+import { createSchemaOnDemandPack } from '../extensions/packs/schema-on-demand-pack.js';
+import { WorkflowFacade } from './runtime/WorkflowFacade';
+import { CapabilityDiscoveryInitializer } from './runtime/CapabilityDiscoveryInitializer';
+import {
+  SelfImprovementSessionManager,
+  resolveGMIForToolContext,
+} from './runtime/SelfImprovementSessionManager';
+import { RagMemoryInitializer } from './runtime/RagMemoryInitializer';
+import type { AgencySession } from '../agents/agency/AgencyTypes';
+import { createRuntimeLaunchTool } from './runtime/agencyLaunch/runtimeLaunchTool';
+import { LAUNCH_AGENCY_TOOL_NAME, resolveLaunchLimits, type LaunchLimits, type RuntimeAgencyLaunchOptions } from './runtime/agencyLaunch/types';
+import type { TurnPlannerConfig } from '../orchestration/turn-planner/TurnPlanner';
+import type {
+  CapabilityDescriptor,
+  CapabilityDiscoveryConfig,
+  CapabilityIndexSources,
+  ICapabilityDiscoveryEngine,
+  PresetCoOccurrence,
+} from '../cognition/discovery/types';
+import type { WorkflowEngineConfig } from '../orchestration/workflows/IWorkflowEngine';
+import type {
+  WorkflowDefinition,
+  WorkflowDescriptorPayload,
+  WorkflowInstance,
+  WorkflowProgressUpdate,
+  WorkflowStatus,
+} from '../orchestration/workflows/WorkflowTypes';
+import type {
+  IWorkflowStore,
+  WorkflowQueryOptions,
+  WorkflowTaskUpdate,
+} from '../orchestration/workflows/storage/IWorkflowStore';
+
+type StorageWriteHookContext = {
+  readonly operation: 'run' | 'batch';
+  statement: string;
+  parameters?: unknown;
+  affectedTables?: string[];
+  readonly inTransaction?: boolean;
+  operationId: string;
+  startTime: number;
+  adapterKind?: string;
+  metadata?: Record<string, unknown>;
+};
+
+type StorageWriteHookResult = StorageWriteHookContext | undefined | void;
+
+type StorageWriteHooks = {
+  onBeforeWrite?: (context: StorageWriteHookContext) => Promise<StorageWriteHookResult>;
+  onAfterWrite?: (
+    context: StorageWriteHookContext,
+    result: { changes: number; lastInsertRowid?: unknown }
+  ) => Promise<void>;
+};
+
+function wrapStorageAdapterWithWriteHooks(
+  adapter: StorageAdapter,
+  hooks: StorageWriteHooks,
+  options?: { inTransaction?: boolean; logger?: ILogger }
+): StorageAdapter {
+  const inTransaction = options?.inTransaction === true;
+
+  const runWithHooks: StorageAdapter['run'] = async (statement, parameters) => {
+    const startTime = Date.now();
+    const operationId = uuidv4();
+    const context: StorageWriteHookContext = {
+      operation: 'run',
+      statement,
+      parameters,
+      inTransaction,
+      operationId,
+      startTime,
+      adapterKind: adapter.kind,
+    };
+
+    if (hooks.onBeforeWrite) {
+      const hookResult = await hooks.onBeforeWrite(context);
+      if (hookResult === undefined) {
+        return { changes: 0, lastInsertRowid: null };
+      }
+      Object.assign(context, hookResult);
+    }
+
+    const result = await adapter.run(context.statement, context.parameters as any);
+    try {
+      await hooks.onAfterWrite?.(context, result);
+    } catch (error: any) {
+      options?.logger?.error?.('[AgentOS][StorageHooks] onAfterWrite failed', {
+        error: error?.message ?? error,
+      });
+    }
+
+    return result;
+  };
+
+  return {
+    kind: adapter.kind,
+    capabilities: adapter.capabilities,
+    open: (opts) => adapter.open(opts),
+    close: () => adapter.close(),
+    exec: (script) => adapter.exec(script),
+    get: (statement, parameters) => adapter.get(statement, parameters),
+    all: (statement, parameters) => adapter.all(statement, parameters),
+    run: runWithHooks,
+    transaction: async <T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> => {
+      return adapter.transaction(async (trx) => {
+        const wrappedTrx = wrapStorageAdapterWithWriteHooks(trx, hooks, {
+          inTransaction: true,
+          logger: options?.logger,
+        });
+        return fn(wrappedTrx);
+      });
+    },
+    batch: adapter.batch
+      ? async (operations) => {
+          const results: any[] = [];
+          const errors: Array<{ index: number; error: Error }> = [];
+          let successful = 0;
+          let failed = 0;
+
+          for (let i = 0; i < operations.length; i += 1) {
+            const op = operations[i];
+            try {
+              const result = await runWithHooks(op.statement, op.parameters);
+              results.push(result);
+              successful += 1;
+            } catch (error: any) {
+              results.push({ changes: 0, lastInsertRowid: null });
+              failed += 1;
+              errors.push({
+                index: i,
+                error: error instanceof Error ? error : new Error(String(error)),
+              });
+            }
+          }
+
+          return {
+            successful,
+            failed,
+            results,
+            errors: errors.length > 0 ? errors : undefined,
+          } as any;
+        }
+      : undefined,
+    prepare: adapter.prepare ? (statement) => adapter.prepare!(statement) : undefined,
+  };
+}
+
+/**
+ * The runtime's conversation tables that a provenance storage policy protects under their default names
+ * (`conversations`, `conversation_messages`) and would not protect under the names
+ * `conversationManagerConfig.tablePrefix` gives them: a policy names the tables it protects exactly, as the sealed
+ * profiles do. A table the policy exempts by its prefixed name is the host's choice and is not listed.
+ *
+ * @returns The prefixed names the policy leaves out; empty when the policy enforces nothing, the conversations are not
+ *   persisted, there is no prefix, or the prefix is not a plain name (the conversation manager refuses that itself).
+ */
+function conversationTablesLeftUnprotected(policy: StoragePolicyConfig, config: ConversationManagerConfig | undefined): string[] {
+  if (policy.mode === 'mutable' || config?.persistenceEnabled === false) return [];
+  let names: ConversationTableNames;
+  try {
+    names = conversationTableNames(config?.tablePrefix ?? '');
+  } catch {
+    return [];
+  }
+  const plain = conversationTableNames();
+  return (['conversations', 'messages'] as const)
+    .filter(
+      (kind) =>
+        names[kind] !== plain[kind] &&
+        isTableProtected(plain[kind], policy) &&
+        !isTableProtected(names[kind], policy) &&
+        !policy.exemptTables?.includes(names[kind]),
+    )
+    .map((kind) => names[kind]);
+}
+
+// Re-export from extracted module
+import { AgentOSServiceError } from './errors';
+import { resolvePersonaLoader, validatePersonaSource } from './runtime/personaLoaderResolution';
+export { AgentOSServiceError } from './errors';
+
+export interface AgentOSCapabilityDiscoverySources {
+  skills?: CapabilityIndexSources['skills'];
+  extensions?: CapabilityIndexSources['extensions'];
+  channels?: CapabilityIndexSources['channels'];
+  manifests?: CapabilityDescriptor[];
+  presetCoOccurrences?: PresetCoOccurrence[];
+}
+
+export interface AgentOSTurnPlanningConfig extends TurnPlannerConfig {
+  discovery?: NonNullable<TurnPlannerConfig['discovery']> & {
+    /**
+     * Optional pre-built discovery engine. If provided, AgentOS uses this and
+     * skips auto-initialization.
+     */
+    engine?: ICapabilityDiscoveryEngine;
+    /**
+     * When true, AgentOS automatically creates a capability discovery engine
+     * using active tools/extensions/channels.
+     */
+    autoInitializeEngine?: boolean;
+    /**
+     * Register the `discover_capabilities` meta-tool after engine initialization.
+     */
+    registerMetaTool?: boolean;
+    /**
+     * Optional override for discovery embedding model.
+     */
+    embeddingModelId?: string;
+    /**
+     * Optional embedding dimension override.
+     */
+    embeddingDimension?: number;
+    /**
+     * Optional low-level discovery engine tuning.
+     */
+    config?: Partial<CapabilityDiscoveryConfig>;
+    /**
+     * Optional explicit capability sources to merge with runtime-derived sources.
+     */
+    sources?: AgentOSCapabilityDiscoverySources;
+  };
+}
+
+export interface AgentOSMemoryToolsConfig extends MemoryToolsExtensionOptions {
+  /**
+   * Enable or disable automatic memory-tool registration.
+   * Default: true when this block is provided.
+   */
+  enabled?: boolean;
+
+  /**
+   * Standalone memory backend whose `createTools()` output should be exposed
+   * through the shared AgentOS tool registry.
+   */
+  memory: Pick<Memory, 'createTools'> & Partial<Pick<Memory, 'close'>>;
+
+  /**
+   * If true, AgentOS will call `memory.close()` during shutdown via the loaded
+   * extension pack's deactivation hook.
+   * Default: false (caller manages lifecycle).
+   */
+  manageLifecycle?: boolean;
+
+  /**
+   * Optional extension-pack identifier override.
+   * @default 'config-memory-tools'
+   */
+  identifier?: string;
+}
+
+export interface AgentOSStandaloneMemoryConfig {
+  /**
+   * Enable or disable standalone-memory integration.
+   * Default: true when this block is provided.
+   */
+  enabled?: boolean;
+
+  /**
+   * Standalone memory backend used to derive one or more AgentOS integrations.
+   */
+  memory: Pick<Memory, 'remember' | 'recall' | 'forget'> &
+    Partial<Pick<Memory, 'createTools' | 'health' | 'close'>>;
+
+  /**
+   * If true, AgentOS closes the standalone memory backend during shutdown
+   * unless `memoryTools.manageLifecycle` already owns that lifecycle.
+   * Default: false.
+   */
+  manageLifecycle?: boolean;
+
+  /**
+   * When provided, AgentOS derives `memoryTools` from this standalone memory
+   * backend unless `memoryTools` was already supplied explicitly.
+   */
+  tools?: boolean | Omit<AgentOSMemoryToolsConfig, 'memory' | 'enabled' | 'manageLifecycle'>;
+
+  /**
+   * When provided, AgentOS derives `longTermMemoryRetriever` from this
+   * standalone memory backend unless one was already supplied explicitly.
+   */
+  longTermRetriever?: boolean | StandaloneMemoryLongTermRetrieverOptions;
+
+  /**
+   * When provided, AgentOS derives `rollingSummaryMemorySink` from this
+   * standalone memory backend unless one was already supplied explicitly.
+   */
+  rollingSummarySink?: boolean | StandaloneMemoryRollingSummarySinkOptions;
+}
+
+/**
+ * @interface AgentOSConfig
+ * @description Defines the comprehensive configuration structure required to initialize and operate
+ * the `AgentOS` service. This configuration object aggregates settings for all major
+ * sub-components and dependencies of the AgentOS platform.
+ */
+/** The spend meter `processRequest` reserves against, and how a request maps to an account and units. */
+export interface AgentOSSpendMeterConfig {
+  meter: ISpendMeter;
+  /** The account a request is metered under. Default: the organization, else the user. */
+  accountIdOf?(input: AgentOSInput): string;
+  /** The units a request reserves. Default 1. */
+  unitsOf?(input: AgentOSInput): number;
+}
+
+/** The error code a refused reservation answers with. */
+const SPEND_DENIAL_CODE: Record<SpendDenyReason, GMIErrorCode> = {
+  allowance_exhausted: GMIErrorCode.ALLOWANCE_EXHAUSTED,
+  in_flight: GMIErrorCode.ALREADY_EXISTS,
+  already_consumed: GMIErrorCode.ALREADY_EXISTS,
+  retries_exhausted: GMIErrorCode.RATE_LIMIT_EXCEEDED,
+};
+
+/**
+ * True when an output guardrail stopped the reply on this chunk: the error chunk a BLOCK yields, or a final response
+ * whose guardrail metadata records an output BLOCK (a guard that answers a block with a fixed reply).
+ */
+function isOutputGuardrailBlock(chunk: AgentOSResponse): boolean {
+  if (chunk.type === AgentOSResponseChunkType.ERROR && chunk.gmiInstanceId === 'guardrail') return true;
+  const output = (chunk.metadata as { guardrail?: { output?: Array<{ action?: unknown }> } } | undefined)?.guardrail?.output;
+  return chunk.type === AgentOSResponseChunkType.FINAL_RESPONSE && Array.isArray(output) && output.some((e) => String(e?.action).toLowerCase() === 'block');
+}
+
+export interface AgentOSConfig {
+  /** Configuration for the {@link GMIManager}. */
+  gmiManagerConfig: GMIManagerConfig;
+  /** Configuration for the {@link AgentOSOrchestrator}. */
+  orchestratorConfig: AgentOSOrchestratorConfig;
+  /**
+   * Optional sink for persisting rolling-memory outputs (`summary_markdown` + `memory_json`)
+   * into an external long-term store (RAG / knowledge graph / database).
+   */
+  rollingSummaryMemorySink?: IRollingSummaryMemorySink;
+  /**
+   * Optional retriever for injecting durable long-term memory context into prompts
+   * (e.g. user/org/persona memories stored in a RAG/KG).
+   */
+  longTermMemoryRetriever?: ILongTermMemoryRetriever;
+  /**
+   * Optional persistence store for task outcome KPI windows.
+   * When provided, rolling task-outcome telemetry survives orchestrator restarts.
+   */
+  taskOutcomeTelemetryStore?: ITaskOutcomeTelemetryStore;
+  /**
+   * A persisted per-account allowance. With one set, every `processRequest` needs an `operationId` and reserves its
+   * units before any provider is called: a refusal or a meter that cannot answer ends the request with an error chunk
+   * and no model call. The turn settles the reservation when it ends; a reply an output guardrail blocks is refunded.
+   */
+  spendMeter?: AgentOSSpendMeterConfig;
+  /** The schemas a request's `structuredReply.schemaRef` is looked up in. A `Map<string, ZodType | JsonSchemaObject>` is one. */
+  structuredSchemas?: IStructuredSchemaRegistry;
+  /**
+   * Optional retrieval augmentor enabling vector-based RAG and/or GraphRAG.
+   * When provided, it is passed into GMIs via the GMIManager.
+   *
+   * Notes:
+   * - This is separate from `longTermMemoryRetriever`, which injects pre-formatted
+   *   memory text into prompts.
+   * - The augmentor instance is typically shared across GMIs; do not shut it down
+   *   from individual GMIs.
+   */
+  retrievalAugmentor?: IRetrievalAugmentor;
+  /**
+   * If true, AgentOS will call `retrievalAugmentor.shutdown()` during `AgentOS.shutdown()`.
+   * Default: false (caller manages lifecycle).
+   */
+  manageRetrievalAugmentorLifecycle?: boolean;
+  /**
+   * Optional configuration for AgentOS-managed RAG subsystem initialization.
+   *
+   * When provided and enabled, AgentOS will:
+   * - Initialize an `EmbeddingManager` with `EmbeddingManagerConfig`
+   * - Initialize a `VectorStoreManager` with `VectorStoreManagerConfig` and `RagDataSourceConfig`
+   * - Initialize a `RetrievalAugmentor` with `RetrievalAugmentorServiceConfig`
+   * - Pass the resulting {@link IRetrievalAugmentor} into GMIs via the {@link GMIManager}
+   *
+   * Notes:
+   * - If `retrievalAugmentor` is provided, it takes precedence and this config is ignored.
+   * - By default, when AgentOS creates the RAG subsystem it also manages lifecycle and will
+   *   shut it down during {@link AgentOS.shutdown}.
+   */
+  ragConfig?: {
+    /** Enable or disable AgentOS-managed RAG initialization. Default: true. */
+    enabled?: boolean;
+    /** Embedding manager configuration (must include at least one embedding model). */
+    embeddingManagerConfig: EmbeddingManagerConfig;
+    /** Vector store manager configuration (providers). */
+    vectorStoreManagerConfig: VectorStoreManagerConfig;
+    /** Logical data sources mapped onto vector store providers. */
+    dataSourceConfigs: RagDataSourceConfig[];
+    /** Retrieval augmentor configuration (category behaviors, defaults). */
+    retrievalAugmentorConfig: RetrievalAugmentorServiceConfig;
+    /**
+     * If true, AgentOS will shut down the augmentor and any owned vector store providers
+     * during {@link AgentOS.shutdown}. Default: true.
+     */
+    manageLifecycle?: boolean;
+    /**
+     * When true (default), AgentOS injects its `storageAdapter` into SQL vector-store providers
+     * that did not specify `adapter` or `storage`. This keeps vector persistence colocated with
+     * the host database by default.
+     */
+    bindToStorageAdapter?: boolean;
+  };
+  /** Configuration for the prompt engine. */
+  promptEngineConfig: PromptEngineConfig;
+  /** Configuration for the tool orchestrator. */
+  toolOrchestratorConfig: ToolOrchestratorConfig;
+  /** Optional human-in-the-loop manager for approvals/clarifications. */
+  hitlManager?: IHumanInteractionManager;
+  /** Configuration for the tool permission manager. */
+  toolPermissionManagerConfig: ToolPermissionManagerConfig;
+  /** Configuration for the {@link ConversationManager}. */
+  conversationManagerConfig: ConversationManagerConfig;
+  /** Configuration for the internal streaming manager. */
+  streamingManagerConfig: StreamingManagerConfig;
+  /** Configuration for the {@link AIModelProviderManager}. */
+  modelProviderManagerConfig: AIModelProviderManagerConfig;
+  /** The default Persona ID to use if none is specified in an interaction. */
+  defaultPersonaId: string;
+  /** An instance of the Prisma client for database interactions.
+   *
+   * **Optional when `storageAdapter` is provided:**
+   * - If `storageAdapter` is provided, Prisma is only used for server-side features (auth, subscriptions).
+   * - If `storageAdapter` is omitted, Prisma is required for all database operations.
+   *
+   * **Client-side usage:**
+   * ```typescript
+   * const storage = await createAgentOSStorage({ platform: 'web' });
+   * await agentos.initialize({
+   *   storageAdapter: storage.getAdapter(),
+   *   prisma: mockPrisma,  // Stub for compatibility (can be minimal mock)
+   *   // ...
+   * });
+   * ```
+   */
+  prisma: PrismaClient;
+  /** Optional authentication service implementing `IAuthService`. Provide via the auth extension or your own adapter. */
+  authService?: IAuthService;
+  /** Optional subscription service implementing `ISubscriptionService`. Provide via the auth extension or your own adapter. */
+  subscriptionService?: ISubscriptionService;
+  /** Optional guardrail service implementation used for policy enforcement. */
+  guardrailService?: IGuardrailService;
+  /**
+   * Guards the deployment cannot run without, by id and stage. `initialize()` refuses to finish when one is missing
+   * or does not implement a named stage; `processRequest()` refuses a request (`SYS_GUARDRAIL_REQUIRED_MISSING`) when
+   * one has gone missing since. Each runs fail-closed with its deadline, and a guard required on `output` puts the
+   * output in hold mode.
+   */
+  requiredGuardrails?: RequiredGuardrailSpec[];
+  /**
+   * `hold`: no TEXT_DELTA reaches the caller before the output guards have judged the whole reply. Default `stream`;
+   * forced to `hold` when a required guard covers the output stage.
+   */
+  guardrailOutputMode?: 'stream' | 'hold';
+  /** Optional map of secretId -> value for extension/tool credentials. */
+  extensionSecrets?: Record<string, string>;
+  /**
+   * Optional standalone-memory tool registration.
+   *
+   * When provided, AgentOS will load the standalone memory editor tools as an
+   * extension pack during initialization, making them immediately available to
+   * the shared `ToolExecutor`/`ToolOrchestrator`.
+   */
+  memoryTools?: AgentOSMemoryToolsConfig;
+  /**
+   * Optional unified standalone-memory bridge.
+   *
+   * This derives one or more AgentOS integrations from a single standalone
+   * `Memory` instance:
+   * - memory tools
+   * - long-term memory retriever
+   * - rolling-summary sink
+   */
+  standaloneMemory?: AgentOSStandaloneMemoryConfig;
+  /**
+   * Optional runtime-level registered tools.
+   *
+   * These tools are normalized during initialization and registered into the
+   * shared `ToolOrchestrator`, making them directly available to `processRequest()`
+   * and other full-runtime flows without helper wrappers.
+   *
+   * Accepts:
+   * - a named high-level tool map
+   * - an `ExternalToolRegistry` (`Record`, `Map`, or iterable)
+   * - a prompt-only `ToolDefinitionForLLM[]`
+   */
+  tools?: AdaptableToolInput;
+  /**
+   * Optional stable registry of host-managed external tools.
+   *
+   * This is the runtime-level default for helper APIs such as
+   * `processRequestWithRegisteredTools(...)` and
+   * `resumeExternalToolRequestWithRegisteredTools(...)`.
+   *
+   * Per-call `externalTools` passed into those helpers override entries from
+   * this configured registry by tool name.
+   */
+  externalTools?: ExternalToolRegistry;
+  /**
+   * Optional: enable schema-on-demand meta tools for lazy tool schema loading.
+   *
+   * When enabled, AgentOS registers three meta tools:
+   * - `extensions_list`
+   * - `extensions_enable` (side effects)
+   * - `extensions_status`
+   *
+   * These tools allow an agent to load additional extension packs at runtime,
+   * so newly-enabled tool schemas appear in the next `listAvailableTools()` call.
+   */
+  schemaOnDemandTools?: {
+    enabled?: boolean;
+    /**
+     * Allow enabling packs by explicit npm package name (source='package').
+     * Default: true in non-production, false in production.
+     */
+    allowPackages?: boolean;
+    /** Allow enabling packs by local module specifier/path (source='module'). Default: false. */
+    allowModules?: boolean;
+    /**
+     * When true, only allow extension packs present in the official
+     * `@framers/agentos-extensions-registry` catalog (if installed).
+     *
+     * Default: true.
+     */
+    officialRegistryOnly?: boolean;
+  };
+  /**
+   * Optional per-turn planning configuration.
+   * Defaults:
+   * - `defaultToolFailureMode = fail_open`
+   * - discovery-driven tool selection enabled when discovery is available.
+   */
+  turnPlanning?: AgentOSTurnPlanningConfig;
+  /**
+   * Optional. An instance of a utility AI service.
+   * This service should conform to `IUtilityAI` for general utility tasks.
+   * If the prompt engine is used and requires specific utility functions (like advanced
+   * summarization for prompt construction), this service *must* also fulfill the contract
+   * of {@link IPromptEngineUtilityAI}.
+   * It's recommended that the concrete class for this service implements both interfaces if needed.
+   */
+  utilityAIService?: IUtilityAI & IPromptEngineUtilityAI;
+  /** Optional extension manifest describing packs to load. */
+  extensionManifest?: ExtensionManifest;
+  /** Declarative overrides applied after packs are loaded. */
+  extensionOverrides?: ExtensionOverrides;
+  /**
+   * Optional registry configuration for loading extensions and personas from custom sources.
+   * Allows self-hosted registries and custom git repositories.
+   *
+   * @example
+   * ```typescript
+   * registryConfig: {
+   *   registries: {
+   *     'extensions': {
+   *       type: 'github',
+   *       location: 'your-org/your-extensions',
+   *       branch: 'main',
+   *     },
+   *     'personas': {
+   *       type: 'github',
+   *       location: 'your-org/your-personas',
+   *       branch: 'main',
+   *     }
+   *   },
+   *   defaultRegistries: {
+   *     tool: 'extensions',
+   *     persona: 'personas',
+   *   }
+   * }
+   * ```
+   */
+  registryConfig?: import('../extensions/RegistryConfig').MultiRegistryConfig;
+  /** Optional workflow engine configuration. */
+  workflowEngineConfig?: WorkflowEngineConfig;
+  /** Optional workflow store implementation. Defaults to the in-memory store if omitted. */
+  workflowStore?: IWorkflowStore;
+  /** Optional multilingual configuration enabling detection, negotiation, translation. */
+  languageConfig?: import('../cognition/nlp/language').AgentOSLanguageConfig;
+  /** Optional custom persona loader (useful for browser/local runtimes). */
+  personaLoader?: IPersonaLoader;
+  /**
+   * Persona definitions given inline, as parsed JSON objects or code-built objects. They are
+   * served by an in-memory loader and validated like file personas. Exclusive with
+   * `personaLoader`; when set, the file-system persona directory is not read.
+   */
+  personas?: IPersonaDefinition[];
+  /**
+   * Optional cross-platform storage adapter for client-side persistence.
+   * Enables fully offline AgentOS in browsers (IndexedDB), desktop (SQLite), mobile (Capacitor).
+   *
+   * **Platform Support:**
+   * - Web: IndexedDB (recommended) or sql.js
+   * - Electron: better-sqlite3 (native) or sql.js (fallback)
+   * - Capacitor: @capacitor-community/sqlite (native) or IndexedDB
+   * - Node: better-sqlite3 or PostgreSQL
+   *
+   * **Usage:**
+   * ```typescript
+   * import { createAgentOSStorage } from '@framers/sql-storage-adapter/agentos';
+   *
+   * const storage = await createAgentOSStorage({ platform: 'auto' });
+   *
+   * await agentos.initialize({
+   *   storageAdapter: storage.getAdapter(),
+   *   // ... other config
+   * });
+   * ```
+   *
+   * **Graceful Degradation:**
+   * - If omitted, AgentOS falls back to Prisma (server-side only).
+   * - If provided, AgentOS uses storageAdapter for conversations, Prisma only for auth/subscriptions.
+   * - Recommended: Always provide storageAdapter for cross-platform compatibility.
+   */
+  storageAdapter?: StorageAdapter;
+
+  /**
+   * Enable emergent capability creation. When true, the agent gains access
+   * to the `forge_tool` meta-tool and can create new tools at runtime.
+   * @default false
+   */
+  emergent?: boolean;
+
+  /**
+   * Configuration for the emergent capability engine.
+   * Only applies when `emergent: true`.
+   */
+  emergentConfig?: Partial<EmergentConfig>;
+
+  /**
+   * Optional observability config for tracing, metrics, and log correlation.
+   * Default: disabled (opt-in).
+   */
+  observability?: AgentOSObservabilityConfig;
+
+  /**
+   * The learning layer (docs/GMI.md, "Learning"). Unset, `false` or `null`: off, and the runtime's GMIs run as they
+   * did before the layer existed. `true` or a {@link LearningConfig}: every GMI sends its persona's personality section
+   * as a system prompt of its own on every turn, and each session is bound to a learner: its persona with the user
+   * and the resolved organization of its first turn. `namespace` is refused here, because the runtime takes the
+   * organization from each turn. The layer the runtime builds keeps its learning store on `storageAdapter` (SQL when the
+   * adapter has transactions; else in the process), reaches the memory tools' facade and the standalone memory's (its
+   * retriever's and its sink's) for `forgetUser` and `revert`, after any `learning.memoryTools` the host sets, and the
+   * memory tools pack leaves `memory_reflect` out. A host that built a layer itself passes it in
+   * `gmiManagerConfig.learningLayer` instead, with its own store and facades: a layer passed there turns learning on
+   * whatever this option says, and `true` or a config beside one is refused. {@link AgentOS.getLearningLayer} returns
+   * the layer.
+   * @default false
+   */
+  learning?: boolean | LearningConfig | null;
+
+  /**
+   * Teams a persona's GMI may launch from a turn (`launch_agency`). With `launch: true` the runtime registers the
+   * tool, which requires the `agency:launch` capability, so only a persona whose `allowedCapabilities` names it lists
+   * and calls it (with `toolPermissionManagerConfig.strictCapabilityChecking`, on by default). Each call builds a
+   * temporary `agency()` team whose seats are GMIs of this runtime (a registered persona by `personaId`, or one made
+   * from the caller's for the seat's instructions), runs the goal once and returns one tool result, bounded by depth,
+   * seats, launches in flight, one wall deadline and the caller's tools; the output guardrails that judge the caller's
+   * tool calls judge the seats' calls too. The bounds are checked at initialization
+   * whenever this is set; with `launch: true`, a config tool named `launch_agency` fails initialization too.
+   * @default undefined (no tool)
+   */
+  agencies?: RuntimeAgencyLaunchOptions;
+}
+
+export interface AgentOSActiveConversationSnapshot {
+  sessionId: string;
+  userId?: string;
+  gmiInstanceId?: string;
+  activePersonaId?: string;
+  createdAt: number;
+  lastActiveAt?: number;
+  messageCount: number;
+}
+
+export interface AgentOSActiveGMISnapshot {
+  gmiId: string;
+  personaId: string;
+  state: string;
+  createdAt: string;
+  hasCognitiveMemory: boolean;
+  reasoningTraceEntries: number;
+  workingMemoryKeys: number;
+  cognitiveMemory?: {
+    totalTraces: number;
+    activeTraces: number;
+    workingMemorySlots: number;
+    workingMemoryCapacity: number;
+    prospectiveCount: number;
+  };
+}
+
+export interface AgentOSRuntimeSnapshot {
+  initialized: boolean;
+  services: {
+    conversationManager: boolean;
+    extensionManager: boolean;
+    toolOrchestrator: boolean;
+    modelProviderManager: boolean;
+    retrievalAugmentor: boolean;
+    workflowEngine: boolean;
+  };
+  providers: {
+    configured: string[];
+    defaultProvider?: string | null;
+  };
+  extensions: {
+    loadedPacks: string[];
+    toolCount: number;
+    workflowCount: number;
+    guardrailCount: number;
+  };
+  conversations: {
+    activeCount: number;
+    items: AgentOSActiveConversationSnapshot[];
+  };
+  gmis: {
+    activeCount: number;
+    items: AgentOSActiveGMISnapshot[];
+  };
+}
+
+/**
+ * @class AgentOS
+ * @implements {IAgentOS}
+ * @description
+ * The `AgentOS` class is the SOTA public-facing service facade for the entire AI agent platform.
+ * It provides a unified API for interacting with the system, managing the lifecycle of core
+ * components, and orchestrating complex AI interactions. This class ensures that all
+ * operations adhere to the defined architectural tenets, including robust error handling,
+ * comprehensive documentation, and strict type safety.
+ *
+ * @category Core
+ */
+export class AgentOS implements IAgentOS {
+  private initialized: boolean = false;
+  private config!: Readonly<AgentOSConfig>;
+  private selfImprovementManager!: SelfImprovementSessionManager;
+
+  private modelProviderManager!: AIModelProviderManager;
+  private utilityAIService!: IUtilityAI & IPromptEngineUtilityAI;
+  private promptEngine!: PromptEngine;
+  private toolPermissionManager!: IToolPermissionManager;
+  private toolExecutor!: ToolExecutor;
+  private toolOrchestrator!: IToolOrchestrator;
+  private extensionManager!: ExtensionManager;
+  private conversationManager!: ConversationManager;
+  private streamingManager!: StreamingManager;
+  private gmiManager!: GMIManager;
+  private agentOSOrchestrator!: AgentOSOrchestrator;
+  private languageService?: import('../cognition/nlp/language').LanguageService;
+  private guardrailService?: IGuardrailService;
+  private workflowFacade?: WorkflowFacade;
+  private discoveryInitializer?: CapabilityDiscoveryInitializer;
+  /** The learning layer the runtime's GMIs use: built from `learning`, or passed in `gmiManagerConfig`. */
+  private learningLayer?: ILearningLayer;
+  /** True when this runtime built the layer, and so closes it at shutdown. */
+  private ownsLearningLayer = false;
+
+  private ragMemoryInitializer!: RagMemoryInitializer;
+
+  private authService?: IAuthService;
+
+  private subscriptionService?: ISubscriptionService;
+  private prisma!: PrismaClient;
+
+  /**
+   * Constructs an `AgentOS` instance. The instance is not operational until
+   * `initialize()` is called and successfully completes.
+   */
+  constructor(private readonly logger: ILogger = createLogger('AgentOS')) {}
+
+  /**
+   * Convenience factory: build an `AgentOS` instance with a fully-populated
+   * default configuration in a single call.
+   *
+   * The factory uses {@link createAgentOSConfig} under the hood, which reads
+   * from the standard environment (`DATABASE_URL`, provider API keys, etc.)
+   * and wires up sane defaults for every sub-system. Any fields passed in
+   * `overrides` are deep-merged onto the generated config so callers can
+   * tweak observability, memoryTools, etc. without rebuilding the whole
+   * config object themselves. Provenance is an extension pack
+   * (`createProvenancePack()` in `extensionManifest`), not a config key.
+   *
+   * For fine-grained control, fall back to `new AgentOS()` +
+   * `initialize(yourConfig)`.
+   *
+   * @param overrides - Optional partial `AgentOSConfig` whose fields are
+   *   shallow-merged onto the auto-generated config. Pass `tools` /
+   *   `externalTools` here to register them at construction time. Pass
+   *   `observability`, `memoryTools`, etc. to opt into subsystems without
+   *   touching the rest of the defaults.
+   * @param logger - Optional logger override.
+   * @returns A fully-initialised `AgentOS` instance.
+   * @throws {AgentOSServiceError} If env config is invalid or initialisation fails.
+   *
+   * @example
+   * ```ts
+   * import { AgentOS } from '@framers/agentos';
+   *
+   * // Defaults — reads DATABASE_URL + provider keys from env.
+   * const os = await AgentOS.create();
+   *
+   * // With tracing turned on.
+   * const observed = await AgentOS.create({
+   *   observability: { tracing: { enabled: true } },
+   * });
+   * ```
+   */
+  public static async create(
+    overrides: Partial<AgentOSConfig> & { tools?: unknown; externalTools?: unknown } = {},
+    logger?: ILogger,
+  ): Promise<AgentOS> {
+    // Lazy-import to avoid a circular dependency between AgentOS.ts and
+    // core/config/AgentOSConfig.ts (which transitively pulls AgentOS types).
+    const { createAgentOSConfig } = await import('../core/config/AgentOSConfig.js');
+    const { tools, externalTools, ...configOverrides } = overrides;
+    const baseConfig = await createAgentOSConfig({ tools, externalTools } as Parameters<typeof createAgentOSConfig>[0]);
+    const mergedConfig = { ...baseConfig, ...configOverrides } as AgentOSConfig;
+    const instance = new AgentOS(logger);
+    await instance.initialize(mergedConfig);
+    return instance;
+  }
+
+  /**
+   * Initializes the `AgentOS` service and all its core dependencies.
+   * This method must be called and successfully awaited before any other operations
+   * can be performed on the `AgentOS` instance. It sets up configurations,
+   * instantiates managers, and prepares the system for operation.
+   *
+   * @public
+   * @async
+   * @param {AgentOSConfig} config - The comprehensive configuration object for AgentOS.
+   * @returns {Promise<void>} A promise that resolves when initialization is complete.
+   * @throws {AgentOSServiceError} If configuration validation fails or if any critical
+   * dependency fails to initialize.
+   */
+  public async initialize(config: AgentOSConfig): Promise<void> {
+    if (this.initialized) {
+      this.logger.warn('AgentOS initialize() called more than once; skipping.');
+      return;
+    }
+
+    this.validateConfiguration(config);
+    this.assertLearningConfig(config);
+    // `agencies`: its bounds are checked whenever it is set; the tool is registered only with `launch: true`.
+    let launchLimits: LaunchLimits | undefined;
+    try {
+      launchLimits = config.agencies ? resolveLaunchLimits(config.agencies) : undefined;
+    } catch (error) {
+      throw AgentOSServiceError.wrap(error, GMIErrorCode.CONFIGURATION_ERROR, 'The agencies option is not valid', 'AgentOS.initialize');
+    }
+    const resolvedConfig = RagMemoryInitializer.resolveConfig(config);
+    const normalizedConfigTools = adaptToolsToMap(resolvedConfig.tools);
+    // With `launch`, launch_agency joins the config tools after the host's own, and a tool of that name would be
+    // replaced without a word: the configuration is refused, as gmi() refuses it at construction.
+    if (launchLimits && config.agencies?.launch === true && normalizedConfigTools[LAUNCH_AGENCY_TOOL_NAME]) {
+      throw new AgentOSServiceError(
+        `The agencies option is not valid: agencies.launch registers '${LAUNCH_AGENCY_TOOL_NAME}', and the runtime's tools already hold a tool of that name.`,
+        GMIErrorCode.CONFIGURATION_ERROR,
+        { toolName: LAUNCH_AGENCY_TOOL_NAME },
+        'AgentOS.initialize',
+      );
+    }
+    const normalizedExternalTools = normalizeExternalToolRegistry(resolvedConfig.externalTools);
+    const {
+      externalTools: _externalTools,
+      tools: _tools,
+      ...resolvedConfigWithoutNormalizedTools
+    } = resolvedConfig;
+    // Make the configuration immutable after validation to prevent runtime changes.
+    this.config = Object.freeze({
+      ...resolvedConfigWithoutNormalizedTools,
+      ...(Object.keys(normalizedConfigTools).length > 0 ? { tools: normalizedConfigTools } : {}),
+      ...(normalizedExternalTools ? { externalTools: normalizedExternalTools } : {}),
+    });
+    // Initialize self-improvement session manager early (before emergent deps are assembled).
+    this.selfImprovementManager = new SelfImprovementSessionManager(this.logger);
+    this.selfImprovementManager.setConfiguredSkillsGetter(() => {
+      try {
+        const turnPlanningSkills = this.config.turnPlanning?.discovery?.sources?.skills;
+        if (Array.isArray(turnPlanningSkills)) {
+          return turnPlanningSkills as any[];
+        }
+        const legacySkills = (this.config as any).capabilityDiscovery?.sources?.skills;
+        if (Array.isArray(legacySkills)) {
+          return legacySkills as any[];
+        }
+      } catch {
+        // Fall through to empty set.
+      }
+      return [];
+    });
+
+    // Observability is opt-in (config + env). Safe no-op if OTEL is not installed by host.
+    configureAgentOSObservability(this.config.observability);
+
+    // Initialize LanguageService early if configured so downstream orchestration can use it.
+    if (config.languageConfig) {
+      try {
+        // Dynamic import may fail under certain bundler path resolutions; using explicit relative path.
+        const { LanguageService } = await import('../cognition/nlp/language');
+        this.languageService = new LanguageService(config.languageConfig);
+        await this.languageService.initialize();
+        this.logger.info('AgentOS LanguageService initialized');
+      } catch (langErr: any) {
+        this.logger.error(
+          'Failed initializing LanguageService; continuing without multilingual features',
+          { error: langErr?.message || langErr }
+        );
+      }
+    }
+
+    // Assign core services from configuration
+    this.authService = this.config.authService;
+    this.subscriptionService = this.config.subscriptionService;
+    this.prisma = this.config.prisma; // Optional - only needed for auth/subscriptions
+    this.guardrailService = this.config.guardrailService;
+
+    // Validate that either storageAdapter or prisma is provided
+    if (!this.config.storageAdapter && !this.config.prisma) {
+      throw new AgentOSServiceError(
+        'Either storageAdapter or prisma must be provided. Use storageAdapter for client-side (IndexedDB/SQLite) or prisma for server-side (PostgreSQL).',
+        GMIErrorCode.CONFIGURATION_ERROR,
+        'AgentOS.initialize'
+      );
+    }
+
+    this.logger.info('AgentOS initialization sequence started');
+
+    this.extensionManager = new ExtensionManager({
+      manifest: this.config.extensionManifest,
+      secrets: this.config.extensionSecrets,
+      overrides: this.config.extensionOverrides,
+    });
+    const extensionLifecycleContext: ExtensionLifecycleContext = { logger: this.logger };
+    await this.extensionManager.loadManifest(extensionLifecycleContext);
+    await this.registerConfigGuardrailService(extensionLifecycleContext);
+    if (this.config.requiredGuardrails?.length) {
+      try {
+        assertRequiredGuardrails(this.listActiveGuardrails(), this.config.requiredGuardrails);
+      } catch (error) {
+        throw AgentOSServiceError.wrap(error, GMIErrorCode.CONFIGURATION_ERROR, 'A required guardrail is missing.', 'AgentOS.initialize');
+      }
+    }
+
+    if (this.config.schemaOnDemandTools?.enabled === true) {
+      const allowPackages =
+        typeof this.config.schemaOnDemandTools.allowPackages === 'boolean'
+          ? this.config.schemaOnDemandTools.allowPackages
+          : process.env.NODE_ENV !== 'production';
+
+      const pack = createSchemaOnDemandPack({
+        extensionManager: this.extensionManager,
+        options: {
+          allowPackages,
+          allowModules: this.config.schemaOnDemandTools.allowModules,
+          officialRegistryOnly: this.config.schemaOnDemandTools.officialRegistryOnly,
+        },
+      });
+      await this.extensionManager.loadPackFromFactory(
+        pack,
+        'schema-on-demand',
+        undefined,
+        extensionLifecycleContext
+      );
+      this.logger.info('[AgentOS] Schema-on-demand tools enabled');
+    }
+
+    // Create RagMemoryInitializer now that extensionManager is available.
+    // modelProviderManager is wired later (after AI model provider init).
+    this.ragMemoryInitializer = new RagMemoryInitializer({
+      extensionManager: this.extensionManager,
+      modelProviderManager: undefined as any,
+      logger: this.logger,
+    });
+    this.ragMemoryInitializer.configureManaged(this.config);
+    await this.ragMemoryInitializer.registerMemoryTools(
+      this.config.memoryTools,
+      extensionLifecycleContext,
+      // The layer is built later, from the same config: whether it will exist is decided here already.
+      { learningLayer: this.learningConfigured() },
+    );
+
+    let storageAdapter = this.config.storageAdapter;
+    if (storageAdapter) {
+      let provenancePolicy: StoragePolicyConfig | undefined;
+      try {
+        const provenanceDescriptor = this.extensionManager
+          .getRegistry<any>(EXTENSION_KIND_PROVENANCE)
+          .getActive('provenance-system');
+        const provenanceHooks = (provenanceDescriptor as any)?.payload?.result?.hooks;
+        if (provenanceHooks) {
+          storageAdapter = wrapStorageAdapterWithWriteHooks(storageAdapter, provenanceHooks, {
+            logger: this.logger,
+          });
+          provenancePolicy = (provenanceDescriptor as any)?.payload?.config?.storagePolicy;
+          this.logger.info('[AgentOS][Provenance] Storage write hooks enabled');
+        }
+      } catch (error: any) {
+        this.logger.warn?.('[AgentOS][Provenance] Failed to apply storage write hooks', {
+          error: error?.message ?? error,
+        });
+      }
+      // The policy names its tables exactly: under a prefix the conversation tables would lose the protection it gives
+      // them by their default names, so the runtime does not start.
+      const unprotected = provenancePolicy ? conversationTablesLeftUnprotected(provenancePolicy, this.config.conversationManagerConfig) : [];
+      if (provenancePolicy && unprotected.length > 0) {
+        throw new AgentOSServiceError(
+          `The provenance storage policy (mode '${provenancePolicy.mode}') protects the conversation tables by their default names, and conversationManagerConfig.tablePrefix keeps them as ${unprotected.join(', ')}: add ${unprotected.join(', ')} to the policy's storagePolicy.protectedTables, or set no prefix.`,
+          GMIErrorCode.CONFIGURATION_ERROR,
+          { unprotectedTables: unprotected },
+          'AgentOS.initialize',
+        );
+      }
+    }
+
+    try {
+      this.workflowFacade = new WorkflowFacade({
+        extensionManager: this.extensionManager,
+        logger: this.logger,
+        workflowEngineConfig: this.config.workflowEngineConfig,
+        workflowStore: this.config.workflowStore,
+      });
+      await this.workflowFacade.initialize(extensionLifecycleContext);
+      // Initialize AI Model Provider Manager
+      this.modelProviderManager = new AIModelProviderManager();
+      await this.modelProviderManager.initialize(this.config.modelProviderManagerConfig);
+      console.log('AgentOS: AIModelProviderManager initialized.');
+      await this.ensureUtilityAIService();
+      // Re-create RagMemoryInitializer with model provider now available.
+      this.ragMemoryInitializer = new RagMemoryInitializer({
+        extensionManager: this.extensionManager,
+        modelProviderManager: this.modelProviderManager,
+        logger: this.logger,
+      });
+      this.ragMemoryInitializer.configureManaged(this.config);
+      await this.ragMemoryInitializer.initializeRag(this.config, storageAdapter);
+
+      // Initialize Prompt Engine
+      this.promptEngine = new PromptEngine();
+      const peUtility = this.utilityAIService;
+      if (
+        typeof peUtility.summarizeConversationHistory !== 'function' ||
+        typeof peUtility.summarizeRAGContext !== 'function'
+      ) {
+        const warningMsg =
+          'AgentOS WARNING: The provided utilityAIService does not fully implement the IPromptEngineUtilityAI interface (missing summarizeConversationHistory or summarizeRAGContext). PromptEngine functionality may be impaired.';
+        console.warn(warningMsg);
+      }
+      await this.promptEngine.initialize(this.config.promptEngineConfig, this.utilityAIService);
+      console.log('AgentOS: PromptEngine initialized.');
+
+      // Initialize Tool Permission Manager
+      this.toolPermissionManager = new ToolPermissionManager();
+      await this.toolPermissionManager.initialize(
+        this.config.toolPermissionManagerConfig,
+        this.authService,
+        this.subscriptionService
+      );
+      console.log('AgentOS: ToolPermissionManager initialized.');
+
+      // Initialize Tool Orchestrator
+      const toolRegistry = this.extensionManager.getRegistry<ITool>(EXTENSION_KIND_TOOL);
+      this.toolExecutor = new ToolExecutor(
+        this.authService,
+        this.subscriptionService,
+        toolRegistry
+      );
+      this.toolOrchestrator = new ToolOrchestrator();
+      // Build emergent options from config when emergent: true.
+      const emergentOptions = this.config.emergent
+        ? {
+            enabled: true,
+            config: this.config.emergentConfig,
+            generateText: async (model: string, prompt: string): Promise<string> => {
+              const provider = this.modelProviderManager.getDefaultProvider();
+              if (!provider) {
+                throw new Error('No LLM provider available for the emergent judge.');
+              }
+              const response = await provider.generateCompletion(
+                model,
+                [{ role: 'user', content: prompt }],
+                {}
+              );
+              const firstContent = response.choices?.[0]?.message?.content ?? '';
+              return typeof firstContent === 'string' ? firstContent : JSON.stringify(firstContent);
+            },
+            storageAdapter: storageAdapter
+              ? {
+                  run: async (sql: string, params?: unknown[]) =>
+                    storageAdapter.run(sql, params as any),
+                  get: async (sql: string, params?: unknown[]) =>
+                    storageAdapter.get(sql, params as any),
+                  all: async (sql: string, params?: unknown[]) =>
+                    storageAdapter.all(sql, params as any),
+                  exec: async (sql: string) => storageAdapter.exec(sql),
+                }
+              : undefined,
+
+            selfImprovementDeps:
+              this.config.emergentConfig?.selfImprovement?.enabled
+                ? this.selfImprovementManager.buildToolDeps(storageAdapter, {
+                    // The GMI that made the tool call, never whichever GMI happens to be first.
+                    getGMIForContext: (context) => resolveGMIForToolContext(this.gmiManager, context),
+                    getToolOrchestrator: () => this.toolOrchestrator,
+                  })
+                : undefined,
+          }
+        : undefined;
+      const initialConfigTools = adaptTools(this.config.tools);
+      const agencies = this.config.agencies;
+      if (launchLimits && agencies?.launch === true) {
+        initialConfigTools.push(
+          createRuntimeLaunchTool({
+            getGmiManager: () => this.gmiManager,
+            getToolOrchestrator: () => this.toolOrchestrator,
+            getAgencyRegistry: () => this.workflowFacade?.getAgencyRegistry(),
+            options: agencies,
+            limits: launchLimits,
+            gmiDefaults: this.config.gmiManagerConfig.defaultGMIBaseConfigDefaults,
+            providerEntry: (providerId: string) => this.modelProviderManager.getProviderEntry(providerId),
+            providerForModel: (modelId: string) => this.modelProviderManager.getProviderForModel(modelId)?.providerId,
+            logger: this.logger,
+          }),
+        );
+      }
+
+      await this.toolOrchestrator.initialize(
+        this.config.toolOrchestratorConfig,
+        this.toolPermissionManager,
+        this.toolExecutor,
+        initialConfigTools,
+        this.config.hitlManager,
+        emergentOptions
+      );
+      console.log('AgentOS: ToolOrchestrator initialized.');
+      if (initialConfigTools.length > 0) {
+        this.logger.info('[AgentOS] Config tools registered', {
+          toolCount: initialConfigTools.length,
+          toolNames: initialConfigTools.map((tool) => tool.name),
+        });
+      }
+      this.discoveryInitializer = new CapabilityDiscoveryInitializer({
+        toolOrchestrator: this.toolOrchestrator,
+        extensionManager: this.extensionManager,
+        modelProviderManager: this.modelProviderManager,
+        modelProviderManagerConfig: this.config.modelProviderManagerConfig,
+        turnPlanningConfig: this.config.turnPlanning,
+        configTools: this.config.tools,
+        logger: this.logger,
+      });
+      await this.discoveryInitializer.initialize();
+      if (this.discoveryInitializer.discoveryEngine && this.toolOrchestrator.setEmergentDiscoveryIndexer) {
+        this.toolOrchestrator.setEmergentDiscoveryIndexer(async (tools) => {
+          if (this.discoveryInitializer?.discoveryEngine?.indexEmergentTools) {
+            await this.discoveryInitializer.discoveryEngine.indexEmergentTools(tools);
+          }
+        });
+      }
+
+      // Initialize Conversation Manager
+      this.conversationManager = new ConversationManager();
+      await this.conversationManager.initialize(
+        this.config.conversationManagerConfig,
+        this.utilityAIService, // General IUtilityAI for conversation tasks
+        storageAdapter // Use storageAdapter instead of Prisma
+      );
+      console.log('AgentOS: ConversationManager initialized.');
+
+      // Initialize Streaming Manager
+      this.streamingManager = new StreamingManager();
+      await this.streamingManager.initialize(this.config.streamingManagerConfig);
+      console.log('AgentOS: StreamingManager initialized.');
+
+      // The learning layer, only when the host turned learning on (or passed a layer of its own).
+      this.learningLayer = this.resolveLearningLayer();
+
+      // Initialize GMI Manager
+      const personaSource = resolvePersonaLoader(this.config);
+      this.gmiManager = new GMIManager(
+        {
+          ...this.config.gmiManagerConfig,
+          personaLoaderConfig: personaSource.personaLoaderConfig,
+          ...(this.learningLayer ? { learningLayer: this.learningLayer } : {}),
+          // The seats of launched teams get a prompt engine of their own, which makes no model call.
+          ...(this.config.agencies && !this.config.gmiManagerConfig.agencySeatPromptEngineConfig
+            ? { agencySeatPromptEngineConfig: this.config.promptEngineConfig }
+            : {}),
+        },
+        this.subscriptionService,
+        this.authService,
+        this.conversationManager, // Removed Prisma parameter
+        this.promptEngine,
+        this.modelProviderManager,
+        this.utilityAIService, // Pass the potentially dual-role utility service
+        this.toolOrchestrator,
+        this.ragMemoryInitializer.retrievalAugmentor,
+        personaSource.loader
+      );
+      await this.gmiManager.initialize();
+      console.log('AgentOS: GMIManager initialized.');
+
+      if (this.workflowFacade) {
+        this.workflowFacade.setRuntimeDependencies({
+          gmiManager: this.gmiManager,
+          streamingManager: this.streamingManager,
+          toolOrchestrator: this.toolOrchestrator,
+        });
+        await this.workflowFacade.startRuntime();
+      }
+
+      // Initialize AgentOS Orchestrator
+      const orchestratorDependencies: AgentOSOrchestratorDependencies = {
+        gmiManager: this.gmiManager,
+        toolOrchestrator: this.toolOrchestrator,
+        conversationManager: this.conversationManager,
+        streamingManager: this.streamingManager,
+        modelProviderManager: this.modelProviderManager,
+        turnPlanner: this.discoveryInitializer?.turnPlanner,
+        rollingSummaryMemorySink: this.config.rollingSummaryMemorySink,
+        longTermMemoryRetriever: this.config.longTermMemoryRetriever,
+        taskOutcomeTelemetryStore: this.config.taskOutcomeTelemetryStore,
+        spendMeter: this.config.spendMeter?.meter,
+      };
+      this.agentOSOrchestrator = new AgentOSOrchestrator();
+      await this.agentOSOrchestrator.initialize(
+        this.config.orchestratorConfig,
+        orchestratorDependencies
+      );
+      this.logger.info('AgentOS orchestrator initialized');
+      // Wire the orchestrator into the workflow facade for progress broadcasts.
+      if (this.workflowFacade) {
+        this.workflowFacade.setRuntimeDependencies({
+          gmiManager: this.gmiManager,
+          streamingManager: this.streamingManager,
+          toolOrchestrator: this.toolOrchestrator,
+          orchestrator: this.agentOSOrchestrator,
+        });
+      }
+    } catch (error: unknown) {
+      this.logger.error('AgentOS initialization failed', { error });
+      const err =
+        error instanceof GMIError
+          ? error
+          : new GMIError(
+              error instanceof Error
+                ? error.message
+                : 'Unknown error during AgentOS initialization',
+              GMIErrorCode.GMI_INITIALIZATION_ERROR, // Corrected error code
+              error // details
+            );
+      console.error(
+        'AgentOS: Critical failure during core component initialization:',
+        err.toJSON()
+      );
+      throw AgentOSServiceError.wrap(
+        err,
+        err.code,
+        'AgentOS initialization failed',
+        'AgentOS.initialize'
+      );
+    }
+
+    this.initialized = true;
+    this.logger.info('AgentOS initialization complete');
+  }
+
+  /**
+   * Validates the provided `AgentOSConfig` to ensure all mandatory sub-configurations
+   * and dependencies are present.
+   *
+   * @private
+   * @param {AgentOSConfig} config - The configuration object to validate.
+   * @throws {AgentOSServiceError} If any required configuration parameter is missing,
+   * with `code` set to `GMIErrorCode.CONFIGURATION_ERROR`.
+   */
+  private validateConfiguration(config: AgentOSConfig): void {
+    const missingParams: string[] = [];
+    if (!config) {
+      // This case should ideally not be hit if TypeScript is used correctly at the call site,
+      // but as a runtime check:
+      missingParams.push('AgentOSConfig (entire object)');
+    } else {
+      validatePersonaSource(config);
+      // Check for each required sub-configuration
+      const requiredConfigs: Array<keyof AgentOSConfig> = [
+        'gmiManagerConfig',
+        'orchestratorConfig',
+        'promptEngineConfig',
+        'toolOrchestratorConfig',
+        'toolPermissionManagerConfig',
+        'conversationManagerConfig',
+        'streamingManagerConfig',
+        'modelProviderManagerConfig',
+        'defaultPersonaId',
+      ];
+      for (const key of requiredConfigs) {
+        if (!config[key]) {
+          missingParams.push(String(key));
+        }
+      }
+      // Either storageAdapter or prisma must be provided
+      if (!config.storageAdapter && !config.prisma) {
+        missingParams.push('storageAdapter or prisma (at least one required)');
+      }
+      if (config.memoryTools && config.memoryTools.enabled !== false) {
+        if (
+          !config.memoryTools.memory ||
+          typeof config.memoryTools.memory.createTools !== 'function'
+        ) {
+          missingParams.push('memoryTools.memory.createTools (when memoryTools is enabled)');
+        }
+        if (
+          config.memoryTools.manageLifecycle === true &&
+          typeof config.memoryTools.memory?.close !== 'function'
+        ) {
+          missingParams.push('memoryTools.memory.close (when memoryTools.manageLifecycle is true)');
+        }
+      }
+      if (config.standaloneMemory && config.standaloneMemory.enabled !== false) {
+        if (!config.standaloneMemory.memory) {
+          missingParams.push('standaloneMemory.memory');
+        }
+        if (
+          config.standaloneMemory.tools &&
+          !config.memoryTools &&
+          typeof config.standaloneMemory.memory?.createTools !== 'function'
+        ) {
+          missingParams.push(
+            'standaloneMemory.memory.createTools (when standaloneMemory.tools is enabled)'
+          );
+        }
+        if (
+          config.standaloneMemory.longTermRetriever &&
+          !config.longTermMemoryRetriever &&
+          typeof config.standaloneMemory.memory?.recall !== 'function'
+        ) {
+          missingParams.push(
+            'standaloneMemory.memory.recall (when standaloneMemory.longTermRetriever is enabled)'
+          );
+        }
+        if (
+          config.standaloneMemory.rollingSummarySink &&
+          !config.rollingSummaryMemorySink &&
+          (typeof config.standaloneMemory.memory?.remember !== 'function' ||
+            typeof config.standaloneMemory.memory?.forget !== 'function')
+        ) {
+          missingParams.push(
+            'standaloneMemory.memory.remember/forget (when standaloneMemory.rollingSummarySink is enabled)'
+          );
+        }
+        if (
+          config.standaloneMemory.manageLifecycle === true &&
+          typeof config.standaloneMemory.memory?.close !== 'function'
+        ) {
+          missingParams.push(
+            'standaloneMemory.memory.close (when standaloneMemory.manageLifecycle is true)'
+          );
+        }
+      }
+    }
+
+    if (missingParams.length > 0) {
+      const message = `AgentOS Configuration Error: Missing essential parameters: ${missingParams.join(', ')}.`;
+      console.error(message);
+      throw new AgentOSServiceError(message, GMIErrorCode.CONFIGURATION_ERROR, {
+        missingParameters: missingParams,
+      });
+    }
+  }
+
+  /** True when the overrides disable the guard given in `config.guardrailService`. */
+  private configGuardrailDisabled(): boolean {
+    return this.config.extensionOverrides?.guardrails?.['config-guardrail-service']?.enabled === false;
+  }
+
+  private async registerConfigGuardrailService(context: ExtensionLifecycleContext): Promise<void> {
+    if (!this.config.guardrailService || this.configGuardrailDisabled()) {
+      return;
+    }
+    const registry = this.extensionManager.getRegistry<IGuardrailService>(EXTENSION_KIND_GUARDRAIL);
+    await registry.register(
+      {
+        id: 'config-guardrail-service',
+        kind: EXTENSION_KIND_GUARDRAIL,
+        payload: this.config.guardrailService,
+        priority: Number.MAX_SAFE_INTEGER,
+        metadata: { origin: 'config' },
+      },
+      context
+    );
+  }
+
+  /** Every active guard with the id a required guard is named by: its own `id`, else its descriptor's. */
+  private listActiveGuardrails(): ActiveGuardrail[] {
+    const active: ActiveGuardrail[] = [];
+
+    if (this.extensionManager) {
+      const registry =
+        this.extensionManager.getRegistry<IGuardrailService>(EXTENSION_KIND_GUARDRAIL);
+      for (const descriptor of registry.listActive()) {
+        active.push({ id: descriptor.payload?.id ?? descriptor.id, service: descriptor.payload });
+      }
+    }
+
+    if (this.guardrailService && !this.configGuardrailDisabled() && !active.some((a) => a.service === this.guardrailService)) {
+      active.push({ id: this.guardrailService.id ?? 'config-guardrail-service', service: this.guardrailService });
+    }
+
+    return active;
+  }
+
+  /** The required guards' report for this moment, or null when the deployment requires none. */
+  private requiredGuardrailReport(): RequiredGuardrailReport | null {
+    const required = this.config.requiredGuardrails;
+    if (!required?.length) return null;
+    return checkRequiredGuardrails(this.listActiveGuardrails(), required);
+  }
+
+  private getActiveGuardrailServices(): IGuardrailService[] {
+    const required = this.config.requiredGuardrails ?? [];
+    return this.listActiveGuardrails().map(({ id, service }) => {
+      const spec = required.find((r) => r.id === id);
+      return spec ? withRequiredPosture(id, service, spec) : service;
+    });
+  }
+
+  /**
+   * The output guards' verdict on a stream. A block drops the pause the orchestrator saved for the stream, so neither
+   * `getPendingExternalToolRequest()` nor the stream offers its calls again. A block that withheld actionable tool
+   * calls drops their pause before the verdict reaches the caller. A block that withheld none (on a streamed delta, or
+   * on the chunk of calls the runtime runs itself) ends the caller's stream while the turn goes on inside the runtime:
+   * a pause the turn saves when it then stops for calls the host runs is dropped once the turn ends, and the verdict
+   * does not wait for that; from the verdict on, the stream is held as blocked, so that pause is neither offered nor
+   * resumed nor continued meanwhile. Then a replaced or rewritten reply is written to the stored conversation. A store
+   * that refuses the save of the dropped pause is logged: the stream is closed all the same, and the stored
+   * conversation keeps the pause until the conversation is saved again. Nothing here throws into the stream.
+   */
+  private async onOutputVerdict(conversationKey: string, verdict: GuardrailOutputVerdict): Promise<void> {
+    if (verdict.action === GuardrailAction.BLOCK) {
+      const withheld = verdict.toolCallIds ?? [];
+      const dropped = this.dropBlockedPause(verdict, withheld);
+      // the withheld calls' pause is dropped before the caller reads the verdict; a block that withheld none waits for
+      // the rest of the turn, which the caller's stream, already ended, does not wait for
+      if (withheld.length > 0) {
+        await dropped;
+      }
+    }
+    await this.recordGuardedReply(conversationKey, verdict);
+  }
+
+  /**
+   * Drops the pause a blocked stream saved, or saves before its turn ends: the calls the block withheld, or, for a
+   * block that withheld none, whatever calls the stream's pause holds. A failure is logged, never thrown.
+   */
+  private async dropBlockedPause(verdict: GuardrailOutputVerdict, withheld: readonly string[]): Promise<void> {
+    try {
+      await this.agentOSOrchestrator.discardBlockedToolCalls(verdict.streamId, withheld.length > 0 ? withheld : undefined, {
+        reason:
+          withheld.length > 0
+            ? 'An output guardrail blocked the reply that requested this tool call, so the call was not run.'
+            : 'An output guardrail blocked the turn that requested this tool call, so the call was not run.',
+        ...(verdict.reasonCode ? { reasonCode: verdict.reasonCode } : {}),
+        ...(verdict.guardrailId ? { guardrailId: verdict.guardrailId } : {}),
+      });
+    } catch (error) {
+      this.logger.warn('The refusal of a blocked tool call could not be saved: the stored conversation keeps its pause until it is saved again', {
+        streamId: verdict.streamId,
+        ...(withheld.length > 0 ? { toolCallIds: [...withheld] } : {}),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * With conversational persistence on, the orchestrator stores the model's reply before the output guards run. When
+   * a guard replaced or rewrote it, the stored message is made to hold what the person saw, so the history never
+   * carries a reply the guards refused. A reply blocked with no replacement is emptied, with the reason recorded.
+   */
+  private async recordGuardedReply(conversationKey: string, verdict: GuardrailOutputVerdict): Promise<void> {
+    const rewritten = verdict.action === GuardrailAction.SANITIZE || verdict.action === GuardrailAction.BLOCK;
+    // a verdict on a streamed delta judged no whole reply, and the orchestrator stores the reply only once the turn
+    // ends: that case is left to hold mode, where nothing streams before the final verdict
+    if (!rewritten || verdict.originalText === null || !this.config.orchestratorConfig?.enableConversationalPersistence || !this.conversationManager) return;
+    try {
+      const context = await this.conversationManager.getConversation(conversationKey);
+      if (!context) return;
+      if (this.conversationManager.appendOnlyPersistence) {
+        this.logger.warn('The conversation store is append-only: the stored reply keeps the text a guard replaced; the history in memory is rewritten', {
+          conversationId: conversationKey,
+          reasonCode: verdict.reasonCode ?? verdict.action,
+        });
+      }
+      // the message the verdict was about, by its text (the orchestrator stored the same string the guards judged):
+      // the newest such message is this turn's, and an earlier turn's reply is never touched
+      const stored = [...context.getAllMessages()].reverse().find((m) => m.role === MessageRole.ASSISTANT && m.metadata?.source === 'agentos_output' && m.content === verdict.originalText);
+      if (!stored) return;
+      context.replaceMessageContent(stored.id, verdict.finalText ?? '', {
+        modificationInfo: { strategy: 'filtered', reason: `guardrail:${verdict.reasonCode ?? verdict.action}` },
+      });
+      await this.conversationManager.saveConversation(context);
+    } catch (error) {
+      this.logger.warn('The guarded reply could not be written to the conversation', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** Hold mode: set, or forced by a guard required on the output stage. */
+  private holdsOutputUntilFinal(): boolean {
+    return this.config.guardrailOutputMode === 'hold' || (this.config.requiredGuardrails ?? []).some((r) => r.stages.includes('output'));
+  }
+
+  /** The error chunk a request is refused with while a required guard is missing. */
+  private requiredGuardrailMissingChunk(report: RequiredGuardrailReport, streamId: string, personaId: string): AgentOSErrorChunk {
+    return {
+      type: AgentOSResponseChunkType.ERROR,
+      streamId,
+      gmiInstanceId: 'guardrail',
+      personaId,
+      isFinal: true,
+      timestamp: new Date().toISOString(),
+      code: GMIErrorCode.GUARDRAIL_REQUIRED_MISSING,
+      message: 'A guardrail this deployment requires is not active, so the request was not run.',
+      details: { missing: report.missing, missingStage: report.missingStage },
+    };
+  }
+
+  private async ensureUtilityAIService(): Promise<void> {
+    if (this.utilityAIService) {
+      return;
+    }
+    if (this.config.utilityAIService) {
+      this.utilityAIService = this.config.utilityAIService;
+      return;
+    }
+    this.utilityAIService = await this.buildDefaultUtilityAI();
+  }
+
+  private async buildDefaultUtilityAI(): Promise<IUtilityAI & IPromptEngineUtilityAI> {
+    const fallbackUtility = new LLMUtilityAI();
+    const defaultProviderId =
+      this.config.gmiManagerConfig.defaultGMIBaseConfigDefaults?.defaultLlmProviderId ||
+      this.config.modelProviderManagerConfig.providers[0]?.providerId ||
+      'openai';
+    const defaultModelId =
+      this.config.gmiManagerConfig.defaultGMIBaseConfigDefaults?.defaultLlmModelId || 'gpt-4o';
+
+    await fallbackUtility.initialize({
+      llmProviderManager: this.modelProviderManager,
+      defaultProviderId,
+      defaultModelId,
+    });
+    return fallbackUtility;
+  }
+
+  /**
+   * Ensures that the `AgentOS` service has been successfully initialized before
+   * attempting to perform any operations.
+   *
+   * @private
+   * @throws {AgentOSServiceError} If the service is not initialized, with `code`
+   * set to `GMIErrorCode.NOT_INITIALIZED`.
+   */
+  private ensureInitialized(): void {
+    if (!this.initialized) {
+      throw new AgentOSServiceError(
+        'AgentOS Service is not initialized. Please call and await the initialize() method before attempting operations.',
+        GMIErrorCode.NOT_INITIALIZED,
+        { serviceName: 'AgentOS', operationAttemptedWhileUninitialized: true }
+      );
+    }
+  }
+
+  public async getRuntimeSnapshot(): Promise<AgentOSRuntimeSnapshot> {
+    this.ensureInitialized();
+
+    const activeConversations =
+      (this.conversationManager as any)?.activeConversations instanceof Map
+        ? Array.from(
+            (
+              (this.conversationManager as any).activeConversations as Map<
+                string,
+                ConversationContext
+              >
+            ).values()
+          )
+        : [];
+
+    const conversationItems: AgentOSActiveConversationSnapshot[] = activeConversations.map(
+      (context) => {
+        const history = context.getHistory();
+        const lastActiveAt = history.reduce((latest, message) => {
+          const timestamp = typeof message.timestamp === 'number' ? message.timestamp : 0;
+          return Math.max(latest, timestamp);
+        }, 0);
+
+        return {
+          sessionId: context.sessionId,
+          userId: context.getMetadata('userId'),
+          gmiInstanceId: context.getMetadata('gmiInstanceId'),
+          activePersonaId: context.getMetadata('activePersonaId'),
+          createdAt: context.createdAt,
+          lastActiveAt: lastActiveAt || context.getMetadata('_lastAccessed'),
+          messageCount: history.length,
+        };
+      }
+    );
+
+    const gmiItems: AgentOSActiveGMISnapshot[] = [];
+    for (const gmi of this.gmiManager.activeGMIs.values()) {
+      const cognitiveMemory = gmi.getCognitiveMemoryManager?.();
+      const workingMemorySnapshot = await gmi.getWorkingMemorySnapshot().catch(() => ({}));
+      const prospectiveCount = cognitiveMemory?.listProspective
+        ? (await cognitiveMemory.listProspective().catch(() => [])).length
+        : 0;
+
+      gmiItems.push({
+        gmiId: gmi.gmiId,
+        personaId: gmi.getPersona().id,
+        state: gmi.getCurrentState(),
+        createdAt: gmi.creationTimestamp.toISOString(),
+        hasCognitiveMemory: Boolean(cognitiveMemory),
+        reasoningTraceEntries: gmi.getReasoningTrace().entries.length,
+        workingMemoryKeys: Object.keys(workingMemorySnapshot).length,
+        cognitiveMemory: cognitiveMemory
+          ? {
+              totalTraces: cognitiveMemory.getStore().getTraceCount(),
+              activeTraces: cognitiveMemory.getStore().getActiveTraceCount(),
+              workingMemorySlots: cognitiveMemory.getWorkingMemory().getSlotCount(),
+              workingMemoryCapacity: cognitiveMemory.getWorkingMemory().getCapacity(),
+              prospectiveCount,
+            }
+          : undefined,
+      });
+    }
+
+    const providerIds = this.config.modelProviderManagerConfig.providers
+      .filter((provider) => provider.enabled !== false)
+      .map((provider) => provider.providerId);
+    const toolRegistry = this.extensionManager.getRegistry<ITool>(EXTENSION_KIND_TOOL);
+    const workflowRegistry =
+      this.extensionManager.getRegistry<WorkflowDescriptorPayload>(EXTENSION_KIND_WORKFLOW);
+    const guardrailRegistry =
+      this.extensionManager.getRegistry<IGuardrailService>(EXTENSION_KIND_GUARDRAIL);
+
+    return {
+      initialized: this.initialized,
+      services: {
+        conversationManager: Boolean(this.conversationManager),
+        extensionManager: Boolean(this.extensionManager),
+        toolOrchestrator: Boolean(this.toolOrchestrator),
+        modelProviderManager: Boolean(this.modelProviderManager),
+        retrievalAugmentor: Boolean(this.ragMemoryInitializer?.retrievalAugmentor),
+        workflowEngine: Boolean(this.workflowFacade),
+      },
+      providers: {
+        configured: providerIds,
+        defaultProvider: this.modelProviderManager.getDefaultProvider()?.providerId ?? null,
+      },
+      extensions: {
+        loadedPacks: this.extensionManager.listLoadedPacks().map((pack) => pack.key),
+        toolCount: toolRegistry.listActive().length,
+        workflowCount: workflowRegistry.listActive().length,
+        guardrailCount: guardrailRegistry.listActive().length,
+      },
+      conversations: {
+        activeCount: conversationItems.length,
+        items: conversationItems,
+      },
+      gmis: {
+        activeCount: gmiItems.length,
+        items: gmiItems,
+      },
+    };
+  }
+
+  public getConversationManager(): ConversationManager {
+    this.ensureInitialized();
+    return this.conversationManager;
+  }
+
+  public getGMIManager(): GMIManager {
+    this.ensureInitialized();
+    return this.gmiManager;
+  }
+
+  /**
+   * The runtime's learning layer, or `undefined` when learning is off: no `learning` option and no layer passed
+   * in `gmiManagerConfig.learningLayer`. A host reads the loop manifest from it; a measurement asserts on it
+   * that a runtime it compares has learning off.
+   */
+  public getLearningLayer(): ILearningLayer | undefined {
+    this.ensureInitialized();
+    return this.learningLayer;
+  }
+
+  /** Whether the runtime has a learning layer: `learning` on, or a layer passed in `gmiManagerConfig.learningLayer`. */
+  private learningConfigured(): boolean {
+    const option = this.config.learning as boolean | LearningConfig | null | undefined;
+    return (option !== undefined && option !== null && option !== false) || Boolean(this.config.gmiManagerConfig?.learningLayer);
+  }
+
+  /**
+   * Checks the `learning` option before any service starts: a `LearningConfig` must be valid, `learning.namespace`
+   * is refused (the runtime takes each turn's resolved organization), and `learning` and
+   * `gmiManagerConfig.learningLayer` are not both set (the manager takes one layer). `learning: null`, and a field set
+   * to `null`, read as unset, as a config read from JSON or YAML writes them.
+   *
+   * @throws {AgentOSServiceError} With `CONFIGURATION_ERROR` (`SYS_CONFIGURATION_ERROR`), naming the option.
+   */
+  private assertLearningConfig(config: AgentOSConfig): void {
+    const option = config.learning as boolean | LearningConfig | null | undefined;
+    if (option === undefined || option === null || option === false) return;
+    const refuse = (message: string): never => {
+      throw new AgentOSServiceError(message, GMIErrorCode.CONFIGURATION_ERROR, undefined, 'AgentOS.initialize');
+    };
+    if (config.gmiManagerConfig?.learningLayer) {
+      refuse('Both learning and gmiManagerConfig.learningLayer are set; set one.');
+    }
+    const namespace = option === true ? undefined : (option as { namespace?: unknown }).namespace;
+    if (namespace !== undefined && namespace !== null) {
+      refuse("learning.namespace is read by gmi() only; the runtime takes each turn's resolved organizationId.");
+    }
+    try {
+      resolveLearningConfig(option === true ? {} : option, 'custom');
+    } catch (error) {
+      throw AgentOSServiceError.wrap(error, GMIErrorCode.CONFIGURATION_ERROR, 'The learning option is not valid', 'AgentOS.initialize');
+    }
+  }
+
+  /**
+   * The layer the GMI manager is built with: one built from `learning` (profile `custom`: the runtime has no
+   * cognition profile, so rendering is on and the self-change kinds are off unless the config asks for them), or
+   * the one the host passed in `gmiManagerConfig.learningLayer`, or none. A layer the runtime builds keeps its store
+   * on the host's own `storageAdapter`, never the provenance-wrapped one, whose write hooks can turn a run() into a
+   * no-op, and reaches the facade of `memoryTools` and the standalone memory's after any `learning.memoryTools`.
+   */
+  private resolveLearningLayer(): ILearningLayer | undefined {
+    const option = this.config.learning as boolean | LearningConfig | null | undefined;
+    this.ownsLearningLayer = false;
+    // Unset, null or false: no layer of the runtime's own.
+    if (option === undefined || option === null || option === false) return this.config.gmiManagerConfig.learningLayer;
+    const config: LearningConfig = option === true ? {} : option;
+    const tools = this.config.memoryTools && this.config.memoryTools.enabled !== false ? this.config.memoryTools.memory : undefined;
+    const standalone =
+      this.config.standaloneMemory && this.config.standaloneMemory.enabled !== false ? this.config.standaloneMemory.memory : undefined;
+    // The host's own facade first, then the memory tools' and the standalone memory's, each once. The layer checks a
+    // facade member by member at run time, so the config's facade types are read through `unknown`.
+    const facades = ([config.memoryTools, tools, standalone] as unknown[]).filter(
+      (facade, index, all) => !!facade && typeof facade === 'object' && all.indexOf(facade) === index,
+    ) as LearningMemoryTools[];
+    const [memoryTools, ...memoryFacades] = facades;
+    const layer = createLearningLayer({
+      ...config,
+      ...(memoryTools ? { memoryTools } : {}),
+      ...(memoryFacades.length > 0 ? { memoryFacades } : {}),
+      // The host's own adapter: the provenance wrap is a local of initialize() and never on the config.
+      ...(this.config.storageAdapter ? { storageAdapter: this.config.storageAdapter } : {}),
+      profile: 'custom',
+      surface: 'runtime',
+      hostLoops: this.describeHostLoops(),
+    });
+    this.ownsLearningLayer = true;
+    return layer;
+  }
+
+  /** What this runtime's configuration says about the loops it runs, for the learning layer's manifest. */
+  private describeHostLoops(): Partial<Record<HostLoopName, LoopState>> {
+    const perFactory: LoopState = { live: 'varies', detail: "decided by the host's cognitiveMemoryFactory" };
+    const perPersona: LoopState = { live: 'varies', detail: 'set per persona' };
+    const off = (detail: string): LoopState => ({ live: false, detail });
+    const memory = Boolean(this.config.gmiManagerConfig.cognitiveMemoryFactory);
+    const emergent = this.config.emergent === true;
+    return {
+      memory: memory ? { live: true } : off('no gmiManagerConfig.cognitiveMemoryFactory'),
+      memory_mechanisms: memory ? perFactory : off('no cognitive memory'),
+      memory_observer_reflector: memory ? perFactory : off('no cognitive memory'),
+      memory_store: memory ? perFactory : off('no cognitive memory'),
+      sentiment: perPersona,
+      metaprompts: perPersona,
+      emergent_tools: emergent ? { live: true } : off('emergent is off'),
+      self_improvement_tools:
+        emergent && this.config.emergentConfig?.selfImprovement?.enabled === true
+          ? { live: true }
+          : off('emergentConfig.selfImprovement is off'),
+      forged_code_executor:
+        emergent && this.config.emergentConfig?.allowSandboxTools === true ? { live: true } : off('sandbox forging is off'),
+      hitl: this.hitlLoop(),
+      tool_policy: this.toolPolicyLoop(),
+      rag: this.ragMemoryInitializer?.retrievalAugmentor ? { live: true } : off('no retrieval augmentor'),
+    };
+  }
+
+  /**
+   * The tool orchestrator's approval gate, for the manifest: it asks only with `hitl.enabled`, only for a tool that
+   * has side effects unless `requireApprovalForSideEffects` is false (then for none), and with no manager it refuses
+   * such a tool unless `autoApproveWhenNoManager` approves every one.
+   */
+  private hitlLoop(): LoopState {
+    const hitl = this.config.toolOrchestratorConfig?.hitl;
+    if (hitl?.enabled !== true) return { live: false, detail: 'toolOrchestratorConfig.hitl.enabled is off' };
+    if (hitl.requireApprovalForSideEffects === false) {
+      return { live: false, detail: 'toolOrchestratorConfig.hitl.requireApprovalForSideEffects is off: the gate asks for no tool' };
+    }
+    if (!this.config.hitlManager) {
+      return hitl.autoApproveWhenNoManager === true
+        ? { live: false, detail: 'no hitlManager, and hitl.autoApproveWhenNoManager approves every call' }
+        : { live: true, detail: 'no hitlManager: side-effect tools are refused' };
+    }
+    return { live: true };
+  }
+
+  /**
+   * The adaptive tool-policy switch, for the manifest: it changes a turn plan's tool policy from task-outcome
+   * telemetry, so it needs adaptive execution, the telemetry and a turn planner. The planner is built before the
+   * learning layer, so it is read set or not.
+   */
+  private toolPolicyLoop(): LoopState {
+    const orchestratorConfig = this.config.orchestratorConfig;
+    if (orchestratorConfig.adaptiveExecution?.enabled === false) {
+      return { live: false, detail: 'orchestratorConfig.adaptiveExecution is off' };
+    }
+    if (orchestratorConfig.taskOutcomeTelemetry?.enabled === false) {
+      return { live: false, detail: 'orchestratorConfig.taskOutcomeTelemetry is off: the switch reads no success rate' };
+    }
+    if (!this.discoveryInitializer?.turnPlanner) {
+      return { live: false, detail: 'no turn planner: the switch has no turn plan to change' };
+    }
+    return { live: true };
+  }
+
+  public getExtensionManager(): ExtensionManager {
+    this.ensureInitialized();
+    return this.extensionManager;
+  }
+
+  /**
+   * Active extension HTTP handlers (EXTENSION_KIND_HTTP_HANDLER payloads), in
+   * registration order. Empty before initialize() or when none are loaded.
+   * Hosts (AgentOSServer, wunderland start, express mounts) iterate these to
+   * serve pack-contributed endpoints such as webhooks.
+   */
+  public getHttpHandlers(): HttpHandlerPayload[] {
+    if (!this.extensionManager) return [];
+    return this.extensionManager
+      .getRegistry<HttpHandlerPayload>(EXTENSION_KIND_HTTP_HANDLER)
+      .listActive()
+      .map((descriptor) => descriptor.payload)
+      .filter(Boolean);
+  }
+
+  public getToolOrchestrator(): IToolOrchestrator {
+    this.ensureInitialized();
+    return this.toolOrchestrator;
+  }
+
+  public getExternalToolRegistry(): ExternalToolRegistry | undefined {
+    this.ensureInitialized();
+    return this.config.externalTools;
+  }
+
+  public listExternalToolsForLLM(): ToolDefinitionForLLM[] {
+    this.ensureInitialized();
+    return listExternalToolDefinitionsForLLM(this.config.externalTools);
+  }
+
+  public getModelProviderManager(): AIModelProviderManager {
+    this.ensureInitialized();
+    return this.modelProviderManager;
+  }
+
+  /**
+   * Processes a single interaction turn with an AI agent. This is an asynchronous generator
+   * that yields {@link AgentOSResponse} chunks as they become available.
+   *
+   * This method orchestrates:
+   * 1. Retrieval or creation of a {@link StreamId} via the {@link AgentOSOrchestrator}.
+   * 2. Registration of a temporary, request-scoped stream client to the internal streaming manager.
+   * 3. Yielding of {@link AgentOSResponse} chunks received by this client.
+   * 4. Ensuring the temporary client is deregistered upon completion or error.
+   *
+   * The underlying {@link AgentOSOrchestrator} handles the GMI interaction and pushes
+   * chunks to the internal streaming manager. This method acts as the bridge to make these
+   * chunks available as an `AsyncGenerator` to the caller (e.g., an API route handler).
+   *
+   * @public
+   * @async
+   * @generator
+   * @param {AgentOSInput} input - The comprehensive input for the current interaction turn.
+   * @yields {AgentOSResponse} Chunks of the agent's response as they are processed.
+   * @returns {AsyncGenerator<AgentOSResponse, void, undefined>} An asynchronous generator
+   * that yields response chunks. The generator completes when the interaction is finalized
+   * or a terminal error occurs.
+   * @throws {AgentOSServiceError} If a critical error occurs during setup or if the
+   * service is not initialized. Errors during GMI processing are typically yielded as
+   * `AgentOSErrorChunk`s.
+   */
+  public async *processRequest(
+    input: AgentOSInput
+  ): AsyncGenerator<AgentOSResponse, void, undefined> {
+    this.ensureInitialized();
+    // Authentication and detailed authorization would typically happen here or be delegated.
+    // For example:
+    // if (!await this.authService.isUserAuthenticated(input.sessionId, input.userId)) {
+    //   throw new AgentOSServiceError("User not authenticated.", GMIErrorCode.AUTHENTICATION_REQUIRED);
+    // }
+
+    const effectivePersonaId = input.selectedPersonaId || this.config.defaultPersonaId;
+
+    const guardrailContext: GuardrailContext = {
+      userId: input.userId,
+      sessionId: input.sessionId,
+      personaId: effectivePersonaId,
+      conversationId: input.conversationId,
+      metadata: input.options?.customFlags,
+    };
+
+    const requiredReport = this.requiredGuardrailReport();
+    if (requiredReport && !requiredReport.ok) {
+      this.logger.error('A required guardrail is missing; the request was not run', { missing: requiredReport.missing, missingStage: requiredReport.missingStage });
+      yield this.requiredGuardrailMissingChunk(requiredReport, input.sessionId || `agentos-guardrail-${Date.now()}`, effectivePersonaId);
+      return;
+    }
+
+    const guardrailServices = this.getActiveGuardrailServices();
+
+    const guardrailReadyInput: AgentOSInput = {
+      ...input,
+      selectedPersonaId: effectivePersonaId,
+    };
+
+    const guardrailInputOutcome = await evaluateInputGuardrails(
+      guardrailServices,
+      guardrailReadyInput,
+      guardrailContext
+    );
+
+    const blockingEvaluation =
+      guardrailInputOutcome.evaluation ?? guardrailInputOutcome.evaluations?.at(-1) ?? null;
+
+    if (blockingEvaluation?.action === GuardrailAction.BLOCK) {
+      const streamId =
+        guardrailReadyInput.sessionId || (`agentos-guardrail-${Date.now()}` as StreamId);
+      const blockedStream = createGuardrailBlockedStream(guardrailContext, blockingEvaluation, {
+        streamId,
+        personaId: effectivePersonaId,
+      });
+      for await (const chunk of blockedStream) {
+        yield chunk;
+      }
+      return;
+    }
+
+    const orchestratorInput: AgentOSInput = this.selfImprovementManager.applySessionOverrides({
+      ...guardrailInputOutcome.sanitizedInput,
+      selectedPersonaId: effectivePersonaId,
+      skillPromptContext: this.selfImprovementManager.buildSkillPromptContext(
+        guardrailInputOutcome.sanitizedInput.sessionId,
+      ),
+      disabledSessionSkillIds: this.selfImprovementManager.listDisabledSkillIds(
+        this.selfImprovementManager.buildSessionRuntimeKey(guardrailInputOutcome.sanitizedInput.sessionId),
+      ),
+    });
+    // A structured reply: the schema is resolved here, before the turn, so a request that names a schema the runtime
+    // cannot reach is refused with no model call; the turn receives the spec with its schema in hand.
+    let structuredSpec: ResolvedStructuredReply | null = null;
+    if (orchestratorInput.options?.structuredReply) {
+      try {
+        const spec: StructuredReplySpec = resolveStructuredReplySpec(orchestratorInput.options.structuredReply, this.config.structuredSchemas);
+        structuredSpec = resolveStructuredReply(spec);
+        orchestratorInput.options = { ...orchestratorInput.options, structuredReply: spec };
+      } catch (error) {
+        const message = error instanceof StructuredReplyConfigError ? error.message : `The structured reply could not be set up: ${error instanceof Error ? error.message : String(error)}`;
+        yield {
+          type: AgentOSResponseChunkType.ERROR,
+          streamId: orchestratorInput.sessionId || `agentos-req-${Date.now()}`,
+          gmiInstanceId: 'structured_reply',
+          personaId: effectivePersonaId,
+          isFinal: true,
+          timestamp: new Date().toISOString(),
+          code: GMIErrorCode.VALIDATION_ERROR,
+          message,
+          details: { structuredReply: true },
+        } as AgentOSErrorChunk;
+        return;
+      }
+    }
+    // Language negotiation (non-blocking)
+    let languageNegotiation: any = null;
+    if (this.languageService && this.config.languageConfig) {
+      try {
+        languageNegotiation = this.languageService.negotiate({
+          explicitUserLanguage: orchestratorInput.languageHint,
+          detectedLanguages: orchestratorInput.detectedLanguages,
+          conversationPreferred: undefined,
+          personaDefault: undefined,
+          configDefault: this.config.languageConfig.defaultLanguage,
+          supported: this.config.languageConfig.supportedLanguages,
+          fallbackChain: this.config.languageConfig.fallbackLanguages || [
+            this.config.languageConfig.defaultLanguage,
+          ],
+          preferSourceLanguageResponses: this.config.languageConfig.preferSourceLanguageResponses,
+          targetLanguage: orchestratorInput.targetLanguage,
+        } as any);
+      } catch (negErr: any) {
+        this.logger.warn('Language negotiation failed', { error: negErr?.message || negErr });
+      }
+    }
+    const baseStreamDebugId = orchestratorInput.sessionId || `agentos-req-${Date.now()}`;
+    this.logger.debug?.('processRequest invoked', {
+      userId: orchestratorInput.userId,
+      sessionId: orchestratorInput.sessionId,
+      personaId: orchestratorInput.selectedPersonaId,
+    });
+
+    // The spend meter: the request's units are reserved before anything reaches a provider. A refusal, a missing
+    // operation id or a meter that cannot answer ends the request here with an error chunk and no model call.
+    const metering = this.config.spendMeter;
+    let meteredOperationId: string | undefined;
+    if (metering) {
+      const refuse = (code: GMIErrorCode, message: string, details: Record<string, unknown>): AgentOSErrorChunk => ({
+        type: AgentOSResponseChunkType.ERROR,
+        streamId: baseStreamDebugId,
+        gmiInstanceId: 'spend_meter',
+        personaId: effectivePersonaId,
+        isFinal: true,
+        timestamp: new Date().toISOString(),
+        code,
+        message,
+        details,
+      });
+      const operationId = typeof orchestratorInput.operationId === 'string' ? orchestratorInput.operationId.trim() : '';
+      if (!operationId) {
+        yield refuse(GMIErrorCode.VALIDATION_ERROR, 'A metered request needs an operationId.', {});
+        return;
+      }
+      try {
+        const reservation = await metering.meter.reserve({
+          accountId: metering.accountIdOf?.(orchestratorInput) ?? orchestratorInput.organizationId ?? orchestratorInput.userId,
+          operationId,
+          units: metering.unitsOf?.(orchestratorInput) ?? 1,
+        });
+        if (reservation.status === 'denied') {
+          yield refuse(SPEND_DENIAL_CODE[reservation.reason], `The request was not run: ${reservation.reason.replace(/_/g, ' ')}.`, {
+            reason: reservation.reason,
+            period: reservation.period,
+            remaining: reservation.remaining,
+          });
+          return;
+        }
+        meteredOperationId = operationId;
+      } catch (meterError) {
+        this.logger.error('The spend meter could not reserve; the request was not run', {
+          error: meterError instanceof Error ? meterError.message : String(meterError),
+        });
+        yield refuse(GMIErrorCode.SPEND_METER_UNAVAILABLE, 'The request could not be counted, so it was not run.', {
+          unavailable: meterError instanceof SpendMeterUnavailableError,
+        });
+        return;
+      }
+    }
+    let replacedByGuardrail = false;
+
+    let streamIdToListen: StreamId | undefined;
+    // Temporary client bridge to adapt push-based StreamingManager to pull-based AsyncGenerator
+    const bridge = new AsyncStreamClientBridge(`client-processReq-${baseStreamDebugId}`);
+
+    try {
+      this.logger.debug?.('Registering streaming bridge for request', {
+        userId: orchestratorInput.userId,
+        sessionId: orchestratorInput.sessionId,
+      });
+
+      // The orchestrator creates/manages the actual stream and starts pushing chunks to StreamingManager.
+      // We get the streamId it uses so our bridge can listen to it.
+      // the output guards that evaluate tool calls also judge each call the runtime runs itself, before it runs; a
+      // host with none hands the orchestrator the turn alone, as before
+      const turnInput = {
+        ...orchestratorInput,
+        languageNegotiation,
+      } as any;
+      const toolCallGate = createToolCallGate(guardrailServices, guardrailContext);
+      streamIdToListen = toolCallGate
+        ? await this.agentOSOrchestrator.orchestrateTurn(turnInput, { toolCallGate })
+        : await this.agentOSOrchestrator.orchestrateTurn(turnInput);
+      await this.streamingManager.registerClient(streamIdToListen, bridge);
+      this.logger.debug?.('Bridge registered', { bridgeId: bridge.id, streamId: streamIdToListen });
+
+      const guardrailWrappedStream = wrapOutputGuardrails(
+        guardrailServices,
+        guardrailContext,
+        bridge.consume(),
+        {
+          streamId: streamIdToListen!,
+          personaId: effectivePersonaId,
+          inputEvaluations: guardrailInputOutcome.evaluations ?? [],
+          holdUntilFinal: this.holdsOutputUntilFinal(),
+          onVerdict: (verdict) => this.onOutputVerdict(orchestratorInput.conversationId || orchestratorInput.sessionId, verdict),
+        }
+      );
+      if (orchestratorInput.workflowRequest) {
+        const wfRequest = orchestratorInput.workflowRequest;
+        try {
+          await this.startWorkflow(wfRequest.definitionId, orchestratorInput, {
+            workflowId: wfRequest.workflowId,
+            conversationId:
+              wfRequest.conversationId ??
+              orchestratorInput.conversationId ??
+              orchestratorInput.sessionId,
+            createdByUserId: orchestratorInput.userId,
+            context: wfRequest.context,
+            roleAssignments: wfRequest.roleAssignments,
+            metadata: wfRequest.metadata,
+          });
+        } catch (error) {
+          this.logger.error('Failed to start workflow from request payload', {
+            workflowDefinitionId: wfRequest.definitionId,
+            conversationId: wfRequest.conversationId ?? orchestratorInput.conversationId,
+            error,
+          });
+        }
+      }
+
+      // Yield chunks from the guardrail-wrapped stream
+      for await (const guarded of guardrailWrappedStream) {
+        let chunk: AgentOSResponse = guarded;
+        if (meteredOperationId && isOutputGuardrailBlock(chunk)) replacedByGuardrail = true;
+        // A structured turn's final chunk, after the output guardrails: a sanitizer that rewrote the text may have
+        // broken the shape the model matched, so the text is checked again as it stands.
+        if (structuredSpec && chunk.type === AgentOSResponseChunkType.FINAL_RESPONSE) {
+          const finalChunk = chunk as AgentOSFinalResponseChunk;
+          const sanitized = Array.isArray(finalChunk.metadata?.guardrail?.output) && finalChunk.metadata.guardrail.output.some((e: { action?: unknown }) => String(e?.action).toLowerCase() === 'sanitize');
+          if (finalChunk.structured && sanitized) {
+            const rechecked = recheckStructuredReply(finalChunk.finalResponseText, finalChunk.structured, structuredSpec);
+            if (!rechecked.meta.valid && structuredSpec.onExhausted === 'error') {
+              yield {
+                type: AgentOSResponseChunkType.ERROR,
+                streamId: finalChunk.streamId,
+                gmiInstanceId: finalChunk.gmiInstanceId,
+                personaId: finalChunk.personaId,
+                isFinal: true,
+                timestamp: new Date().toISOString(),
+                code: GMIErrorCode.STRUCTURED_OUTPUT_INVALID,
+                message: `The reply no longer matched the schema "${structuredSpec.name}" after an output guardrail rewrote it.`,
+                details: { schemaName: structuredSpec.name, stage: 'post_guardrail', issues: rechecked.meta.issues },
+              } as AgentOSErrorChunk;
+              break;
+            }
+            chunk = { ...finalChunk, structured: rechecked };
+          }
+        }
+        if (languageNegotiation) {
+          if (!chunk.metadata) chunk.metadata = {};
+          chunk.metadata.language = languageNegotiation;
+        }
+        yield chunk;
+        if (isActionableToolCallRequestChunk(chunk)) {
+          break;
+        }
+        if (chunk.isFinal && chunk.type !== AgentOSResponseChunkType.ERROR) {
+          // If a non-error chunk is final, the primary interaction part might be done.
+          // The stream itself might remain open for a short while for cleanup or late messages.
+          // The bridge's consume() will end when notifyStreamClosed is called.
+          break;
+        }
+      }
+    } catch (error: unknown) {
+      const serviceError = AgentOSServiceError.wrap(
+        error,
+        GMIErrorCode.GMI_PROCESSING_ERROR, // Default code for facade-level processing errors
+        `Error during AgentOS.processRequest for user '${orchestratorInput.userId}'`,
+        'AgentOS.processRequest'
+      );
+      this.logger.error('processRequest failed', {
+        error: serviceError,
+        streamId: streamIdToListen,
+      });
+
+      const errorChunk: AgentOSErrorChunk = {
+        type: AgentOSResponseChunkType.ERROR,
+        streamId: streamIdToListen || baseStreamDebugId, // Use known streamId if available
+        gmiInstanceId: (serviceError.details as any)?.gmiInstanceId || 'agentos_facade_error',
+        personaId: effectivePersonaId,
+        isFinal: true,
+        timestamp: new Date().toISOString(),
+        code: serviceError.code.toString(),
+        message: serviceError.message, // Use the wrapped error's message
+        details: serviceError.details || { name: serviceError.name, stack: serviceError.stack },
+      };
+      yield errorChunk; // Yield the processed error
+    } finally {
+      // The turn settles its own reservation when it ends. Two cases are this method's: a turn that never started
+      // (nothing reached a provider) is released, and a reply an output guardrail stopped is refunded.
+      if (meteredOperationId && metering) {
+        const outcome = !streamIdToListen ? 'released' : replacedByGuardrail ? 'replaced' : null;
+        if (outcome) {
+          await metering.meter.settle({ operationId: meteredOperationId, outcome }).catch((settleError: unknown) => {
+            this.logger.warn('The spend meter could not settle; its reconciler will', {
+              outcome,
+              error: settleError instanceof Error ? settleError.message : String(settleError),
+            });
+          });
+        }
+      }
+      if (streamIdToListen) {
+        const activeStreamIds = await this.streamingManager
+          .getActiveStreamIds()
+          .catch(() => [] as string[]);
+        if (activeStreamIds.includes(streamIdToListen)) {
+          await this.streamingManager
+            .deregisterClient(streamIdToListen, bridge.id)
+            .catch((deregError) => {
+              this.logger.warn('Failed to deregister bridge client', {
+                bridgeId: bridge.id,
+                streamId: streamIdToListen,
+                error: (deregError as Error).message,
+              });
+            });
+        }
+      }
+      bridge.forceClose(); // Ensure the bridge generator also terminates
+    }
+  }
+
+  /**
+   * Handles the result of an externally executed tool and continues the agent interaction.
+   * This method is an asynchronous generator that yields new {@link AgentOSResponse} chunks
+   * resulting from the GMI processing the tool's output.
+   *
+   * It functions similarly to `processRequest` by:
+   * 1. Delegating to {@link AgentOSOrchestrator.orchestrateToolResult}, which pushes new
+   * chunks to the *existing* `streamId`.
+   * 2. Registering a temporary, request-scoped stream client (bridge) to this `streamId`.
+   * 3. Yielding {@link AgentOSResponse} chunks received by this bridge.
+   * 4. Ensuring the bridge client is deregistered.
+   *
+   * @public
+   * @async
+   * @generator
+   * @param {StreamId} streamId - The ID of the existing stream to which the tool result pertains.
+   * @param {string} toolCallId - The ID of the specific tool call being responded to.
+   * @param {string} toolName - The name of the tool that was executed.
+   * @param {any} toolOutput - The output data from the tool execution.
+   * @param {boolean} isSuccess - Indicates whether the tool execution was successful.
+   * @param {string} [errorMessage] - An error message if `isSuccess` is `false`.
+   * @yields {AgentOSResponse} New response chunks from the agent after processing the tool result.
+   * @returns {AsyncGenerator<AgentOSResponse, void, undefined>} An asynchronous generator for new response chunks.
+   * @throws {AgentOSServiceError} If a critical error occurs during setup or if the service is not initialized.
+   * Errors during GMI processing are yielded as `AgentOSErrorChunk`s.
+   */
+  public async *handleToolResult(
+    streamId: StreamId,
+    toolCallId: string,
+    toolName: string,
+    toolOutput: any,
+    isSuccess: boolean,
+    errorMessage?: string
+  ): AsyncGenerator<AgentOSResponse, void, undefined> {
+    yield* this.handleToolResults(streamId, [
+      {
+        toolCallId,
+        toolName,
+        toolOutput,
+        isSuccess,
+        errorMessage,
+      },
+    ]);
+  }
+
+  public async *handleToolResults(
+    streamId: StreamId,
+    toolResults: AgentOSToolResultInput[]
+  ): AsyncGenerator<AgentOSResponse, void, undefined> {
+    this.ensureInitialized();
+    if (!Array.isArray(toolResults) || toolResults.length === 0) {
+      throw new AgentOSServiceError(
+        'At least one tool result is required to continue the stream.',
+        GMIErrorCode.VALIDATION_ERROR,
+        { streamId },
+        'AgentOS.handleToolResults'
+      );
+    }
+
+    // Create a new bridge client for this specific tool result handling phase
+    const bridge = new AsyncStreamClientBridge(
+      `client-toolRes-${streamId.substring(0, 8)}-${toolResults[0]!.toolCallId.substring(0, 8)}`
+    );
+
+    try {
+      console.log(
+        `AgentOS.handleToolResults: Stream '${streamId}', ${toolResults.length} tool result(s). Orchestrator will push new chunks to this stream.`
+      );
+
+      // Register the bridge client to listen for new chunks on the existing stream
+      await this.streamingManager.registerClient(streamId, bridge);
+      console.log(
+        `AgentOS.handleToolResults: Bridge client ${bridge.id} registered to stream ${streamId}.`
+      );
+
+      // The stream's identity and the required guards, before the continuation starts: a missing guard means no
+      // model call, and a continuation that ends the turn removes the stream's context when it finishes.
+      const identity = this.agentOSOrchestrator.getStreamIdentity(streamId);
+      const continuationContext: GuardrailContext = {
+        userId: identity?.userId ?? 'unknown_user',
+        sessionId: identity?.sessionId ?? streamId,
+        personaId: identity?.personaId,
+        conversationId: identity?.conversationId,
+      };
+      const continuationReport = this.requiredGuardrailReport();
+      if (continuationReport && !continuationReport.ok) {
+        yield this.requiredGuardrailMissingChunk(continuationReport, streamId, identity?.personaId ?? 'unknown_persona');
+        return;
+      }
+      const continuationServices = this.getActiveGuardrailServices();
+
+      // This call is `async Promise<void>`; it triggers the orchestrator to process the tool result(s)
+      // and push new chunks to the StreamingManager for the given streamId. The output guards that evaluate tool
+      // calls judge each call the continuation runs itself, before it runs.
+      const continuationGate = createToolCallGate(continuationServices, continuationContext);
+      if (continuationGate) {
+        await this.agentOSOrchestrator.orchestrateToolResults(streamId, toolResults, { toolCallGate: continuationGate });
+      } else {
+        await this.agentOSOrchestrator.orchestrateToolResults(streamId, toolResults);
+      }
+
+      // Yield new chunks received by our bridge client on the same stream, through the same output guards a turn has
+      const continuationKey = identity?.conversationId || identity?.sessionId || streamId;
+      const guardedContinuation = wrapOutputGuardrails(continuationServices, continuationContext, bridge.consume(), {
+        streamId,
+        personaId: identity?.personaId,
+        holdUntilFinal: this.holdsOutputUntilFinal(),
+        onVerdict: (verdict) => this.onOutputVerdict(continuationKey, verdict),
+      });
+      for await (const chunk of guardedContinuation) {
+        yield chunk;
+        if (isActionableToolCallRequestChunk(chunk)) {
+          break;
+        }
+        if (chunk.isFinal && chunk.type !== AgentOSResponseChunkType.ERROR) {
+          break;
+        }
+      }
+    } catch (error: unknown) {
+      // results the stream does not wait on (its pause continued, resumed, ended by a newer turn or replaced, or its
+      // stream blocked) are refused before the GMI takes them, and keep their code, as a refused resume does
+      const refused = error instanceof GMIError && error.code === GMIErrorCode.INVALID_STATE;
+      const serviceError = AgentOSServiceError.wrap(
+        error,
+        refused ? GMIErrorCode.INVALID_STATE : GMIErrorCode.TOOL_ERROR, // Default code for facade-level tool result errors
+        `Error during AgentOS.handleToolResults for stream '${streamId}'`,
+        'AgentOS.handleToolResults'
+      );
+      if (!refused) {
+        console.error(`${serviceError.name}: ${serviceError.message}`, serviceError.toJSON());
+      }
+
+      const errorChunk: AgentOSErrorChunk = {
+        type: AgentOSResponseChunkType.ERROR,
+        streamId: streamId,
+        gmiInstanceId: (serviceError.details as any)?.gmiInstanceId || 'agentos_facade_tool_error',
+        personaId: (serviceError.details as any)?.personaId || 'unknown_tool_persona',
+        isFinal: true,
+        timestamp: new Date().toISOString(),
+        code: serviceError.code.toString(),
+        message: serviceError.message,
+        details: serviceError.details || { name: serviceError.name, stack: serviceError.stack },
+      };
+      yield errorChunk;
+    } finally {
+      console.log(
+        `AgentOS.handleToolResults: Deregistering bridge client ${bridge.id} from stream ${streamId}.`
+      );
+      const activeStreamIds = await this.streamingManager
+        .getActiveStreamIds()
+        .catch(() => [] as string[]);
+      if (activeStreamIds.includes(streamId)) {
+        await this.streamingManager.deregisterClient(streamId, bridge.id).catch((deregError) => {
+          console.error(
+            `AgentOS.handleToolResults: Error deregistering bridge client ${bridge.id}: ${(deregError as Error).message}`
+          );
+        });
+      }
+      bridge.forceClose();
+    }
+  }
+
+  public listWorkflowDefinitions(): WorkflowDefinition[] {
+    this.ensureInitialized();
+    return this.workflowFacade!.listWorkflowDefinitions();
+  }
+
+  public async startWorkflow(
+    definitionId: string,
+    input: AgentOSInput,
+    options: {
+      workflowId?: string;
+      conversationId?: string;
+      createdByUserId?: string;
+      context?: Record<string, unknown>;
+      roleAssignments?: Record<string, string>;
+      metadata?: Record<string, unknown>;
+    } = {}
+  ): Promise<WorkflowInstance> {
+    this.ensureInitialized();
+    return this.workflowFacade!.startWorkflow(definitionId, input, options);
+  }
+
+  public async getWorkflow(workflowId: string): Promise<WorkflowInstance | null> {
+    this.ensureInitialized();
+    return this.workflowFacade!.getWorkflow(workflowId);
+  }
+
+  public async listWorkflows(options?: WorkflowQueryOptions): Promise<WorkflowInstance[]> {
+    this.ensureInitialized();
+    return this.workflowFacade!.listWorkflows(options);
+  }
+
+  /**
+   * Copies of the agencies running now: a workflow's, and every team a persona's GMI launched with `launch_agency`
+   * (`agencies.launch`), whose entry has `metadata.kind: 'launched'` and lasts while its team runs.
+   *
+   * @returns The running agencies; empty on a runtime with no agency registry.
+   */
+  public listAgencies(): AgencySession[] {
+    this.ensureInitialized();
+    return this.workflowFacade?.getAgencyRegistry()?.listAgencies() ?? [];
+  }
+
+  public async getWorkflowProgress(
+    workflowId: string,
+    sinceTimestamp?: string
+  ): Promise<WorkflowProgressUpdate | null> {
+    this.ensureInitialized();
+    return this.workflowFacade!.getWorkflowProgress(workflowId, sinceTimestamp);
+  }
+
+  public async updateWorkflowStatus(
+    workflowId: string,
+    status: WorkflowStatus
+  ): Promise<WorkflowInstance | null> {
+    this.ensureInitialized();
+    return this.workflowFacade!.updateWorkflowStatus(workflowId, status);
+  }
+
+  public async applyWorkflowTaskUpdates(
+    workflowId: string,
+    updates: WorkflowTaskUpdate[]
+  ): Promise<WorkflowInstance | null> {
+    this.ensureInitialized();
+    return this.workflowFacade!.applyWorkflowTaskUpdates(workflowId, updates);
+  }
+
+  /**
+   * Lists all available personas that the requesting user (if specified) has access to.
+   *
+   * @public
+   * @async
+   * @param {string} [userId] - Optional. The ID of the user making the request. If provided,
+   * persona availability will be filtered based on the user's subscription tier and permissions.
+   * If omitted, all generally public personas might be listed (behavior determined by `GMIManager`).
+   * @returns {Promise<Partial<IPersonaDefinition>[]>} A promise that resolves to an array of
+   * persona definitions (or partial definitions suitable for public listing).
+   * @throws {AgentOSServiceError} If the service is not initialized.
+   */
+  public async listAvailablePersonas(userId?: string): Promise<Partial<IPersonaDefinition>[]> {
+    this.ensureInitialized();
+    console.log(
+      `AgentOS.listAvailablePersonas: Request for UserID: '${userId || 'anonymous/system'}'.`
+    );
+    try {
+      return await this.gmiManager.listAvailablePersonas(userId);
+    } catch (error: unknown) {
+      throw AgentOSServiceError.wrap(
+        error,
+        GMIErrorCode.PERSONA_LOAD_ERROR,
+        'Failed to list available personas',
+        'AgentOS.listAvailablePersonas'
+      );
+    }
+  }
+
+  /**
+   * Retrieves the conversation history for a specific conversation ID, subject to user authorization.
+   *
+   * @public
+   * @async
+   * @param {string} conversationId - The unique identifier of the conversation to retrieve.
+   * @param {string} userId - The ID of the user requesting the history. Authorization checks
+   * are performed to ensure the user has access to this conversation.
+   * @returns {Promise<ConversationContext | null>} A promise that resolves to the
+   * `ConversationContext` object if found and accessible, or `null` otherwise.
+   * @throws {AgentOSServiceError} If the service is not initialized or if a critical error
+   * occurs during history retrieval (permission errors might result in `null` or specific error type).
+   */
+  public async getConversationHistory(
+    conversationId: string,
+    userId: string
+  ): Promise<ConversationContext | null> {
+    this.ensureInitialized();
+    console.log(
+      `AgentOS.getConversationHistory: Request for ConversationID '${conversationId}', UserID '${userId}'.`
+    );
+
+    // Authorization to access conversation history should be handled here or by the ConversationManager.
+    // For example, using this.authService:
+    // const canAccess = await this.authService.canUserAccessConversation(userId, conversationId);
+    // if (!canAccess) {
+    //   console.warn(`AgentOS.getConversationHistory: User '${userId}' denied access to conversation '${conversationId}'.`);
+    //   throw new AgentOSServiceError("Access denied to conversation history.", GMIErrorCode.PERMISSION_DENIED, { userId, conversationId });
+    //   // Or return null, depending on desired API behavior for permission failures.
+    // }
+
+    try {
+      const context = await this.conversationManager.getConversation(conversationId);
+      if (context) {
+        // Verify ownership or access rights
+        if (context.getMetadata('userId') === userId /* || check other access rules */) {
+          return context;
+        } else {
+          console.warn(
+            `AgentOS.getConversationHistory: User '${userId}' attempted to access conversation '${conversationId}' belonging to another user ('${context.getMetadata('userId')}').`
+          );
+          // Consider throwing PERMISSION_DENIED for explicit denial.
+          return null;
+        }
+      }
+      return null; // Conversation not found
+    } catch (error: unknown) {
+      throw AgentOSServiceError.wrap(
+        error,
+        GMIErrorCode.GMI_CONTEXT_ERROR,
+        `Failed to retrieve conversation history for ID '${conversationId}'`,
+        'AgentOS.getConversationHistory'
+      );
+    }
+  }
+
+  public async getPendingExternalToolRequest(
+    conversationId: string,
+    userId: string
+  ): Promise<AgentOSPendingExternalToolRequest | null> {
+    this.ensureInitialized();
+
+    const context = await this.getConversationHistory(conversationId, userId);
+    if (!context) {
+      return null;
+    }
+
+    const pendingRequest = context.getMetadata(AGENTOS_PENDING_EXTERNAL_TOOL_REQUEST_METADATA_KEY) as
+      | AgentOSPendingExternalToolRequest
+      | undefined;
+    // a pause a stream saves after an output guardrail blocked it is dropped once the turn ends, and never offered
+    if (pendingRequest && this.agentOSOrchestrator.isStreamBlocked(pendingRequest.streamId)) {
+      return null;
+    }
+    return pendingRequest ?? null;
+  }
+
+  public async *resumeExternalToolRequest(
+    pendingRequest: AgentOSPendingExternalToolRequest,
+    toolResults: AgentOSToolResultInput[],
+    options: AgentOSResumeExternalToolRequestOptions = {}
+  ): AsyncGenerator<AgentOSResponse, void, undefined> {
+    this.ensureInitialized();
+
+    let streamIdToListen: StreamId | undefined;
+    let shouldDeregisterBridge = false;
+    const bridge = new AsyncStreamClientBridge(
+      `client-resumeToolReq-${pendingRequest.conversationId}-${Date.now()}`
+    );
+
+    try {
+      // the required guards, before the resumed turn starts: a missing guard means no model call
+      const resumeReport = this.requiredGuardrailReport();
+      if (resumeReport && !resumeReport.ok) {
+        yield this.requiredGuardrailMissingChunk(resumeReport, pendingRequest.streamId, pendingRequest.personaId);
+        return;
+      }
+      const resumeContext: GuardrailContext = {
+        userId: pendingRequest.userId,
+        sessionId: pendingRequest.sessionId,
+        personaId: pendingRequest.personaId,
+        conversationId: pendingRequest.conversationId,
+      };
+      const resumeServices = this.getActiveGuardrailServices();
+      // the output guards that evaluate tool calls judge each call the resumed turn runs itself, before it runs
+      const resumeGate = createToolCallGate(resumeServices, resumeContext);
+      streamIdToListen = resumeGate
+        ? await this.agentOSOrchestrator.orchestrateResumedToolResults(pendingRequest, toolResults, options, {
+            toolCallGate: resumeGate,
+          })
+        : await this.agentOSOrchestrator.orchestrateResumedToolResults(pendingRequest, toolResults, options);
+      await this.streamingManager.registerClient(streamIdToListen, bridge);
+
+      const guardedResume = wrapOutputGuardrails(resumeServices, resumeContext, bridge.consume(), {
+        streamId: streamIdToListen,
+        personaId: pendingRequest.personaId,
+        holdUntilFinal: this.holdsOutputUntilFinal(),
+        onVerdict: (verdict) => this.onOutputVerdict(pendingRequest.conversationId, verdict),
+      });
+      for await (const chunk of guardedResume) {
+        yield chunk;
+        if (isActionableToolCallRequestChunk(chunk)) {
+          shouldDeregisterBridge = true;
+          break;
+        }
+        if (chunk.isFinal && chunk.type !== AgentOSResponseChunkType.ERROR) {
+          break;
+        }
+      }
+    } catch (error: unknown) {
+      // a resume of a pause the conversation no longer holds is refused before its stream is made, and keeps its code
+      const refused = error instanceof GMIError && error.code === GMIErrorCode.INVALID_STATE;
+      const serviceError = AgentOSServiceError.wrap(
+        error,
+        refused ? GMIErrorCode.INVALID_STATE : GMIErrorCode.TOOL_ERROR,
+        `Error during AgentOS.resumeExternalToolRequest for conversation '${pendingRequest.conversationId}'`,
+        'AgentOS.resumeExternalToolRequest'
+      );
+      if (!refused) {
+        console.error(`${serviceError.name}: ${serviceError.message}`, serviceError.toJSON());
+      }
+
+      const errorChunk: AgentOSErrorChunk = {
+        type: AgentOSResponseChunkType.ERROR,
+        streamId: streamIdToListen || pendingRequest.streamId,
+        gmiInstanceId:
+          (serviceError.details as any)?.gmiInstanceId ||
+          pendingRequest.gmiInstanceId ||
+          'agentos_facade_resume_error',
+        personaId:
+          (serviceError.details as any)?.personaId || pendingRequest.personaId || 'unknown_persona',
+        isFinal: true,
+        timestamp: new Date().toISOString(),
+        code: serviceError.code.toString(),
+        message: serviceError.message,
+        details: serviceError.details || { name: serviceError.name, stack: serviceError.stack },
+      };
+      yield errorChunk;
+    } finally {
+      if (streamIdToListen && shouldDeregisterBridge) {
+        const activeStreamIds = await this.streamingManager
+          .getActiveStreamIds()
+          .catch(() => [] as string[]);
+        if (activeStreamIds.includes(streamIdToListen)) {
+          await this.streamingManager
+            .deregisterClient(streamIdToListen, bridge.id)
+            .catch((deregError) => {
+              this.logger.warn('Failed to deregister resume bridge client', {
+                bridgeId: bridge.id,
+                streamId: streamIdToListen,
+                error: (deregError as Error).message,
+              });
+            });
+        }
+      }
+      bridge.forceClose();
+    }
+  }
+
+  /**
+   * Receives and processes user feedback related to a specific interaction or persona.
+   * The exact handling of feedback (e.g., storage, GMI adaptation) is determined by
+   * the configured `GMIManager` and underlying GMI implementations.
+   *
+   * @public
+   * @async
+   * @param {string} userId - The ID of the user providing the feedback.
+   * @param {string} sessionId - The session ID to which the feedback pertains.
+   * @param {string} personaId - The persona ID involved in the interaction being reviewed.
+   * @param {UserFeedbackPayload} feedbackPayload - The structured feedback data.
+   * @returns {Promise<void>} A promise that resolves when the feedback has been processed.
+   * @throws {AgentOSServiceError} If the service is not initialized or if an error occurs
+   * during feedback processing (e.g., `GMIErrorCode.GMI_FEEDBACK_ERROR`).
+   */
+  public async receiveFeedback(
+    userId: string,
+    sessionId: string,
+    personaId: string,
+    feedbackPayload: UserFeedbackPayload
+  ): Promise<void> {
+    this.ensureInitialized();
+    // Basic authorization checks for the user can be performed here.
+    // E.g., await this.authService.validateUserExists(userId);
+
+    console.log(
+      `AgentOS.receiveFeedback: UserID '${userId}', SessionID '${sessionId}', PersonaID '${personaId}'. Feedback metadata:`,
+      { fields: Object.keys(feedbackPayload), textLength: feedbackPayload.text?.length ?? 0 }
+    );
+
+    try {
+      // Delegate feedback processing, typically to GMIManager or directly to the relevant GMI.
+      await this.gmiManager.processUserFeedback(userId, sessionId, personaId, feedbackPayload);
+      console.info(
+        `AgentOS.receiveFeedback: Feedback processed successfully for UserID '${userId}', PersonaID '${personaId}'.`
+      );
+    } catch (error: unknown) {
+      throw AgentOSServiceError.wrap(
+        error,
+        GMIErrorCode.GMI_FEEDBACK_ERROR,
+        'Failed to process user feedback',
+        'AgentOS.receiveFeedback'
+      );
+    }
+  }
+
+  /**
+   * Initiates a graceful shutdown of the `AgentOS` service and all its components.
+   * This includes shutting down managers, clearing caches, and releasing resources.
+   *
+   * @public
+   * @async
+   * @returns {Promise<void>} A promise that resolves when the shutdown sequence is complete.
+   * @throws {AgentOSServiceError} If an error occurs during the shutdown of any critical component.
+   */
+  public async shutdown(): Promise<void> {
+    if (!this.initialized) {
+      console.warn(
+        'AgentOS Service is already shut down or was never initialized. Shutdown call is a no-op.'
+      );
+      return;
+    }
+    console.log('AgentOS Service: Initiating graceful shutdown sequence...');
+
+    // Order of shutdown can be important:
+    // 1. Orchestrator (stops new complex operations)
+    // 2. GMI Manager (stops GMI activities)
+    // 3. Streaming Manager (closes active client connections)
+    // 4. Other services (ConversationManager, ToolOrchestrator, PromptEngine, ModelProviderManager)
+    try {
+      await this.workflowFacade?.shutdown();
+      if (this.agentOSOrchestrator?.shutdown) {
+        await this.agentOSOrchestrator.shutdown();
+        console.log('AgentOS: AgentOSOrchestrator shut down.');
+      }
+      if (this.gmiManager?.shutdown) {
+        await this.gmiManager.shutdown();
+        console.log('AgentOS: GMIManager shut down.');
+      }
+      // After the GMIs: each ended its learner session as it shut down. A layer the host passed stays the host's.
+      if (this.learningLayer && this.ownsLearningLayer) {
+        await this.learningLayer.close();
+      }
+      this.learningLayer = undefined;
+      this.ownsLearningLayer = false;
+      if (this.streamingManager?.shutdown) {
+        await this.streamingManager.shutdown();
+        console.log('AgentOS: StreamingManager shut down.');
+      }
+      if (
+        this.conversationManager?.shutdown &&
+        typeof this.conversationManager.shutdown === 'function'
+      ) {
+        await this.conversationManager.shutdown();
+        console.log('AgentOS: ConversationManager shut down.');
+      }
+      if (this.toolOrchestrator && typeof (this.toolOrchestrator as any).shutdown === 'function') {
+        await (this.toolOrchestrator as any).shutdown();
+        console.log('AgentOS: ToolOrchestrator shut down.');
+      }
+      await this.discoveryInitializer?.shutdown();
+      await this.ragMemoryInitializer?.shutdown();
+      // PromptEngine might have a cleanup method like clearCache
+      if (this.promptEngine && typeof this.promptEngine.clearCache === 'function') {
+        await this.promptEngine.clearCache();
+        console.log('AgentOS: PromptEngine cache cleared.');
+      }
+      if (this.modelProviderManager?.shutdown) {
+        await this.modelProviderManager.shutdown();
+        console.log('AgentOS: AIModelProviderManager shut down.');
+      }
+      if (this.extensionManager?.shutdown) {
+        await this.extensionManager.shutdown({ logger: this.logger });
+        console.log('AgentOS: ExtensionManager shut down.');
+      }
+      // Standalone memory closers are handled by ragMemoryInitializer.shutdown() above.
+      // Other services like authService, subscriptionService, prisma might not have explicit async shutdown methods
+      // if they manage connections passively or are handled by process exit.
+
+      console.log('AgentOS Service: Graceful shutdown completed successfully.');
+    } catch (error: unknown) {
+      // Even if one component fails to shut down, attempt to log and continue if possible,
+      // but report the overall failure.
+      const serviceError = AgentOSServiceError.wrap(
+        error,
+        GMIErrorCode.GMI_SHUTDOWN_ERROR,
+        'Error during AgentOS service shutdown sequence',
+        'AgentOS.shutdown'
+      );
+      console.error(`${serviceError.name}: ${serviceError.message}`, serviceError.toJSON());
+      throw serviceError; // Re-throw to indicate shutdown was problematic.
+    } finally {
+      this.initialized = false; // Mark as uninitialized regardless of shutdown errors.
+    }
+  }
+
+}
+
+// Imported from extracted module
+import { AsyncStreamClientBridge } from '../core/streaming/AsyncStreamClientBridge';

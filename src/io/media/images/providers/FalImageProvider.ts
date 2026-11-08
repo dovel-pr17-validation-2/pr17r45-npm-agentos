@@ -1,0 +1,830 @@
+/**
+ * @module media/images/providers/FalImageProvider
+ *
+ * Image generation provider for the Fal.ai platform, a popular serverless
+ * GPU host that offers fast inference for Flux and other diffusion models.
+ *
+ * ## Supported models
+ *
+ * | Model ID                    | Description                                  |
+ * |-----------------------------|----------------------------------------------|
+ * | `fal-ai/flux/dev`           | Flux Dev — fast iteration, open weights      |
+ * | `fal-ai/flux/dev/image-to-image` | Flux Dev's edit endpoint (the edit default) |
+ * | `fal-ai/flux-lora/inpainting` | Flux Dev inpainting (the default with a mask) |
+ * | `fal-ai/flux-pro`           | Flux Pro — highest quality                   |
+ * | `fal-ai/flux/schnell`       | Flux Schnell — optimised for speed           |
+ *
+ * ## API flow (queue-based)
+ *
+ * 1. **Submit** — `POST https://queue.fal.run/{model}` with prompt/params.
+ *    Returns `{ request_id }` immediately.
+ * 2. **Poll** — `GET https://queue.fal.run/{model}/requests/{request_id}/status`
+ *    until `status === 'COMPLETED'` and `images` array is populated.
+ *
+ * ## Authentication
+ *
+ * Requires a `FAL_API_KEY` environment variable. The key is sent as
+ * `Authorization: Key ${FAL_API_KEY}`.
+ *
+ * @see {@link IImageProvider} for the provider interface contract.
+ * @see {@link FluxImageProvider} for direct BFL API access.
+ * @see {@link ReplicateImageProvider} for Flux via Replicate.
+ */
+
+import {
+  type IImageProvider,
+  type ImageGenerationRequest,
+  type ImageGenerationResult,
+  type ImageEditRequest,
+  type ImageModelInfo,
+  type ImageStyleTransferRequest,
+  type GeneratedImage,
+  parseImageSize,
+} from '../IImageProvider.js';
+import { editPartType, imageDataUrl } from '../blobPart.js';
+import {
+  INDEXED_IMAGE_NAMES,
+  styleTransferImageTypes,
+  styleTransferModelError,
+  styleTransferPrompt,
+} from '../styleTransfer.js';
+import { ApiKeyPool } from '../../../../core/providers/ApiKeyPool.js';
+
+/** Fal's queue, the provider's base URL unless one is configured. */
+const FAL_QUEUE_URL = 'https://queue.fal.run';
+
+/**
+ * The endpoints Fal's style transfer runs on, FLUX.2 Pro first as the
+ * default. Each requires `prompt` and `image_urls`, "List of URLs of input
+ * images for editing" (Fal's OpenAPI schema of each, read 2026-10-12:
+ * https://fal.ai/api/openapi/queue/openapi.json?endpoint_id=fal-ai/flux-2-pro/edit).
+ */
+export const FAL_STYLE_TRANSFER_MODELS: readonly string[] = [
+  'fal-ai/flux-2-pro/edit',
+  'fal-ai/flux-2-max/edit',
+  'fal-ai/flux-2-flex/edit',
+  'fal-ai/flux-2/edit',
+];
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for the Fal.ai image provider.
+ *
+ * @example
+ * ```typescript
+ * const config: FalImageProviderConfig = {
+ *   apiKey: process.env.FAL_API_KEY!,
+ *   defaultModelId: 'fal-ai/flux/dev',
+ * };
+ * ```
+ */
+/**
+ * Named fal image_size presets for the FLUX.2 endpoints, keyed by the
+ * provider-agnostic aspect-ratio strings callers pass. FLUX.2 has no
+ * aspect_ratio field; kontext does and takes the string verbatim.
+ */
+const FAL_ASPECT_PRESETS: Record<string, string> = {
+  '16:9': 'landscape_16_9',
+  '4:3': 'landscape_4_3',
+  '1:1': 'square_hd',
+  '9:16': 'portrait_16_9',
+  '3:4': 'portrait_4_3',
+};
+
+export interface FalImageProviderConfig {
+  /**
+   * Fal.ai API key. Sent as `Authorization: Key ${apiKey}`.
+   * Obtain from https://fal.ai/dashboard/keys
+   */
+  apiKey: string;
+
+  /**
+   * Base URL for the Fal.ai queue API. Override for testing or proxy setups.
+   * @default 'https://queue.fal.run'
+   */
+  baseURL?: string;
+
+  /**
+   * Default model to use when the request doesn't specify one.
+   * @default 'fal-ai/flux/dev'
+   */
+  defaultModelId?: string;
+
+  /**
+   * Milliseconds between status polls while waiting for generation.
+   * @default 1000
+   */
+  pollIntervalMs?: number;
+
+  /**
+   * Maximum milliseconds to wait for generation before timing out.
+   * @default 120000
+   */
+  timeoutMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Fal.ai API response types
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from the Fal.ai queue submission endpoint.
+ * @internal
+ */
+interface FalSubmitResponse {
+  /** Unique request ID for polling. */
+  request_id: string;
+  /**
+   * Absolute status-polling URL Fal returns on submit. Authoritative over a
+   * reconstructed `${base}/${model}/requests/${id}/status` path: multi-segment
+   * model slugs (e.g. image-to-image edit endpoints) reconstruct to an invalid
+   * route and 405. Always prefer this when present.
+   */
+  status_url?: string;
+  /** Absolute result URL Fal returns on submit. Authoritative over a reconstructed path (same 405 reason as `status_url`). */
+  response_url?: string;
+}
+
+/**
+ * Response from the Fal.ai status polling endpoint.
+ * @internal
+ */
+interface FalStatusResponse {
+  /** Current status: 'IN_QUEUE', 'IN_PROGRESS' or 'COMPLETED'; a failed request completes, with `error`. */
+  status: string;
+  /** A human-readable error, present only when the request failed (with status COMPLETED). */
+  error?: string;
+  /** The error's machine-readable type, present with `error`. */
+  error_type?: string;
+}
+
+/**
+ * Response from the Fal.ai result endpoint (fetched after COMPLETED).
+ * @internal
+ */
+interface FalResultResponse {
+  /** Array of generated images with URLs. */
+  images: Array<{
+    /** URL to the generated image (temporary, typically expires). */
+    url: string;
+    /** Image width in pixels. */
+    width?: number;
+    /** Image height in pixels. */
+    height?: number;
+    /** MIME type of the image. */
+    content_type?: string;
+  }>;
+  /** Random seed used for generation. */
+  seed?: number;
+  /** Whether NSFW content was detected. */
+  has_nsfw_concepts?: boolean[];
+  /** Prompt used for generation (may differ from input if modified). */
+  prompt?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Provider-specific options
+// ---------------------------------------------------------------------------
+
+/**
+ * Provider-specific options for Fal.ai image generation.
+ *
+ * Pass via `request.providerOptions.fal` when calling
+ * {@link FalImageProvider.generateImage}.
+ *
+ * @example
+ * ```typescript
+ * const result = await provider.generateImage({
+ *   modelId: 'fal-ai/flux/dev',
+ *   prompt: 'A sunset over mountains',
+ *   providerOptions: {
+ *     fal: { num_images: 2, seed: 42 },
+ *   },
+ * });
+ * ```
+ */
+export interface FalImageProviderOptions {
+  /** Number of images to generate. Default: 1. */
+  num_images?: number;
+  /** Image size string (e.g. 'landscape_16_9', 'square_hd', 'portrait_4_3'). */
+  image_size?: string;
+  /** Random seed for reproducible generation. */
+  seed?: number;
+  /** Number of inference steps. */
+  num_inference_steps?: number;
+  /** Guidance scale for classifier-free guidance. */
+  guidance_scale?: number;
+  /** Whether to enable the safety checker. Default: true. */
+  enable_safety_checker?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Sleep for the specified number of milliseconds.
+ * Used between poll requests to avoid rate-limiting.
+ * @param ms - Duration in milliseconds.
+ * @returns Resolves after the delay.
+ * @internal
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * Where an edit runs when the call names no model, or names `fal-ai/flux/dev`,
+ * which is text-to-image on Fal and takes no image (its queue schema,
+ * https://fal.ai/api/openapi/queue/openapi.json?endpoint_id=fal-ai/flux/dev,
+ * has no image field). Its image-to-image endpoint takes `image_url` and
+ * `strength`; with a mask, the FLUX.1 [dev] inpainting endpoint takes
+ * `image_url`, `mask_url` and `strength`.
+ */
+export const FAL_EDIT_MODEL = 'fal-ai/flux/dev/image-to-image';
+/** See {@link FAL_EDIT_MODEL}: the endpoint an edit with a mask runs on. */
+export const FAL_INPAINT_MODEL = 'fal-ai/flux-lora/inpainting';
+
+/**
+ * Image generation provider connecting to the Fal.ai serverless platform.
+ *
+ * Implements the queue-based submit-then-poll pattern: a generation request
+ * returns a request ID immediately, and the provider polls the status
+ * endpoint until completion or timeout.
+ *
+ * @implements {IImageProvider}
+ *
+ * @example
+ * ```typescript
+ * const provider = new FalImageProvider();
+ * await provider.initialize({ apiKey: process.env.FAL_API_KEY! });
+ *
+ * const result = await provider.generateImage({
+ *   modelId: 'fal-ai/flux/dev',
+ *   prompt: 'A photorealistic astronaut riding a horse on Mars',
+ * });
+ * console.log(result.images[0].url);
+ * ```
+ */
+export class FalImageProvider implements IImageProvider {
+  /** @inheritdoc */
+  public readonly providerId = 'fal';
+
+  /** @inheritdoc */
+  public isInitialized = false;
+
+  /** @inheritdoc */
+  public defaultModelId?: string;
+
+  /** Internal resolved configuration. */
+  private _config!: Required<Pick<FalImageProviderConfig, 'apiKey' | 'baseURL' | 'pollIntervalMs' | 'timeoutMs'>> & FalImageProviderConfig;
+  private keyPool!: ApiKeyPool;
+
+  /**
+   * Initialize the provider with API credentials and optional configuration.
+   *
+   * @param config - Configuration object. Must include `apiKey`.
+   * @throws {Error} If `apiKey` is missing or empty.
+   *
+   * @example
+   * ```typescript
+   * await provider.initialize({ apiKey: 'fal_xxx' });
+   * ```
+   */
+  async initialize(config: Record<string, unknown>): Promise<void> {
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
+    if (!apiKey) {
+      throw new Error('Fal.ai image provider requires apiKey (FAL_API_KEY).');
+    }
+
+    this._config = {
+      apiKey,
+      baseURL:
+        typeof config.baseURL === 'string' && config.baseURL.trim()
+          ? config.baseURL.trim()
+          : FAL_QUEUE_URL,
+      defaultModelId:
+        typeof config.defaultModelId === 'string' && config.defaultModelId.trim()
+          ? config.defaultModelId.trim()
+          : 'fal-ai/flux/dev',
+      pollIntervalMs:
+        typeof config.pollIntervalMs === 'number' && config.pollIntervalMs > 0
+          ? config.pollIntervalMs
+          : 1000,
+      timeoutMs:
+        typeof config.timeoutMs === 'number' && config.timeoutMs > 0
+          ? config.timeoutMs
+          : 120_000,
+    };
+
+    this.defaultModelId = this._config.defaultModelId;
+    this.keyPool = new ApiKeyPool(apiKey);
+    this.isInitialized = true;
+  }
+
+  /**
+   * Generate an image using the Fal.ai queue API.
+   *
+   * Submits the generation task to the queue, then polls the status
+   * endpoint until the result is ready or the timeout is reached.
+   *
+   * @param request - Image generation request with prompt and optional params.
+   * @returns The generated image result with URL(s).
+   *
+   * @throws {Error} If the provider is not initialized.
+   * @throws {Error} If the API returns an error or times out.
+   *
+   * @example
+   * ```typescript
+   * const result = await provider.generateImage({
+   *   modelId: 'fal-ai/flux/dev',
+   *   prompt: 'A serene Japanese garden in autumn',
+   *   n: 2,
+   * });
+   * ```
+   */
+  async generateImage(request: ImageGenerationRequest): Promise<ImageGenerationResult> {
+    if (!this.isInitialized) {
+      throw new Error('Fal.ai image provider is not initialized. Call initialize() first.');
+    }
+
+    const model = request.modelId || this.defaultModelId || 'fal-ai/flux/dev';
+
+    // Extract Fal-specific options from the provider options bag.
+    const providerOpts = (request.providerOptions as Record<string, unknown> | undefined)?.fal as FalImageProviderOptions | undefined;
+
+    // Build the request body matching Fal.ai's API schema.
+    const body: Record<string, unknown> = {
+      prompt: request.prompt,
+    };
+
+    // Map standard request fields to Fal.ai parameters.
+    // Fal.ai uses `image_size` which can be a named preset or dimensions.
+    const { width, height } = parseImageSize(request.size);
+    if (providerOpts?.image_size) {
+      body.image_size = providerOpts.image_size;
+    } else if (width && height) {
+      // Fal.ai accepts object-style dimensions for some models
+      body.image_size = { width, height };
+    }
+
+    if (request.n) body.num_images = request.n;
+    if (providerOpts?.num_images !== undefined) body.num_images = providerOpts.num_images;
+    if (request.seed !== undefined) body.seed = request.seed;
+    if (providerOpts?.seed !== undefined) body.seed = providerOpts.seed;
+    if (providerOpts?.num_inference_steps !== undefined) body.num_inference_steps = providerOpts.num_inference_steps;
+    if (providerOpts?.guidance_scale !== undefined) body.guidance_scale = providerOpts.guidance_scale;
+    if (providerOpts?.enable_safety_checker !== undefined) body.enable_safety_checker = providerOpts.enable_safety_checker;
+
+    // --- Reference image mapping, per model family ---
+    // FLUX.2 endpoints (fal-ai/flux-2-pro / -max / -flex) are txt2img; their
+    // reference-anchored variants live at `<model>/edit` and take an
+    // `image_urls` ARRAY. Kontext endpoints take `image_url` (singular).
+    // Everything else keeps the legacy IP-Adapter fields.
+    const FAL_CONSISTENCY_SCALES: Record<string, number> = {
+      strict: 0.9,
+      balanced: 0.6,
+      loose: 0.3,
+    };
+
+    let resolvedModel = model;
+    if (request.referenceImageUrl) {
+      if (model.includes('flux-2')) {
+        if (!resolvedModel.endsWith('/edit')) {
+          resolvedModel = `${resolvedModel}/edit`;
+        }
+        if (body.image_urls === undefined) {
+          body.image_urls = [request.referenceImageUrl];
+        }
+        // /edit endpoints reject the txt2img-only object image_size shape
+        // less predictably than named presets; leave whatever the caller
+        // set and never add ip_adapter fields.
+      } else if (model.includes('kontext')) {
+        if (body.image_url === undefined) {
+          body.image_url = request.referenceImageUrl;
+        }
+      } else {
+        body.ip_adapter_image = request.referenceImageUrl;
+        body.ip_adapter_scale = FAL_CONSISTENCY_SCALES[request.consistencyMode ?? 'balanced'];
+      }
+    }
+
+    // Aspect ratio: kontext takes aspect_ratio verbatim; FLUX.2 uses named
+    // image_size presets. Only applied when the caller didn't already set
+    // an explicit image_size / aspect_ratio.
+    if (request.aspectRatio) {
+      if (resolvedModel.includes('kontext') && body.aspect_ratio === undefined) {
+        body.aspect_ratio = request.aspectRatio;
+      } else if (resolvedModel.includes('flux-2') && body.image_size === undefined) {
+        const preset = FAL_ASPECT_PRESETS[request.aspectRatio];
+        if (preset) body.image_size = preset;
+      }
+    }
+
+    // Step 1: Submit to the queue
+    const { requestId, statusUrl, responseUrl } = await this._submitTask(resolvedModel, body);
+
+    // Step 2: Poll until complete (use the URLs Fal returns, not reconstructed paths)
+    await this._pollStatus(resolvedModel, requestId, statusUrl, responseUrl);
+
+    // Step 3: Fetch the result
+    const result = await this._fetchResult(resolvedModel, requestId, responseUrl);
+
+    if (!result.images || result.images.length === 0) {
+      throw new Error('Fal.ai generation completed but returned no images.');
+    }
+
+    const images: GeneratedImage[] = result.images.map((img) => ({
+      url: img.url,
+      mimeType: img.content_type,
+      providerMetadata: {
+        width: img.width,
+        height: img.height,
+        seed: result.seed,
+      },
+    }));
+
+    return {
+      created: Math.floor(Date.now() / 1000),
+      modelId: model,
+      providerId: this.providerId,
+      images,
+      usage: {
+        totalImages: images.length,
+      },
+    };
+  }
+
+  /**
+   * List available Flux models on the Fal.ai platform.
+   *
+   * @returns Static list of known Fal.ai model identifiers.
+   */
+  /**
+   * Edit an image using a Fal.ai-hosted Flux model.
+   *
+   * Supports img2img (prompt-guided transformation) and inpainting
+   * (mask-guided regional editing). With no model named, or with
+   * `fal-ai/flux/dev`, which is text-to-image, the edit runs on
+   * {@link FAL_EDIT_MODEL}, or with a mask on {@link FAL_INPAINT_MODEL}.
+   * The source image and the mask go as base64 data URLs typed by their
+   * bytes, in the field the endpoint takes.
+   *
+   * @param request - Edit request with source image, prompt, and optional mask.
+   * @returns Generation result with the edited image(s).
+   * @throws {Error} When the provider is not initialised or the API fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await provider.editImage({
+   *   modelId: 'fal-ai/flux/dev/image-to-image',
+   *   image: imageBuffer,
+   *   prompt: 'Convert to watercolor style',
+   *   strength: 0.7,
+   * });
+   * ```
+   */
+  async editImage(request: ImageEditRequest): Promise<ImageGenerationResult> {
+    if (!this.isInitialized) {
+      throw new Error('Fal.ai image provider is not initialized. Call initialize() first.');
+    }
+
+    const hasMask = !!request.mask;
+    // fal-ai/flux/dev cannot edit: an edit on it, or on no named model, runs
+    // on its image-to-image endpoint, or with a mask on its inpainting one.
+    // The image-to-image endpoint takes no mask, so a masked edit named for
+    // it runs on the inpainting endpoint.
+    const model =
+      !request.modelId || request.modelId === 'fal-ai/flux/dev' || (hasMask && request.modelId === FAL_EDIT_MODEL)
+        ? hasMask
+          ? FAL_INPAINT_MODEL
+          : FAL_EDIT_MODEL
+        : request.modelId;
+
+    // Typed by the image's bytes, as the other providers' edits send it.
+    const source = imageDataUrl(request.image, editPartType(request.image));
+    const body: Record<string, unknown> = {
+      prompt: request.prompt,
+    };
+
+    // Source-image field is model-specific: kontext takes image_url
+    // (singular, no strength); the FLUX.2 /edit endpoints take an
+    // image_urls ARRAY (no strength); the image-to-image and inpainting
+    // endpoints take image_url with strength, and mask_url for the mask;
+    // any other endpoint keeps the image + strength pair this provider has
+    // always sent. Fal accepts data: URIs in all of them.
+    const imageUrlEndpoint = /\/(image-to-image|inpainting)$/.test(model);
+    if (model.includes('kontext')) {
+      body.image_url = source;
+    } else if (model.includes('flux-2')) {
+      body.image_urls = [source];
+    } else if (imageUrlEndpoint) {
+      body.image_url = source;
+      body.strength = request.strength ?? 0.75;
+    } else {
+      body.image = source;
+      body.strength = request.strength ?? 0.75;
+    }
+
+    if (hasMask) {
+      const mask = imageDataUrl(request.mask!, editPartType(request.mask!));
+      if (imageUrlEndpoint) body.mask_url = mask;
+      else body.mask = mask;
+    }
+
+    // FLUX.1 [dev]'s edit endpoints take no negative prompt.
+    if (request.negativePrompt && model !== FAL_EDIT_MODEL && model !== FAL_INPAINT_MODEL) {
+      body.negative_prompt = request.negativePrompt;
+    }
+    if (request.seed !== undefined) body.seed = request.seed;
+    if (request.n) body.num_images = request.n;
+
+    const { requestId, statusUrl, responseUrl } = await this._submitTask(model, body);
+    await this._pollStatus(model, requestId, statusUrl, responseUrl);
+    const result = await this._fetchResult(model, requestId, responseUrl);
+
+    const usable = (result.images ?? []).filter((img) => typeof img?.url === 'string' && img.url !== '');
+    if (usable.length === 0) {
+      throw new Error('Fal.ai edit completed but returned no images.');
+    }
+
+    const images: GeneratedImage[] = usable.map((img) => ({
+      url: img.url,
+      mimeType: img.content_type,
+      providerMetadata: { width: img.width, height: img.height, seed: result.seed },
+    }));
+
+    return {
+      created: Math.floor(Date.now() / 1000),
+      modelId: model,
+      providerId: this.providerId,
+      images,
+      usage: { totalImages: images.length },
+    };
+  }
+
+  /**
+   * The endpoint a style transfer runs on for `modelId`, or a refusal. An
+   * empty id takes the configured default when it is one of
+   * {@link FAL_STYLE_TRANSFER_MODELS}, else FLUX.2 Pro's edit endpoint. A
+   * named model must be one of them, or one of them without its `/edit`,
+   * which it is given; any name is taken when the provider's base URL is not
+   * Fal's queue.
+   *
+   * @param modelId - The model the call names, or an empty string.
+   * @throws {Error} For a model the style transfer does not run.
+   */
+  styleTransferModel(modelId: string): string {
+    if (!modelId) {
+      return this.defaultModelId && FAL_STYLE_TRANSFER_MODELS.includes(this.defaultModelId)
+        ? this.defaultModelId
+        : FAL_STYLE_TRANSFER_MODELS[0];
+    }
+    if (FAL_STYLE_TRANSFER_MODELS.includes(modelId)) return modelId;
+    if (FAL_STYLE_TRANSFER_MODELS.includes(`${modelId}/edit`)) return `${modelId}/edit`;
+    if (this.hasCustomEndpoint()) return modelId;
+    throw styleTransferModelError('Fal', modelId, FAL_STYLE_TRANSFER_MODELS);
+  }
+
+  /**
+   * Restyles an image after a style reference on a FLUX.2 edit endpoint,
+   * which takes both as `image_urls`, the source first, with an instruction
+   * that names them by index. FLUX.2 takes no strength and no negative
+   * prompt: `strength` picks the instruction (see `styleTransfer.ts`).
+   * `image_size` and `output_format` are left at the endpoint's defaults:
+   * `auto` and JPEG on pro, max and flex; on `fal-ai/flux-2/edit`, PNG and
+   * a size the schema does not state (Fal's OpenAPI schema of each).
+   * Both images must be JPEG, PNG or WebP.
+   *
+   * @param request - The source, the reference and the prompt.
+   * @returns Generation result with the restyled image(s).
+   *
+   * @throws {Error} When the provider is not initialised, the model or an
+   *   image is refused, the queue reports a failure or times out, or the
+   *   result holds no image.
+   */
+  async transferStyle(request: ImageStyleTransferRequest): Promise<ImageGenerationResult> {
+    if (!this.isInitialized) {
+      throw new Error('Fal.ai image provider is not initialized. Call initialize() first.');
+    }
+    const model = this.styleTransferModel(request.modelId);
+    const providerOpts = (request.providerOptions as Record<string, unknown> | undefined)?.fal as FalImageProviderOptions | undefined;
+    const types = styleTransferImageTypes(
+      'Fal',
+      ['image/jpeg', 'image/png', 'image/webp'],
+      request.image,
+      request.styleImage,
+    );
+
+    const body: Record<string, unknown> = {
+      prompt: styleTransferPrompt(request.prompt, request.strength, INDEXED_IMAGE_NAMES),
+      image_urls: [imageDataUrl(request.image, types.image), imageDataUrl(request.styleImage, types.style)],
+    };
+    const seed = request.seed ?? providerOpts?.seed;
+    if (seed !== undefined) body.seed = seed;
+
+    const { requestId, statusUrl, responseUrl } = await this._submitTask(model, body);
+    await this._pollStatus(model, requestId, statusUrl, responseUrl);
+    const result = await this._fetchResult(model, requestId, responseUrl);
+
+    const images: GeneratedImage[] = (result.images ?? [])
+      .filter((img) => typeof img?.url === 'string' && img.url !== '')
+      .map((img) => ({
+        url: img.url,
+        mimeType: img.content_type,
+        providerMetadata: { width: img.width, height: img.height, seed: result.seed },
+      }));
+    if (images.length === 0) {
+      throw new Error('Fal style transfer returned no image.');
+    }
+
+    return {
+      created: Math.floor(Date.now() / 1000),
+      modelId: model,
+      providerId: this.providerId,
+      images,
+      usage: { totalImages: images.length },
+    };
+  }
+
+  /** Whether the provider's base URL is not Fal's queue. */
+  private hasCustomEndpoint(): boolean {
+    return Boolean(this._config?.baseURL) && this._config.baseURL.replace(/\/+$/, '') !== FAL_QUEUE_URL;
+  }
+
+  async listAvailableModels(): Promise<ImageModelInfo[]> {
+    return [
+      { providerId: this.providerId, modelId: 'fal-ai/flux/dev', displayName: 'Flux Dev (Fal)', description: 'Fast iteration, open weights; text-to-image, so edits run on its image-to-image endpoint' },
+      { providerId: this.providerId, modelId: FAL_EDIT_MODEL, displayName: 'Flux Dev Image-to-Image (Fal)', description: 'Edits a source image after the prompt, with a strength' },
+      { providerId: this.providerId, modelId: FAL_INPAINT_MODEL, displayName: 'Flux Dev Inpainting (Fal)', description: 'Repaints the masked region of a source image' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux-pro', displayName: 'Flux Pro (Fal)', description: 'Highest quality generation' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux/schnell', displayName: 'Flux Schnell (Fal)', description: 'Speed-optimized generation' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux-pro/v1.1', displayName: 'Flux Pro 1.1 (Fal)', description: 'Latest pro generation' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux-pro/v1.1-ultra', displayName: 'Flux Pro 1.1 Ultra (Fal)', description: 'Ultra-high resolution' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux-lora', displayName: 'Flux LoRA (Fal)', description: 'LoRA fine-tuned generation' },
+      { providerId: this.providerId, modelId: 'fal-ai/flux-realism', displayName: 'Flux Realism (Fal)', description: 'Photorealistic output' },
+      // FLUX.2: each generates from a prompt, and transferStyle runs it on its
+      // /edit endpoint, which takes the source and the style reference. The
+      // /edit endpoints are not listed: they require input images, so a
+      // generation would fail there.
+      ...FAL_STYLE_TRANSFER_MODELS.map((editModelId) => {
+        const modelId = editModelId.replace(/\/edit$/, '');
+        return {
+          providerId: this.providerId,
+          modelId,
+          displayName: `${modelId.replace(/^fal-ai\//, '')} (Fal)`,
+          description: 'FLUX.2 generation; transferStyle runs it on its /edit endpoint',
+        };
+      }),
+    ];
+  }
+
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Submit a generation task to the Fal.ai queue.
+   *
+   * @param model - Full model path (e.g. 'fal-ai/flux/dev').
+   * @param body - Request body with prompt and generation params.
+   * @returns The request_id for status polling.
+   *
+   * @throws {Error} If the submission request fails.
+   * @internal
+   */
+  private async _submitTask(
+    model: string,
+    body: Record<string, unknown>
+  ): Promise<{ requestId: string; statusUrl?: string; responseUrl?: string }> {
+    const url = `${this._config.baseURL}/${model}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Key ${this.keyPool.next()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Fal.ai image generation submission failed (${response.status}): ${errorText}`);
+    }
+
+    const data = (await response.json()) as FalSubmitResponse;
+    if (!data.request_id) {
+      throw new Error('Fal.ai submission response missing request_id.');
+    }
+
+    return { requestId: data.request_id, statusUrl: data.status_url, responseUrl: data.response_url };
+  }
+
+  /**
+   * Poll the Fal.ai status endpoint until the task completes or times out.
+   *
+   * @param model - Full model path.
+   * @param requestId - The request ID from submission.
+   *
+   * @throws {Error} If the generation fails or times out.
+   * @internal
+   */
+  private async _pollStatus(model: string, requestId: string, statusUrl?: string, responseUrl?: string): Promise<void> {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < this._config.timeoutMs) {
+      const url = statusUrl ?? `${this._config.baseURL}/${model}/requests/${requestId}/status`;
+
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Key ${this.keyPool.next()}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Fal.ai status polling failed (${response.status}): ${errorText}`);
+      }
+
+      const data = (await response.json()) as FalStatusResponse;
+
+      if (data.status === 'COMPLETED') {
+        // A failed request completes too, with `error` and `error_type`
+        // ("present only if the request failed (only when COMPLETED)",
+        // https://fal.ai/docs/documentation/model-apis/inference/queue).
+        if (typeof data.error === 'string' && data.error) {
+          throw new Error(
+            `Fal.ai request ${requestId} failed: ${data.error}${typeof data.error_type === 'string' ? ` (${data.error_type})` : ''}`,
+          );
+        }
+        return;
+      }
+
+      if (data.status === 'FAILED') {
+        // Surface the provider's failure detail (safety refusal, invalid
+        // input, ...) instead of a bare request id. Callers classify
+        // refusals from the error text — a detail-less message made every
+        // Fal failure look identical and unclassifiable. Best-effort: the
+        // response endpoint carries the error payload for failed requests.
+        let detail = '';
+        try {
+          // The submit answer's response_url, as the result read uses: the
+          // rebuilt path can answer 405 on a multi-segment endpoint (above).
+          const resultUrl = responseUrl ?? `${this._config.baseURL}/${model}/requests/${requestId}`;
+          const resultResponse = await fetch(resultUrl, {
+            headers: { Authorization: `Key ${this.keyPool.next()}` },
+          });
+          const bodyText = await resultResponse.text();
+          if (bodyText) detail = `: ${bodyText.slice(0, 500)}`;
+        } catch {
+          // Detail fetch is best-effort; fall through to the bare message.
+        }
+        throw new Error(`Fal.ai image generation failed for request ${requestId}${detail}`);
+      }
+
+      // 'IN_QUEUE' or 'IN_PROGRESS' — wait before next poll
+      await sleep(this._config.pollIntervalMs);
+    }
+
+    throw new Error(`Fal.ai image generation timed out after ${this._config.timeoutMs}ms for request ${requestId}.`);
+  }
+
+  /**
+   * Fetch the completed generation result from the Fal.ai result endpoint.
+   *
+   * Called after polling confirms the task is COMPLETED. The result
+   * endpoint is separate from the status endpoint because Fal.ai
+   * returns the full payload (including image URLs) only here.
+   *
+   * @param model - Full model path.
+   * @param requestId - The request ID from submission.
+   * @returns The generation result with image URLs.
+   *
+   * @throws {Error} If the result fetch fails.
+   * @internal
+   */
+  private async _fetchResult(model: string, requestId: string, responseUrl?: string): Promise<FalResultResponse> {
+    const url = responseUrl ?? `${this._config.baseURL}/${model}/requests/${requestId}`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Key ${this.keyPool.next()}`,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Fal.ai result fetch failed (${response.status}): ${errorText}`);
+    }
+
+    return (await response.json()) as FalResultResponse;
+  }
+}

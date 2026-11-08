@@ -1,0 +1,127 @@
+# Query Router
+
+AgentOS includes a [`QueryRouter`](https://github.com/framerslab/agentos/blob/master/src/orchestration/pipeline/query/QueryRouter.ts) that turns one user question into a three-stage pipeline:
+
+1. classify the query into tier `0` through `3`
+2. retrieve the right amount of context
+3. generate a grounded answer from that context
+
+## What It Does
+
+- Tier classification uses an LLM prompt with corpus topics, recent conversation history, and optional tool names.
+- The router embeds local markdown docs into an in-memory vector store when an embedding provider is available.
+- If embeddings are unavailable or vector search fails, the router falls back to keyword search automatically.
+- Result metadata includes `tiersUsed` and `fallbacksUsed`.
+- Lifecycle events cover classification, retrieval, research, generation, and route completion.
+
+## Built-in Retrieval Branches
+
+The graph, rerank and research branches have built-in implementations that use only the local corpus:
+
+- `graphExpand()` adds chunks from the same document and with overlapping headings; it is not a GraphRAG engine.
+- `rerank()` is a lexical reranker, not a cross-encoder.
+- `deepResearch()` synthesizes from the local corpus; it searches no web sources.
+
+Hosts replace any of the three with their own implementation through the hooks below.
+
+## Host-Injected Runtime Hooks
+
+You can replace the built-in heuristic branches without forking [`QueryRouter`](https://github.com/framerslab/agentos/blob/master/src/orchestration/pipeline/query/QueryRouter.ts)
+by passing host-provided callbacks in the constructor:
+
+- `graphExpand(seedChunks)` for GraphRAG or relationship expansion
+- `rerank(query, chunks, topN)` for provider-backed reranking
+- `deepResearch(query, sources)` for real multi-source research
+
+When these hooks are supplied, `router.getCorpusStats()` reports the
+corresponding runtime mode as `active` instead of the built-in `heuristic`
+mode.
+
+## Example
+
+Runnable source: [`examples/query-router.mjs`](https://github.com/framerslab/agentos/blob/master/examples/query-router.mjs)
+
+```ts
+import { QueryRouter } from '@framers/agentos';
+
+const router = new QueryRouter({
+  knowledgeCorpus: ['./docs', './packages/agentos/docs'],
+  availableTools: ['web_search', 'deep_research'],
+});
+
+await router.init();
+
+console.log(router.getCorpusStats());
+
+const result = await router.route('How does memory retrieval work?');
+
+console.log(result.answer);
+console.log(result.classification.tier);
+console.log(result.tiersUsed);
+console.log(result.fallbacksUsed);
+console.log(result.sources);
+
+await router.close();
+```
+
+### Host-Injected Runtime Example
+
+Runnable source: [`examples/query-router-host-hooks.mjs`](https://github.com/framerslab/agentos/blob/master/examples/query-router-host-hooks.mjs)
+
+```ts
+const router = new QueryRouter({
+  knowledgeCorpus: ['./docs', './packages/agentos/docs'],
+  graphEnabled: true,
+  deepResearchEnabled: true,
+  graphExpand: async (seedChunks) => [...seedChunks, extraGraphChunk],
+  rerank: async (_query, chunks, topN) => chunks.slice(0, topN),
+  deepResearch: async (query, sources) => ({
+    synthesis: `Host-provided research for ${query}`,
+    sources: externalResearchChunks,
+  }),
+});
+
+await router.init();
+console.log(router.getCorpusStats()); // graph/deepResearch/rerank runtime modes become active
+```
+
+## Config Notes
+
+- `knowledgeCorpus` is required.
+- `init()` throws when the corpus is empty: no readable `.md` / `.mdx` sections under `knowledgeCorpus` and no platform knowledge (`includePlatformKnowledge: false`, or the bundled file missing).
+- `availableTools` is optional and is only used to help the classifier reason about what the runtime can do.
+- `apiKey` / `baseUrl` configure classifier and generator LLM calls. When omitted, a classifier or generator whose provider is not OpenAI takes that provider's own key variable (`MINIMAX_API_KEY` for `minimax`), or none when it is unset, and no URL from the router, so `generateText` resolves its credentials and endpoint and another vendor's key never reaches it. An OpenAI one prefers `OPENAI_API_KEY` and falls back to `OPENROUTER_API_KEY` with the OpenRouter compatibility base URL. With `MINIMAX_API_KEY` as the only provider key, the classifier and generator default to `minimax` and `MiniMax-M3.1-Flash`. An empty or whitespace-only `baseUrl` counts as omitted, so an OpenAI route on the OpenRouter key keeps the OpenRouter URL.
+- `embeddingApiKey` / `embeddingBaseUrl` override only the embedding path when vector retrieval should use a different provider or credential. When omitted, embeddings fall back to `apiKey` and `baseUrl` when they use the classifier's or the generator's provider, never for another vendor's; without that, an embedding provider other than OpenAI that has a key variable of its own takes that key (`GEMINI_API_KEY` for `gemini`), or none, and an OpenAI one takes the first provider key set, `OPENAI_API_KEY` first and `OPENROUTER_API_KEY` last. An embedding provider other than OpenAI gets no URL from the router; the OpenRouter compatibility URL goes only to an OpenAI one on the OpenRouter key. An empty or whitespace-only `embeddingBaseUrl` or inherited `baseUrl` counts as omitted. MiniMax publishes no embedding model, so a MiniMax key alone leaves `embeddingProvider` on `openai`, and the MiniMax provider refuses an embedding request before sending it.
+- `githubRepos` optionally enables non-blocking GitHub corpus indexing after `init()`. Newly indexed repo chunks are merged back into the live corpus, keyword fallback, classifier topics, and the vector index when embeddings are active.
+- `deepResearchEnabled` controls whether the tier-3 research branch is attempted (by default, on when `SERPER_API_KEY` is set); the default core implementation is a local-corpus heuristic, and hosts can inject a web-backed implementation.
+- `onClassification` and `onRetrieval` are hooks for consumers that want lightweight runtime integration without reading the full event stream.
+- `router.getCorpusStats()` returns a [`QueryRouterCorpusStats`](https://github.com/framerslab/agentos/blob/master/src/orchestration/pipeline/query/types.ts) snapshot with configured path count, loaded chunk/topic/source counts, live bundled platform-knowledge category counts, whether retrieval is running in `vector+keyword-fallback` or `keyword-only` mode, the embedding health field `embeddingStatus`, and the runtime-truth fields `graphRuntimeMode`, `rerankRuntimeMode`, and `deepResearchRuntimeMode`.
+- `embeddingStatus: 'active'` means the vector index initialized successfully, `'disabled-no-key'` means init stayed keyword-only because no embedding credential was available, and `'failed-init'` means embedding bootstrap was attempted but failed and the router fell back to keyword-only mode.
+- `graphRuntimeMode: 'heuristic'` means the built-in same-document / heading-overlap expansion is active; `'active'` means a host-injected `graphExpand` hook; `'disabled'` means `graphEnabled` is off.
+- `rerankRuntimeMode: 'heuristic'` means the built-in lexical reranker is active; `'active'` means a host-injected `rerank` hook.
+- `deepResearchRuntimeMode: 'heuristic'` means the built-in local-corpus synthesis pass is active; `'active'` means a host-injected `deepResearch` hook; `'disabled'` means `deepResearchEnabled` is off.
+
+## Result Metadata
+
+[`QueryResult`](https://github.com/framerslab/agentos/blob/master/src/orchestration/pipeline/query/types.ts) includes:
+
+- `classification`: the final classification result
+- `sources`: citations built from retrieved chunks
+- `recommendations`: optional skill/tool/extension suggestions inferred during plan-aware classification
+- `tiersUsed`: the tiers actually exercised after fallbacks
+- `fallbacksUsed`: retrieval/classification fallback strategy names such as `keyword-fallback` or `research-skip`
+- `durationMs`: total end-to-end wall-clock time for classification, retrieval, and generation
+
+## Events
+
+The router records typed events for:
+
+- `classify:start`
+- `classify:complete`
+- `classify:error`
+- `retrieve:*`
+- `research:*`
+- `generate:*`
+- `route:complete`
+
+Hosts use them for observability and audit trails.

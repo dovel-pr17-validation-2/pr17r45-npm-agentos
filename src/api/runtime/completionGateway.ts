@@ -1,0 +1,1049 @@
+/**
+ * @file completionGateway.ts
+ * One model layer for a GMI turn. `resolve()` picks the hop (router, primary,
+ * policy-aware fallback chain) and initialises its provider BEFORE the GMI
+ * builds a prompt, so the prompt is budgeted for the model that will serve it.
+ * `stream()` makes ONE provider attempt on a resolved hop with a delivery
+ * boundary: a failure before the first content chunk is reported through
+ * `outcome`, with the usage the provider billed for it, and nothing is
+ * yielded, so the GMI can rebuild the prompt for the next hop. The GMI drives
+ * the hop loop.
+ */
+import type { ZodType } from 'zod';
+import type { ChatMessage, ModelCompletionOptions, ModelCompletionResponse, ModelUsage } from '../../core/llm/providers/IProvider.js';
+import type { AIModelProviderManager } from '../../core/llm/providers/AIModelProviderManager.js';
+import type { ITool } from '../../core/tools/ITool.js';
+import type { IModelRouter, ModelRouteParams } from '../../core/llm/routing/IModelRouter.js';
+import { globalLLMProviderHealth } from '../../core/safety/LLMProviderHealthRegistry.js';
+import { lowerZodToJsonSchema } from '../../orchestration/compiler/SchemaLowering.js';
+import { findDuplicateJsonKey } from '../../core/utils/jsonDuplicateKeys.js';
+import { resolveModelOption, resolveProvider, createProviderManager, type ModelOption } from '../model.js';
+import { providerHealthKey } from './providerHealthKey.js';
+import { credentialsGoWith, modelNamesAnotherProvider } from './credentialOwner.js';
+import {
+  advanceFallbackWalk,
+  buildPolicyAwareFallbackChain,
+  explicitRequiredCapabilities,
+  fallbackEntrySentAs,
+  fallbackHopOverrides,
+  gateFallbackEntry,
+  INITIAL_FALLBACK_WALK,
+  isContentPolicyRefusal,
+  isRetryableError,
+  resolveFallbackChain,
+  resolvePolicyTier,
+  usageOfError,
+  type FallbackProviderEntry,
+  type FallbackSkipReason,
+  type FallbackWalkState,
+  type GenerateTextOptions,
+  type ResolvedFallbackEntry,
+} from '../generateText.js';
+import { hostPolicyToRouteParams, mergeRequiredCapabilities, type HostLLMPolicy } from './hostPolicy.js';
+import { buildResponseFormatForProvider, responseFormatCarriesSchema } from './responseFormatForProvider.js';
+import { buildSchemaInstructionText } from './structuredReply.js';
+
+/** What a turn asks the gateway for. Unset fields take the gateway's defaults. */
+export interface CompletionRoute {
+  modelId?: string;
+  providerId?: string;
+  /** The turn's messages so far; the last user message is the router's task hint. */
+  messages: ChatMessage[];
+  tools?: ITool[] | Array<Record<string, unknown>>;
+  router?: IModelRouter;
+  routerParams?: Partial<ModelRouteParams>;
+  hostPolicy?: HostLLMPolicy;
+  policyTier?: GenerateTextOptions['policyTier'];
+  /**
+   * Caller chain. Undefined builds the policy-aware chain from the environment; an empty array disables fallback.
+   * Either is resolved once, as generateText's walk resolves its chain: entries naming an excluded model or lacking
+   * an explicitly required capability are passed over, and so is the policy chain's entry for the first model.
+   */
+  fallbackProviders?: FallbackProviderEntry[];
+  /**
+   * Credentials for the primary only; fallback hops read the environment, as streamText's walk does.
+   * Set in the gateway defaults beside a provider or model, they are for that provider: a turn that
+   * names another provider does not take them.
+   */
+  apiKey?: string;
+  baseUrl?: string;
+  /** The call's own effort, cache and output budget, from which each fallback hop's overrides are derived. */
+  callOptions?: Pick<GenerateTextOptions, 'maxTokens' | 'effort' | 'cache'>;
+  /** Called when the turn moves to a hop after the primary. */
+  onFallback?: (info: { from: string; to: string; hop: number; error: Error }) => void;
+  /** Called for every hop that could not start (initialisation failure or open circuit). */
+  onHopFailure?: (info: { providerId: string; hop: number; error: Error }) => void;
+  /**
+   * Called for every chain entry the walk passes over without an attempt: an
+   * excluded model, a missing required capability, the policy chain's entry
+   * for the first model, a refill no standing leg is owed, a Claude leg after
+   * a refusal.
+   */
+  onHopSkipped?: (info: CompletionHopSkip) => void;
+}
+
+/**
+ * A chain entry the walk passed over without an attempt, and why.
+ * `provider` and `model` name the entry as written; `sentAsProvider` and
+ * `sentAsModel` name the provider and model the gateway would have sent it
+ * to, the names `onFallback` (`to`) and `onHopFailure` (`providerId`) use for
+ * a hop: an Anthropic entry with no Anthropic key or base URL and
+ * `OPENROUTER_API_KEY` set is `openrouter` and `anthropic/<model>` there, a
+ * `provider:model` id its prefix's provider and the id after it, an entry
+ * with no model its provider's default.
+ */
+export interface CompletionHopSkip {
+  /** The entry's provider, as written. */
+  provider: string;
+  /** The entry's model, as written (undefined for a provider's default). */
+  model?: string;
+  reason: FallbackSkipReason;
+  /** The provider the entry would have been sent to. */
+  sentAsProvider?: string;
+  /** The model id the entry would have been sent as. */
+  sentAsModel?: string;
+}
+
+/** The skip report for a passed-over entry: the entry as written, and as the gateway sends a hop. */
+function hopSkip(entry: { provider: string; model?: string }, reason: FallbackSkipReason): CompletionHopSkip {
+  // A fallback hop is sent on the environment's credentials (see resolve's hop loop).
+  const sentAs = fallbackEntrySentAs({ provider: entry.provider, model: entry.model });
+  return {
+    provider: entry.provider,
+    model: entry.model,
+    reason,
+    sentAsProvider: sentAs.provider,
+    ...(sentAs.model !== undefined ? { sentAsModel: sentAs.model } : {}),
+  };
+}
+
+/** One entry of the hop list a route resolves to. */
+export interface CompletionHop {
+  provider: string;
+  model?: string;
+  /** The chain entry behind a fallback hop, with its role in the walk when the policy chain gave it one. */
+  entry?: ResolvedFallbackEntry;
+  /**
+   * The primary only: whether the route's own key and base URL are for this
+   * provider. False when a router picked another one, which then runs on its
+   * own credentials.
+   */
+  ownCredentials?: boolean;
+}
+
+/** A hop that is ready to serve: its provider is initialised and its window is known. */
+export interface CompletionResolution {
+  providerId: string;
+  modelId: string;
+  hop: number;
+  maxContextTokens: number;
+  capabilities: string[];
+  /** Same strings as ModelTargetInfo.toolSupport.format. */
+  toolFormat: 'openai_functions' | 'anthropic_tools' | 'google_function_calling';
+  providerManager: AIModelProviderManager;
+  /**
+   * The id the hop's health is recorded under: for the first hop on a key or
+   * base URL of the route's own that differs from the provider's, the
+   * provider id with a digest of them (see `providerHealthKey`). Absent
+   * means the provider id.
+   */
+  healthId?: string;
+  /** Per-hop effort, cache and output budget from `fallbackHopOverrides`; merged over the caller's options. */
+  optionOverrides: Partial<ModelCompletionOptions>;
+  /** The hop list fixed by the route's first `resolve()`; later calls walk it. */
+  readonly chain: ReadonlyArray<CompletionHop>;
+  /**
+   * What the route's walk had seen before this hop ran: standing legs owed a
+   * refill, and whether a model refused. `resolve()` reads it from the hop it
+   * is handed.
+   *
+   * @internal
+   */
+  readonly walk?: FallbackWalkState;
+  /**
+   * The entries the chain's one-time resolution passed over (an excluded
+   * model, a missing capability, the policy chain's entry for the first
+   * model), held on the first hop until a walk starts, as the walkers log
+   * theirs only when they walk.
+   *
+   * @internal
+   */
+  readonly pendingSkips?: ReadonlyArray<CompletionHopSkip>;
+}
+
+/**
+ * How an attempt ended. A `hopFailed` attempt carries `usage` when the
+ * provider billed it and reported the bill (a refused turn, an error chunk
+ * with usage); the GMI adds it to the turn's usage.
+ */
+export type CompletionOutcome =
+  | { kind: 'delivered' }
+  | { kind: 'hopFailed'; error: Error; retryable: boolean; usage?: ModelUsage }
+  | { kind: 'abandoned' };
+
+/** One provider attempt. `outcome` settles when iteration ends (a never-iterated attempt never calls the provider). */
+export interface CompletionAttempt extends AsyncIterable<ModelCompletionResponse> {
+  outcome: Promise<CompletionOutcome>;
+  /**
+   * For an attempt with a response schema: true when the hop's provider
+   * payload carries the schema (a strict `json_schema`, Anthropic's forced
+   * schema tool, Gemini's `responseSchema`), false when the schema reaches the
+   * model in the prompt alone (no payload for the provider or model, or a JSON
+   * mode without one). Unset for an attempt with no schema. It describes the
+   * request that answered: a provider that sends the request again without
+   * the schema payload (OpenRouter's `json_object` retry when no endpoint
+   * takes the strict schema) says so on its chunks, and the value turns false,
+   * so read it once the attempt's stream has ended.
+   */
+  schemaInPayload?: boolean;
+  /**
+   * For an attempt with a response schema on an Anthropic hop: the route the
+   * hop's request took, as the provider's chunks say it (`schemaRoute`), else
+   * the route of the hop's marker. `json_schema` (the JSON output format; a
+   * text answer that parses is lifted into `structuredOutput`), `forced_tool`
+   * (a schema tool call whose arguments parse is lifted) or `none` (the schema
+   * rode the prompt; nothing is lifted). Unset on other providers and without
+   * a schema; like `schemaInPayload`, read it once the stream has ended.
+   */
+  schemaRoute?: 'json_schema' | 'forced_tool' | 'none';
+}
+
+/**
+ * Usage a provider reported for an attempt after the caller's signal ended it.
+ * The attempt ends at once, and a provider stream that had started is read in
+ * the background until it ends (for a bounded number of chunks), where a
+ * provider that bills the request may still report the bill: OpenRouter ends
+ * its stream with an abort chunk carrying the usage line it was reading (the
+ * one a held content-filter decline or a held error was waiting for, or the
+ * one that follows a normal finish). Neither the attempt's `outcome` nor its
+ * chunks carry this usage.
+ */
+export interface LateAttemptUsage {
+  providerId: string;
+  modelId: string;
+  hop: number;
+  /** The usage beyond what the attempt reported before it ended (providers report a request's running total). */
+  usage: ModelUsage;
+}
+
+export interface CompletionGateway {
+  /**
+   * The route's first hop that can start, or, given the hop that failed, the
+   * next one. `failure` is the error that hop failed with: the walk reads it
+   * as generateText's and streamText's walks do (a refusal passes over the
+   * policy chain's Claude legs; a standing uncensored leg that failed on
+   * availability is owed the next ranked model). Without it the hop counts
+   * as an availability failure.
+   */
+  resolve(route: CompletionRoute, after?: CompletionResolution, failure?: unknown): Promise<CompletionResolution | null>;
+  stream(
+    resolution: CompletionResolution,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions,
+    responseSchema?: ZodType,
+    schemaName?: string,
+    /**
+     * True when `messages` already carry the schema's instructions (a structured
+     * reply puts its own in the system prompt): a hop whose payload carries no
+     * schema then gets no second copy.
+     */
+    schemaInPrompt?: boolean,
+    /**
+     * Receives the usage the provider reports for this attempt after the
+     * caller's signal ended it ({@link LateAttemptUsage}), once the stream left
+     * running has ended. Without a listener, or when it throws, that usage is
+     * logged at warn level with its token counts.
+     */
+    onLateUsage?: (report: LateAttemptUsage) => void,
+  ): CompletionAttempt;
+  /**
+   * The schema instructions, in generateObject's words, that a hop's system
+   * prompt needs for `responseSchema`: the text when the hop's provider payload
+   * carries no schema (no payload for the provider or model, or a JSON mode
+   * without one), undefined when the payload carries it. A caller that puts
+   * the text in its prompt itself passes `schemaInPrompt` to `stream()`.
+   */
+  schemaInstruction?(resolution: CompletionResolution, responseSchema: ZodType, schemaName?: string): string | undefined;
+}
+
+/** The tool format a provider expects; the same mapping as GMI.determineToolFormat. */
+export function toolFormatFor(providerId: string): CompletionResolution['toolFormat'] {
+  const pid = providerId.toLowerCase();
+  if (pid.includes('anthropic')) return 'anthropic_tools';
+  if (pid.includes('google') || pid.includes('gemini')) return 'google_function_calling';
+  return 'openai_functions';
+}
+
+function definedOnly<T extends Record<string, unknown>>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** The text of the last user message, its text parts joined when the content is multimodal. */
+function lastUserText(messages: ChatMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .map((part) => {
+          const { type, text } = part as { type?: unknown; text?: unknown };
+          return type === 'text' && typeof text === 'string' ? text : '';
+        })
+        .filter((text) => text.length > 0)
+        .join('\n');
+    }
+    return '';
+  }
+  return '';
+}
+
+function toolNamesOf(tools: CompletionRoute['tools']): string[] {
+  return (tools ?? [])
+    .map((t) => (t as { name?: string }).name ?? (t as { function?: { name?: string } }).function?.name)
+    .filter((n): n is string => typeof n === 'string' && n.length > 0);
+}
+
+/** The error a hop with an open circuit fails with, worded as streamText words it. */
+function circuitOpenError(providerId: string, healthId: string = providerId): Error {
+  const stats = globalLLMProviderHealth.getStats(healthId);
+  return Object.assign(
+    new Error(`[503] Provider '${providerId}' circuit open; cooldown ${stats?.cooldownRemainingMs ?? 0}ms`),
+    { name: 'LLMProviderCircuitOpenError', httpStatus: 503 },
+  );
+}
+
+/** Primary selection, the same as streamText's: explicit model and provider, then the router when one is set. */
+async function selectPrimary(route: CompletionRoute): Promise<{ provider: string; model: string; ownCredentials: boolean }> {
+  // With the route's own key or base URL, so a model prefix that names
+  // another provider than the route's is refused rather than handed the key.
+  let { providerId, modelId } = resolveModelOption(
+    { provider: route.providerId, model: route.modelId, apiKey: route.apiKey, baseUrl: route.baseUrl } as ModelOption,
+    'text',
+  );
+  // The provider the route's own credentials are for: a router that picks
+  // another serves the primary on that provider's own credentials.
+  const credentialProviderId = providerId;
+  if (route.router) {
+    try {
+      const toolNames = toolNamesOf(route.tools);
+      const hostParams = hostPolicyToRouteParams(route.hostPolicy);
+      const params = {
+        taskHint: route.routerParams?.taskHint ?? lastUserText(route.messages),
+        ...hostParams,
+        ...route.routerParams,
+        optimizationPreference: route.routerParams?.optimizationPreference ?? hostParams.optimizationPreference ?? 'balanced',
+        requiredCapabilities: mergeRequiredCapabilities(
+          hostParams.requiredCapabilities,
+          route.routerParams?.requiredCapabilities,
+          toolNames.length > 0 ? ['function_calling'] : undefined,
+        ),
+        preferredProviderIds: route.routerParams?.preferredProviderIds ?? hostParams.preferredProviderIds,
+        policyTier: route.routerParams?.policyTier ?? route.policyTier ?? hostParams.policyTier,
+      } as ModelRouteParams;
+      const routed = await route.router.selectModel(params, undefined);
+      if (routed) {
+        providerId = routed.modelInfo?.providerId ?? providerId;
+        modelId = routed.modelId;
+      }
+    } catch (routerErr) {
+      console.warn('[agentos] Model router error, falling back to standard resolution:', routerErr);
+    }
+  }
+  return { provider: providerId, model: modelId, ownCredentials: providerId === credentialProviderId };
+}
+
+type InBandError = NonNullable<ModelCompletionResponse['error']>;
+
+/**
+ * The HTTP status an in-band error names in a numeric code (Gemini's stream
+ * errors carry `code: 500` beside `type: 'INTERNAL'`), read as streamText reads
+ * it: a 401 or 403 inside a stream describes an upstream attempt, not this
+ * key, so it is not taken as a status.
+ */
+function statusOfChunkCode(code: unknown): number | undefined {
+  return typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 599 && code !== 401 && code !== 403
+    ? code
+    : undefined;
+}
+
+/** An in-band provider error as an Error that `isRetryableError` and the health registry can judge (type, code, HTTP status kept). */
+function errorFromChunk(e: InBandError): Error {
+  const status = statusOfChunkCode(e.code);
+  return Object.assign(new Error(e.message), {
+    name: 'ProviderStreamError',
+    ...(e.type !== undefined ? { type: e.type } : {}),
+    ...(e.code !== undefined ? { code: e.code } : {}),
+    ...(status !== undefined ? { httpStatus: status } : {}),
+    ...(e.details !== undefined ? { details: e.details } : {}),
+  });
+}
+
+/**
+ * The chunk that ends an attempt whose provider threw after content. It carries
+ * the usage the error reports (`details.usage`, as a refused Claude turn reports
+ * it), so the GMI counts what the failed step was billed.
+ */
+function terminalErrorChunk(resolution: CompletionResolution, error: Error): ModelCompletionResponse {
+  const usage = asUsageReport(usageOfError(error));
+  return {
+    id: `gateway-error-${resolution.providerId}-${resolution.hop}`,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    modelId: resolution.modelId,
+    choices: [],
+    isFinal: true,
+    ...(usage ? { usage } : {}),
+    error: { message: error.message, type: (error as { type?: string }).type ?? 'provider_error', details: { terminal: true, providerId: resolution.providerId, hop: resolution.hop } },
+  };
+}
+
+/** The error of an attempt the caller's signal stopped, as the providers word theirs. */
+const CALLER_ABORT: InBandError = { message: 'Stream aborted by caller', type: 'abort' };
+
+/** The chunk that ends an attempt the caller's signal stopped, in the shape the providers give theirs. */
+function abortChunk(resolution: CompletionResolution): ModelCompletionResponse {
+  return {
+    id: `gateway-abort-${resolution.providerId}-${resolution.hop}`,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    modelId: resolution.modelId,
+    choices: [],
+    isFinal: true,
+    error: { ...CALLER_ABORT },
+  };
+}
+
+const ABORTED = Symbol('aborted');
+
+/** `next`'s result, or `ABORTED` once `signal` has aborted, whichever comes first. */
+function unlessAborted<T>(next: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  return new Promise<T | typeof ABORTED>((resolve, reject) => {
+    const onAbort = (): void => resolve(ABORTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+    next.then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * The most chunks read from a provider stream the caller's abort left behind.
+ * The built-in providers end their stream once they see the signal, at their
+ * next event at the latest, with their abort chunk; a custom IProvider that
+ * ignores the signal would otherwise stream, and its upstream bill, the whole
+ * reply in the background.
+ */
+const LEFT_STREAM_MAX_CHUNKS = 32;
+
+/**
+ * Reads a provider stream the caller's abort left behind, starting with the
+ * chunk it was asked for when the abort came (`pending`), until it ends, until
+ * the provider's abort or error chunk (a provider's last), or for at most
+ * {@link LEFT_STREAM_MAX_CHUNKS} chunks; a stream still open then is closed,
+ * which ends its request. A read that fails ends the reading.
+ *
+ * @returns The last usage report read there (a chunk's, or the one a thrown
+ *   error carries), or undefined when none was.
+ */
+async function readToEnd(
+  iterator: AsyncIterator<ModelCompletionResponse>,
+  pending: Promise<IteratorResult<ModelCompletionResponse>> | undefined,
+): Promise<ModelUsage | undefined> {
+  let usage: ModelUsage | undefined;
+  try {
+    let result = pending ? await pending : await iterator.next();
+    for (let read = 1; !result.done; read++) {
+      usage = asUsageReport(result.value?.usage) ?? usage;
+      if (result.value?.error || read >= LEFT_STREAM_MAX_CHUNKS) {
+        void Promise.resolve()
+          .then(() => iterator.return?.())
+          .catch(() => undefined);
+        break;
+      }
+      result = await iterator.next();
+    }
+  } catch (error) {
+    // The attempt has ended already; the provider's own failure is not the caller's, its bill is.
+    usage = asUsageReport(usageOfError(error)) ?? usage;
+  }
+  return usage;
+}
+
+/**
+ * The part of `latest`, a request's running total, that `counted` (an earlier
+ * report of the same request) did not carry; undefined when nothing is left.
+ */
+function usageBeyond(latest: ModelUsage, counted: ModelUsage | undefined): ModelUsage | undefined {
+  const beyond: Record<string, number> = {};
+  for (const [field, value] of Object.entries(latest)) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    const before = (counted as unknown as Record<string, unknown> | undefined)?.[field];
+    beyond[field] = Math.max(0, value - (typeof before === 'number' && Number.isFinite(before) ? before : 0));
+  }
+  return Object.values(beyond).some((count) => count > 0) ? (beyond as unknown as ModelUsage) : undefined;
+}
+
+/**
+ * Hands a late usage report to `onLateUsage`; without one, or when it throws, logs it with its token counts.
+ *
+ * @internal Also called by an attempt held in a spend meter (heldAttempt.ts), which reads the report on the way.
+ */
+export function reportLateUsage(report: LateAttemptUsage, onLateUsage: ((report: LateAttemptUsage) => void) | undefined): void {
+  if (onLateUsage) {
+    try {
+      onLateUsage(report);
+      return;
+    } catch (listenerError) {
+      console.warn('[agentos] completion gateway: the late usage listener failed:', listenerError);
+    }
+  }
+  const { promptTokens, completionTokens, totalTokens } = report.usage;
+  console.warn(
+    `[agentos] completion gateway: '${report.providerId}' reported usage for model '${report.modelId}' (hop ${report.hop}) ` +
+      `after its attempt was stopped, and nothing counted it: ${promptTokens ?? 0} prompt, ${completionTokens ?? 0} completion, ${totalTokens ?? 0} total tokens.`,
+  );
+}
+
+/**
+ * The provider's chunks until `signal` aborts, then the abort chunk at once.
+ * Anthropic, Gemini, Ollama, OpenRouter and Requesty read the signal when a
+ * streamed event or line arrives, so a request stalled before its first byte,
+ * or between two events, would otherwise hold the turn (and a session's
+ * `close()`) until the provider's own timeout. The signal is read before every
+ * chunk is asked for: asking a stream that has not started for its first chunk
+ * sends its request, so once the signal has aborted, a stream that was never
+ * asked is closed and sends nothing, and one that has started is read in the
+ * background until it ends, for a bounded number of chunks (readToEnd), and
+ * then closed. The usage reported there beyond what the attempt had
+ * reported (OpenRouter's abort chunk carries the bill its trailing usage line
+ * reports) goes to `onLateUsage` once that read ends ({@link LateAttemptUsage}).
+ */
+async function* untilAborted(
+  source: AsyncIterable<ModelCompletionResponse>,
+  signal: AbortSignal,
+  resolution: CompletionResolution,
+  onLateUsage: ((report: LateAttemptUsage) => void) | undefined,
+): AsyncGenerator<ModelCompletionResponse, void, undefined> {
+  const iterator = source[Symbol.asyncIterator]();
+  let started = false;
+  let leftRunning = false;
+  // The last usage report passed on: what the attempt reported before it ended.
+  let reported: ModelUsage | undefined;
+  // Hands the provider's stream over once the signal has aborted; `pending` is the chunk asked for when it did.
+  const leave = (pending?: Promise<IteratorResult<ModelCompletionResponse>>): void => {
+    leftRunning = true;
+    if (!started) {
+      void Promise.resolve(iterator.return?.()).catch(() => undefined);
+      return;
+    }
+    void readToEnd(iterator, pending).then((latest) => {
+      const late = latest ? usageBeyond(latest, reported) : undefined;
+      if (late) reportLateUsage({ providerId: resolution.providerId, modelId: resolution.modelId, hop: resolution.hop, usage: late }, onLateUsage);
+    });
+  };
+  try {
+    for (;;) {
+      if (signal.aborted) {
+        leave();
+        yield abortChunk(resolution);
+        return;
+      }
+      const pending = iterator.next();
+      started = true;
+      const next = await unlessAborted(pending, signal);
+      if (next === ABORTED) {
+        leave(pending);
+        yield abortChunk(resolution);
+        return;
+      }
+      if (next.done) return;
+      reported = asUsageReport(next.value.usage) ?? reported;
+      yield next.value;
+    }
+  } finally {
+    // As a for-await loop ends its source; not one still waiting on the network.
+    if (!leftRunning) await iterator.return?.();
+  }
+}
+
+/** Text, tool activity or a lifted schema answer: the first such chunk ends the buffering. */
+function carriesContent(chunk: ModelCompletionResponse): boolean {
+  if (chunk.responseTextDelta) return true;
+  if (chunk.toolCallsDeltas && chunk.toolCallsDeltas.length > 0) return true;
+  if ((chunk.choices?.[0]?.message?.tool_calls?.length ?? 0) > 0) return true;
+  return (chunk as { structuredOutput?: unknown }).structuredOutput !== undefined;
+}
+
+/** A usage report as a provider gives it: an object with a numeric token count. */
+function asUsageReport(value: unknown): ModelUsage | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { promptTokens, completionTokens, totalTokens } = value as Record<string, unknown>;
+  return [promptTokens, completionTokens, totalTokens].some((n) => typeof n === 'number' && Number.isFinite(n))
+    ? (value as ModelUsage)
+    : undefined;
+}
+
+/**
+ * What the provider billed an attempt that failed before any content: the
+ * error chunk's own usage, else the usage the error carries (`details.usage`,
+ * as a refused Claude turn reports it), else the last usage among the chunks
+ * buffered before the failure. Providers report the request's running total,
+ * so the latest report is the attempt's whole bill.
+ */
+function billedUsage(buffered: ReadonlyArray<ModelCompletionResponse>, error: Error, chunkUsage?: ModelUsage): ModelUsage | undefined {
+  const reported = asUsageReport(chunkUsage) ?? asUsageReport(usageOfError(error));
+  if (reported) return reported;
+  for (let i = buffered.length - 1; i >= 0; i--) {
+    const usage = asUsageReport(buffered[i].usage);
+    if (usage) return usage;
+  }
+  return undefined;
+}
+
+/** How an Anthropic hop carried the response schema: the JSON output format, the forced schema tool, or the prompt. */
+type SchemaRoute = 'json_schema' | 'forced_tool' | 'none';
+
+/**
+ * The provider-native schema payload for this hop, built as session.send builds
+ * it, and, when that payload carries no schema (no payload for the provider or
+ * model, or a JSON mode without one), the schema instructions for the hop's
+ * system prompt, in generateObject's words. For an Anthropic hop, `route` is
+ * the marker's route and `toolName` the schema's name; the attempt lifts by
+ * the route the provider says it took (`schemaRoute` on its chunks), else by
+ * this one, so the schema tool's call is lifted only on the forced route and a
+ * caller tool that shares the schema's name is never lifted on the others.
+ */
+function lowerForHop(
+  resolution: CompletionResolution,
+  schema: ZodType,
+  schemaName: string,
+): {
+  responseFormat: Record<string, unknown> | undefined;
+  route?: SchemaRoute;
+  toolName?: string;
+  schemaInstruction?: string;
+} {
+  const jsonSchema = lowerZodToJsonSchema(schema);
+  const responseFormat = buildResponseFormatForProvider({
+    providerId: resolution.providerId,
+    modelId: resolution.modelId,
+    jsonSchema,
+    effectiveSchema: schema,
+    schemaName,
+  });
+  const marker = responseFormat as
+    | { _agentosUseToolForStructuredOutput?: boolean; route?: SchemaRoute; tool?: { name?: string } }
+    | undefined;
+  const route = marker?._agentosUseToolForStructuredOutput ? marker.route ?? 'forced_tool' : undefined;
+  return {
+    responseFormat,
+    ...(route ? { route } : {}),
+    toolName: route ? marker?.tool?.name : undefined,
+    ...(responseFormatCarriesSchema(responseFormat) ? {} : { schemaInstruction: buildSchemaInstructionText(jsonSchema, schemaName) }),
+  };
+}
+
+/** `messages` with a system message of `text` after the leading system messages. */
+function withSystemMessage(messages: ChatMessage[], text: string): ChatMessage[] {
+  let at = 0;
+  while (at < messages.length && messages[at].role === 'system') at += 1;
+  return [...messages.slice(0, at), { role: 'system', content: text }, ...messages.slice(at)];
+}
+
+/**
+ * True when a chunk stopped at the output limit: `length`, the providers'
+ * mapping of Anthropic's `max_tokens`, or the raw `max_tokens`.
+ */
+function stoppedAtOutputLimit(chunk: ModelCompletionResponse): boolean {
+  const reason = chunk.choices?.[0]?.finishReason;
+  return reason === 'length' || reason === 'max_tokens';
+}
+
+/**
+ * A streamed forced schema tool call becomes `structuredOutput` on the chunk,
+ * never a tool call the GMI would dispatch. A call that is no answer is still
+ * removed, its raw arguments become the chunk's text and nothing goes into
+ * `structuredOutput`, so the step keeps its finish reason and the session
+ * names the failure, and the GMI never parses or runs the cut call: arguments
+ * that do not parse or that repeat a key (the parse would keep only the
+ * key's last value), and any call on a chunk that stopped at the output limit
+ * (`length`), whose arguments can parse though the call was cut (the limit
+ * can fall just after the closing brace; Anthropic's provider gives a call
+ * none of whose input arrived empty arguments, never a `{}`).
+ */
+function liftSchemaToolCall(chunk: ModelCompletionResponse, toolName: string): ModelCompletionResponse {
+  const choice = chunk.choices?.[0];
+  const calls = choice?.message?.tool_calls;
+  if (!choice || !calls?.length) return chunk;
+  const schemaCall = calls.find((call) => call.function?.name === toolName);
+  if (!schemaCall) return chunk;
+  const rest = calls.filter((call) => call !== schemaCall);
+  const message = { ...choice.message, tool_calls: rest.length > 0 ? rest : undefined };
+  const args: unknown = schemaCall.function.arguments;
+  const asText = (): ModelCompletionResponse => {
+    const raw = typeof args === 'string' ? args : JSON.stringify(args ?? null);
+    const text = typeof message.content === 'string' && message.content ? `${message.content}${raw}` : raw;
+    return { ...chunk, choices: [{ ...choice, message: { ...message, content: text } }, ...chunk.choices.slice(1)] };
+  };
+  if (stoppedAtOutputLimit(chunk)) return asText();
+  let structuredOutput: unknown = args;
+  if (typeof args === 'string') {
+    try {
+      structuredOutput = JSON.parse(args);
+    } catch {
+      return asText();
+    }
+    // A key the model repeated would keep only its last value in the parse:
+    // the call stays text, which the session's parse refuses and repairs.
+    if (findDuplicateJsonKey(args)) return asText();
+  }
+  return {
+    ...chunk,
+    choices: [{ ...choice, message }, ...chunk.choices.slice(1)],
+    structuredOutput,
+  } as ModelCompletionResponse & { structuredOutput: unknown };
+}
+
+/**
+ * A JSON text answer (an Anthropic hop on the JSON output format, which puts
+ * the JSON in the text block) becomes `structuredOutput` on the chunk, as
+ * {@link liftSchemaToolCall} lifts a forced tool call, so the session's
+ * protection of a schema answer and its parse see the same field on both
+ * routes. Only text that parses, on a chunk that did not stop at the output
+ * limit, is lifted: prose, and a `max_tokens` cut-off whether or not its text
+ * parses (the limit can fall just after the closing brace), keep their text
+ * and their finish reason, so a cut-off never reads as a clean stop.
+ */
+function liftSchemaText(chunk: ModelCompletionResponse, text: string): ModelCompletionResponse {
+  if (stoppedAtOutputLimit(chunk)) return chunk;
+  let structuredOutput: unknown;
+  try {
+    structuredOutput = JSON.parse(text);
+  } catch {
+    return chunk;
+  }
+  // As in liftSchemaToolCall: a repeated key leaves the answer as text.
+  if (findDuplicateJsonKey(text)) return chunk;
+  return { ...chunk, structuredOutput } as ModelCompletionResponse & { structuredOutput: unknown };
+}
+
+export function createCompletionGateway(defaults: Partial<CompletionRoute> = {}): CompletionGateway {
+  async function resolve(input: CompletionRoute, after?: CompletionResolution, failure?: unknown): Promise<CompletionResolution | null> {
+    const own = definedOnly(input as unknown as Record<string, unknown>) as Partial<CompletionRoute>;
+    const route: CompletionRoute = { ...defaults, ...own } as CompletionRoute;
+    // A turn whose model's `provider:` prefix names another provider than the
+    // defaults' does not inherit the defaults' provider.
+    if (
+      own.providerId === undefined &&
+      own.modelId !== undefined &&
+      defaults.providerId !== undefined &&
+      modelNamesAnotherProvider(defaults.providerId, own.modelId)
+    ) {
+      route.providerId = undefined;
+    }
+    // The defaults' key and base URL are for the provider the defaults name:
+    // a turn that names another provider takes only its own, and the
+    // primary then reads that provider's from the environment.
+    if (
+      (defaults.apiKey !== undefined || defaults.baseUrl !== undefined) &&
+      !credentialsGoWith({ provider: defaults.providerId, model: defaults.modelId }, { provider: route.providerId, model: route.modelId })
+    ) {
+      route.apiKey = own.apiKey;
+      route.baseUrl = own.baseUrl;
+    }
+    let chain: ReadonlyArray<CompletionHop>;
+    let walk: FallbackWalkState;
+    // The resolution's passed-over entries, reported when a walk starts.
+    let pendingSkips: CompletionHopSkip[] = [];
+    if (after) {
+      for (const skip of after.pendingSkips ?? []) route.onHopSkipped?.(skip);
+      chain = after.chain;
+      // The failed hop updates the walk: a refusal is recorded, and a standing
+      // leg that failed on availability is owed a refill.
+      walk = advanceFallbackWalk(after.walk ?? INITIAL_FALLBACK_WALK, chain[after.hop]?.entry?.walkRole, failure);
+    } else {
+      const primary = await selectPrimary(route);
+      // The tier the walkers read: route params, the call's own, the host policy's, the router's.
+      const tier = resolvePolicyTier({ routerParams: route.routerParams, policyTier: route.policyTier, hostPolicy: route.hostPolicy, router: route.router });
+      const fallbacks = route.fallbackProviders ?? buildPolicyAwareFallbackChain(tier, primary.provider);
+      // Resolved once, as generateText and streamText resolve a walk's chain:
+      // the policy chain's entry for the first model is dropped, the route's
+      // explicit capability and exclusion requirements apply to every entry
+      // as it will be sent, and the uncensored group's standing legs and
+      // refills are marked.
+      const resolved = resolveFallbackChain(fallbacks, {
+        primary,
+        requiredCapabilities: explicitRequiredCapabilities({ hostPolicy: route.hostPolicy, routerParams: route.routerParams }),
+        excludedModelIds: route.routerParams?.excludedModelIds,
+        onSkip: (entry, reason) => pendingSkips.push(hopSkip(entry, reason)),
+      });
+      chain = [
+        { provider: primary.provider, model: primary.model, ownCredentials: primary.ownCredentials },
+        ...resolved.map((entry) => ({ provider: entry.provider, model: entry.model, entry })),
+      ];
+      walk = INITIAL_FALLBACK_WALK;
+    }
+    let lastError: Error | undefined;
+    for (let hop = after ? after.hop + 1 : 0; hop < chain.length; hop++) {
+      const h = chain[hop];
+      // A refill runs only while a standing leg is owed one, and the policy
+      // chain's Claude legs are passed over after a refusal.
+      if (h.entry) {
+        const gate = gateFallbackEntry(walk, h.entry);
+        if (!gate.run) {
+          route.onHopSkipped?.(hopSkip(h, gate.reason));
+          continue;
+        }
+        walk = gate.state;
+      }
+      // Set once credentials resolve: the provider that serves the hop (resolveProvider
+      // may serve anthropic through openrouter), and the id its circuit and health
+      // are kept under (the route's own key and base URL have one of their own).
+      let servingProviderId: string | undefined;
+      let healthId: string | undefined;
+      try {
+        const parsed = hop === 0 && h.model ? { providerId: h.provider, modelId: h.model } : resolveModelOption({ provider: h.provider, model: h.model }, 'text');
+        // The route's own credentials go to the primary only when they are for
+        // its provider (a router may have picked another).
+        const routeCredentials = hop === 0 && h.ownCredentials !== false;
+        const resolved = routeCredentials
+          ? resolveProvider(parsed.providerId, parsed.modelId, { apiKey: route.apiKey, baseUrl: route.baseUrl })
+          : resolveProvider(parsed.providerId, parsed.modelId);
+        servingProviderId = resolved.providerId;
+        // A blank baseUrl counts here and changes nothing: resolveProvider dropped it, so the record is the provider's own.
+        const ownCredentials = routeCredentials && (route.apiKey !== undefined || route.baseUrl !== undefined);
+        // The provider's shared credentials are read quietly: that lookup sends nothing.
+        const hopHealthId = providerHealthKey(
+          resolved,
+          ownCredentials ? () => resolveProvider(parsed.providerId, parsed.modelId, { quiet: true }) : undefined,
+        );
+        healthId = hopHealthId;
+        if (globalLLMProviderHealth.isOpen(hopHealthId)) throw circuitOpenError(resolved.providerId, hopHealthId);
+        const providerManager = await createProviderManager(resolved);
+        const info = await providerManager.getModelInfo(resolved.modelId, resolved.providerId);
+        const overrides = h.entry ? fallbackHopOverrides(route.callOptions ?? {}, h.entry) : undefined;
+        const resolution: CompletionResolution = {
+          providerId: resolved.providerId,
+          modelId: resolved.modelId,
+          hop,
+          maxContextTokens: info?.contextWindowSize ?? 8192,
+          capabilities: [...(info?.capabilities ?? [])],
+          toolFormat: toolFormatFor(resolved.providerId),
+          providerManager,
+          healthId: hopHealthId,
+          optionOverrides: overrides
+            ? (definedOnly({ maxTokens: overrides.maxTokens, effort: overrides.effort, cache: overrides.cache }) as Partial<ModelCompletionOptions>)
+            : {},
+          chain,
+          walk,
+          ...(hop === 0 && pendingSkips.length > 0 ? { pendingSkips } : {}),
+        };
+        if (hop > 0) {
+          // The most recent error, as the walkers report it: a hop that could not
+          // start on the way here, else the one the previous hop failed with.
+          const cause = lastError ?? (failure instanceof Error ? failure : undefined) ?? new Error('the previous hop failed');
+          route.onFallback?.({ from: after?.providerId ?? chain[0].provider, to: resolved.providerId, hop, error: cause });
+        }
+        return resolution;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        // As in streamText: a configuration error (no credentials, unknown model)
+        // says nothing about the provider's health, and an open circuit is the
+        // registry's own verdict; neither is recorded.
+        if (healthId && lastError.name !== 'LLMProviderCircuitOpenError') {
+          globalLLMProviderHealth.recordFailure(healthId, lastError);
+        }
+        route.onHopFailure?.({ providerId: servingProviderId ?? h.provider, hop, error: lastError });
+        // The primary's configuration error (no credentials, unknown provider) is the caller's to see.
+        // A fallback leg that cannot start is skipped.
+        if (hop === 0 && !isRetryableError(lastError)) throw lastError;
+        // The primary could not start, so the walk starts here.
+        if (hop === 0) {
+          for (const skip of pendingSkips) route.onHopSkipped?.(skip);
+          pendingSkips = [];
+        }
+        // A hop that could not start failed on availability: a standing leg is owed a refill.
+        walk = advanceFallbackWalk(walk, h.entry?.walkRole, lastError);
+      }
+    }
+    return null;
+  }
+
+  function stream(
+    resolution: CompletionResolution,
+    messages: ChatMessage[],
+    options: ModelCompletionOptions,
+    responseSchema?: ZodType,
+    schemaName = 'response',
+    schemaInPrompt = false,
+    onLateUsage?: (report: LateAttemptUsage) => void,
+  ): CompletionAttempt {
+    let settle!: (outcome: CompletionOutcome) => void;
+    const outcome = new Promise<CompletionOutcome>((resolveOutcome) => {
+      settle = resolveOutcome;
+    });
+    let settled = false;
+    const finish = (o: CompletionOutcome): void => {
+      if (!settled) {
+        settled = true;
+        settle(o);
+      }
+    };
+    const failed = (
+      error: Error,
+      usage: ModelUsage | undefined,
+      retryable = isRetryableError(error) || isContentPolicyRefusal(error),
+    ): CompletionOutcome => ({ kind: 'hopFailed', error, retryable, ...(usage ? { usage } : {}) });
+
+    const structured = responseSchema ? lowerForHop(resolution, responseSchema, schemaName) : undefined;
+    // Whether the answering request's payload carries the schema: as lowered for the hop,
+    // until the provider's chunks say it sent the request without it.
+    let schemaInPayload = structured ? responseFormatCarriesSchema(structured.responseFormat) : undefined;
+    // A hop whose payload carries no schema gets it in its system prompt, unless the prompt carries it already.
+    const hopMessages = structured?.schemaInstruction && !schemaInPrompt ? withSystemMessage(messages, structured.schemaInstruction) : messages;
+    const callOptions: ModelCompletionOptions = {
+      ...options,
+      ...resolution.optionOverrides,
+      ...(structured
+        ? { responseFormat: structured.responseFormat as ModelCompletionOptions['responseFormat'], tools: undefined, toolChoice: undefined }
+        : {}),
+      stream: true,
+    };
+
+    /**
+     * The route the hop's provider says its request took (`schemaRoute` on its
+     * chunks): it decides on the request it sends (the model on the wire, thinking,
+     * citations, passthrough tools), so it can differ from the marker's route.
+     */
+    let sentRoute: SchemaRoute | undefined;
+    /** The text of a JSON-output-format answer so far, lifted once on the final chunk. */
+    let answerText = '';
+    let answerLifted = false;
+    const liftJsonText = (raw: ModelCompletionResponse): ModelCompletionResponse => {
+      // A hop whose provider put the schema in the prompt itself (its chunks say
+      // schemaInPayload false) answered as prompt-only text: nothing is lifted, and
+      // the session extracts the JSON from the text as it does for any prompt-only hop.
+      if (schemaInPayload === false) return raw;
+      if (raw.responseTextDelta) answerText += raw.responseTextDelta;
+      if (answerLifted || !raw.isFinal) return raw;
+      const content = raw.choices?.[0]?.message?.content;
+      const text = typeof content === 'string' && content ? content : answerText;
+      if (!text) return raw;
+      answerLifted = true;
+      return liftSchemaText(raw, text);
+    };
+    /** The answer lifted from where the hop's request put it: the schema tool's call, the format's text, or nowhere. */
+    const lift = (raw: ModelCompletionResponse): ModelCompletionResponse => {
+      if (!structured?.route) return raw;
+      if (raw.schemaRoute) sentRoute = raw.schemaRoute;
+      const route = sentRoute ?? structured.route;
+      if (route === 'forced_tool') return structured.toolName ? liftSchemaToolCall(raw, structured.toolName) : raw;
+      if (route === 'json_schema') return liftJsonText(raw);
+      return raw;
+    };
+
+    async function* run(): AsyncGenerator<ModelCompletionResponse, void, undefined> {
+      let delivered = false;
+      let completed = false;
+      const buffer: ModelCompletionResponse[] = [];
+      try {
+        // A turn the caller stopped before this attempt began (a session's close()
+        // during a tool round) sends no request: a provider that does not pass the
+        // signal to fetch would send it, and it would be billed.
+        if (callOptions.abortSignal?.aborted) {
+          finish(failed(errorFromChunk(CALLER_ABORT), undefined, false));
+          return;
+        }
+        const provider = resolution.providerManager.getProvider(resolution.providerId);
+        if (!provider) {
+          const error = Object.assign(new Error(`Provider '${resolution.providerId}' is not available.`), { name: 'ProviderInitializationError' });
+          globalLLMProviderHealth.recordFailure(resolution.healthId ?? resolution.providerId, error);
+          finish(failed(error, undefined));
+          return;
+        }
+        const chunks = provider.generateCompletionStream(resolution.modelId, hopMessages, callOptions);
+        const signal = callOptions.abortSignal;
+        for await (const raw of signal ? untilAborted(chunks, signal, resolution, onLateUsage) : chunks) {
+          if (structured && raw.schemaInPayload === false) schemaInPayload = false;
+          const chunk = lift(raw);
+          if (chunk.error) {
+            // An abort is the caller's own stop: it is never walked to another
+            // hop and says nothing about the provider's health (as in streamText).
+            const aborted = chunk.error.type === 'abort';
+            const error = errorFromChunk(chunk.error);
+            if (!aborted) globalLLMProviderHealth.recordFailure(resolution.healthId ?? resolution.providerId, error);
+            if (!delivered) {
+              const usage = billedUsage(buffer, error, chunk.usage);
+              finish(aborted ? failed(error, usage, false) : failed(error, usage));
+              return;
+            }
+            // After content the step ends with the provider's error chunk. The
+            // outcome settles first, so a consumer that stops reading at the
+            // error still finds the attempt delivered.
+            completed = true;
+            finish({ kind: 'delivered' });
+            yield chunk;
+            return;
+          }
+          if (!delivered) {
+            buffer.push(chunk);
+            if (carriesContent(chunk)) {
+              delivered = true;
+              yield* buffer.splice(0);
+            }
+            continue;
+          }
+          yield chunk;
+        }
+        // A normal end with no content chunk (an empty reply, a content-filter stop,
+        // a usage-only trailing chunk) still reaches the GMI.
+        if (!delivered) {
+          delivered = true;
+          yield* buffer.splice(0);
+        }
+        completed = true;
+        globalLLMProviderHealth.recordSuccess(resolution.healthId ?? resolution.providerId);
+        finish({ kind: 'delivered' });
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        globalLLMProviderHealth.recordFailure(resolution.healthId ?? resolution.providerId, error);
+        if (!delivered) {
+          finish(failed(error, billedUsage(buffer, error)));
+          return;
+        }
+        completed = true;
+        finish({ kind: 'delivered' });
+        yield terminalErrorChunk(resolution, error);
+      } finally {
+        // Only an attempt that neither delivered nor failed gets here unsettled:
+        // the consumer stopped reading. `finish` ignores every later call.
+        if (!completed) finish({ kind: 'abandoned' });
+      }
+    }
+
+    const attempt: CompletionAttempt = { [Symbol.asyncIterator]: () => run(), outcome };
+    if (structured) {
+      Object.defineProperty(attempt, 'schemaInPayload', { enumerable: true, get: () => schemaInPayload });
+      // The route the request took, as the provider said it; the marker's own until a chunk says.
+      if (structured.route) {
+        const markerRoute = structured.route;
+        Object.defineProperty(attempt, 'schemaRoute', { enumerable: true, get: () => sentRoute ?? markerRoute });
+      }
+    }
+    return attempt;
+  }
+
+  function schemaInstruction(resolution: CompletionResolution, responseSchema: ZodType, schemaName = 'response'): string | undefined {
+    return lowerForHop(resolution, responseSchema, schemaName).schemaInstruction;
+  }
+
+  return { resolve, stream, schemaInstruction };
+}

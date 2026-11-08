@@ -1,0 +1,315 @@
+/**
+ * @module @framers/agentos/io/voice-pipeline
+ *
+ * Real-time streaming voice pipeline for AgentOS.
+ *
+ * Provides a complete, provider-agnostic voice conversation system with
+ * pluggable STT, TTS, endpoint detection, barge-in handling, and transport.
+ *
+ * ## Architecture
+ *
+ * ```
+ * Browser Mic → Transport → STT → Endpoint Detector → Agent → TTS → Transport → Browser Speaker
+ *                                                        ↑
+ *                                                  Barge-in Handler
+ * ```
+ *
+ * All components are injected via `VoicePipelineOverrides`, making the pipeline
+ * fully provider-agnostic. Swap Deepgram for ElevenLabs STT, or ElevenLabs for
+ * OpenAI TTS, by changing one line.
+ *
+ * ## Built-in Providers
+ *
+ * **STT (Speech-to-Text):**
+ * - {@link DeepgramStreamingSTT}: WebSocket streaming via Deepgram Nova-3. Lowest latency.
+ * - {@link ElevenLabsStreamingSTT} — Chunked REST via ElevenLabs Scribe. Uses same key as TTS.
+ * - {@link OpenAIRealtimeTranscriptionSTT}: WebSocket streaming via OpenAI's Realtime API in transcription mode, keyed by item id, with a connection rollover for long sessions.
+ * - {@link MoonshineBrowserSTT}: Moonshine's streaming models on the user's own device, in the browser through WebAssembly; also in `@framers/agentos/io/voice-pipeline/browser`.
+ *
+ * **TTS (Text-to-Speech):**
+ * - {@link ElevenLabsStreamingTTS} — WebSocket streaming via ElevenLabs. High quality voices.
+ *
+ * **Endpoint Detection:**
+ * - {@link HeuristicEndpointDetector} — Punctuation + silence timeout. Fast, no model needed.
+ * - {@link AcousticEndpointDetector} — Silence-only, no transcript analysis.
+ *
+ * **Barge-in Handling:**
+ * - {@link HardCutBargeinHandler} — Immediate TTS cancel above speech threshold.
+ * - {@link SoftFadeBargeinHandler} — Three-tier (ignore/pause/cancel) with configurable fade.
+ *
+ * **Transport:**
+ * - {@link WebSocketStreamTransport} — WebSocket bidirectional audio/text.
+ * - {@link WebRTCStreamTransport} — WebRTC DataChannel transport.
+ *
+ * **Agent Adapter:**
+ * - {@link AgentSessionVoiceAdapter} — Wraps any AgentOS `AgentSession` as `IVoicePipelineAgentSession`.
+ *
+ * **Listening:**
+ * - {@link startListenSession}: a transport's audio into a transcriber and each final into a sink as a numbered turn, with no speech output.
+ * - {@link ReconnectingSTT}: one transcriber whose session is reconnected, with the buffered audio replayed and replayed duplicates dropped.
+ *
+ * ## Usage
+ *
+ * ```typescript
+ * import {
+ *   VoicePipelineOrchestrator,
+ *   HeuristicEndpointDetector,
+ *   HardCutBargeinHandler,
+ *   WebSocketStreamTransport,
+ *   ElevenLabsStreamingSTT,
+ *   ElevenLabsStreamingTTS,
+ *   AgentSessionVoiceAdapter,
+ * } from '@framers/agentos/io/voice-pipeline';
+ * import { agent } from '@framers/agentos';
+ *
+ * // Create agent and voice adapter
+ * const a = agent({ model: 'gpt-4o-mini', instructions: 'You are a voice companion.' });
+ * const session = a.session('voice-1');
+ * const voiceAdapter = new AgentSessionVoiceAdapter(session);
+ *
+ * // Create providers (use whichever API keys you have)
+ * const stt = new ElevenLabsStreamingSTT({ apiKey: process.env.ELEVENLABS_API_KEY! });
+ * const tts = new ElevenLabsStreamingTTS({ apiKey: process.env.ELEVENLABS_API_KEY! });
+ *
+ * // Create and start the pipeline
+ * const orchestrator = new VoicePipelineOrchestrator({
+ *   stt: 'elevenlabs', tts: 'elevenlabs', language: 'en-US',
+ * });
+ *
+ * const pipelineSession = await orchestrator.startSession(transport, voiceAdapter, {
+ *   streamingSTT: stt,
+ *   streamingTTS: tts,
+ *   endpointDetector: new HeuristicEndpointDetector(),
+ *   bargeinHandler: new HardCutBargeinHandler(),
+ * });
+ *
+ * // Listen for state changes (idle → listening → processing → speaking → listening)
+ * pipelineSession.on('state_change', (state) => console.log('Pipeline:', state));
+ * ```
+ *
+ * ## Custom Providers
+ *
+ * Implement {@link IStreamingSTT} and {@link IStreamingTTS} to add any provider:
+ *
+ * ```typescript
+ * class MyCustomSTT implements IStreamingSTT {
+ *   readonly providerId = 'my-custom-stt';
+ *   readonly isStreaming = true;
+ *   async startSession(config?: StreamingSTTConfig): Promise<StreamingSTTSession> {
+ *     // Connect to your STT service, return a session that emits 'transcript' events
+ *   }
+ * }
+ * ```
+ */
+
+// Re-export all type definitions from the types module.
+// Consumers can import any interface or type alias directly from this barrel.
+export * from './types.js';
+
+// Canonical provider-family taxonomy (see provider-family.ts).
+export { ttsProviderFamily, type TtsProviderFamily } from './provider-family.js';
+
+// The voice pipeline's event emitter (Node's semantics, no import) and the
+// emitter interface the streaming contracts extend.
+export { VoiceEventEmitter, type EventEmitterLike, type VoiceEventListener } from './VoiceEventEmitter.js';
+
+// On-device streaming STT in the browser (Moonshine through WebAssembly).
+export {
+  MoonshineBrowserSTT,
+  MOONSHINE_STREAMING_MODEL_FILES,
+  checkMoonshineBrowserSupport,
+  chooseMoonshineModel,
+  readMoonshineDeviceSignals,
+  loadMoonshineWasm,
+  type MoonshineBrowserSTTConfig,
+  type MoonshineLoadProgress,
+  type MoonshineModelSize,
+  type MoonshineModelChoice,
+  type MoonshineDeviceSignals,
+  type MoonshineBrowserScope,
+  type MoonshineBrowserSupport,
+  type MoonshineBrowserSupportOptions,
+  type MoonshineBrowserRequirement,
+  type MoonshineWasmModule,
+  type MoonshineTranscriberLike,
+  type MoonshineStreamLike,
+  type MoonshineWorkerHostLike,
+  type MoonshineLineLike,
+  type MoonshineLineEvent,
+  type MoonshineLineListener,
+  type MoonshineWordLike,
+  type MoonshineLoadOptionsLike,
+  type MoonshineModelSource,
+  type MoonshineProgressReport,
+} from './providers/MoonshineBrowserSTT.js';
+
+// The client transcript message's helpers: a client that transcribes on its
+// own device sends its transcripts in place of audio.
+export {
+  toClientTranscriptMessage,
+  isClientTranscriptMessage,
+  transcriptEventFromClient,
+} from './clientTranscript.js';
+// The text input message's check: a user who types sends text in place of speech.
+export { isClientTextInputMessage, MAX_TEXT_INPUT_LENGTH } from './clientTextInput.js';
+// The text a reply has proven spoken: sentence segments with exact offsets, and the acknowledged prefix.
+export { SentenceSegmenter, PlayedTextTracker, boundaryOf } from './ttsTextBoundaries.js';
+export type { TextSegment } from './ttsTextBoundaries.js';
+
+// Concrete barge-in handler implementations
+export { HardCutBargeinHandler } from './HardCutBargeinHandler.js';
+export { SoftFadeBargeinHandler } from './SoftFadeBargeinHandler.js';
+
+// Concrete endpoint detector implementations
+export { HeuristicEndpointDetector } from './HeuristicEndpointDetector.js';
+export { AcousticEndpointDetector } from './AcousticEndpointDetector.js';
+
+// WebSocket-based transport implementation
+export { WebSocketStreamTransport } from './WebSocketStreamTransport.js';
+
+// WebRTC DataChannel-based transport implementation
+export { WebRTCStreamTransport, createWebRTCTransport } from './WebRTCStreamTransport.js';
+
+// Central pipeline orchestrator (state machine)
+export { VoicePipelineOrchestrator } from './VoicePipelineOrchestrator.js';
+
+// A listen-only session and a transcriber that reconnects (TranscriptTurn and ITranscriptInputSink come from types.ts, above)
+export { startListenSession, type ListenSession, type ListenSessionOverrides, type ListenSessionStats, type ListenSessionState, type ListenEndReason, type ListenWarningKind } from './ListenSession.js';
+export { ReconnectingSTT, type ReconnectingSTTOptions, type SttReconnectedEvent, type SttGapEvent } from './ReconnectingSTT.js';
+
+// Typed error for barge-in interruptions
+export { VoiceInterruptError } from './VoiceInterruptError.js';
+
+// Streaming provider implementations
+export {
+  DeepgramStreamingSTT,
+  type DeepgramStreamingSTTConfig,
+  ElevenLabsStreamingSTT,
+  type ElevenLabsStreamingSTTConfig,
+  OpenAIRealtimeTranscriptionSTT,
+  type OpenAIRealtimeTranscriptionSTTConfig,
+  type OpenAIRealtimeTranscriptionRollover,
+  type OpenAIRealtimeRolloverRequest,
+  type OpenAIRealtimeTurnDetection,
+  ElevenLabsStreamingTTS,
+  type ElevenLabsStreamingTTSConfig,
+  DeepgramAuraStreamingTTS,
+  type DeepgramAuraStreamingTTSConfig,
+  AgentSessionVoiceAdapter,
+  StreamingSTTChain,
+  type StreamingSTTChainOptions,
+  type ProviderSelectedEvent,
+  type ProviderFailedEvent,
+  type ProviderFailoverEvent,
+  StreamingTTSChain,
+  type StreamingTTSChainOptions,
+  type TTSProviderSelectedEvent,
+  type TTSProviderFailedEvent,
+  type TTSProviderFailoverEvent,
+} from './providers/index.js';
+
+// Batch (one-shot) STT provider implementations.
+export {
+  BatchSTTFallback,
+  EmptyTranscriptError,
+  DeepgramPreRecordedBatchSTT,
+  type DeepgramPreRecordedBatchSTTConfig,
+  OpenAIWhisperBatchSTT,
+  type OpenAIWhisperBatchSTTConfig,
+} from './providers/index.js';
+
+// Resilience primitives
+export {
+  VoicePipelineError,
+  AggregateVoiceError,
+  type HealthErrorClass,
+  type VoicePipelineErrorInit,
+} from './VoicePipelineError.js';
+export {
+  type HealthyProvider,
+  type ProviderCapabilities,
+  type HealthCheckResult,
+  defaultCapabilities,
+  supportsLanguage,
+} from './HealthyProvider.js';
+export {
+  CircuitBreaker,
+  type BreakerState,
+  type CircuitBreakerOptions,
+  type StateChangeEvent,
+} from './CircuitBreaker.js';
+export { AudioRingBuffer, type AudioRingBufferOptions } from './AudioRingBuffer.js';
+export { InputSilenceWatch, inputLevelDb, type InputSilenceWatchOptions } from './inputLevel.js';
+export {
+  TranscriptDedupe,
+  normalizeTranscriptText,
+  type TranscriptObservation,
+  type DedupeResult,
+} from './TranscriptDedupe.js';
+export {
+  LIVEKIT_TRANSCRIPTION_ATTRIBUTES,
+  LIVEKIT_TRANSCRIPTION_TOPIC,
+  TRANSCRIPTION_FAILED_ATTRIBUTE,
+  TRANSCRIPTION_TIME_ATTRIBUTES,
+  TRANSCRIPTION_SPEAKER_ATTRIBUTE,
+  TRANSCRIPTION_RUN_OF_ATTRIBUTE,
+  readingOrder,
+  TranscriptLedger,
+  transcriptEventFromLiveKit,
+  type LedgerEvent,
+  type LedgerItem,
+  type TranscriptLedgerOptions,
+} from './transcriptLedger.js';
+export { lineSpeaker, splitFinalBySpeaker } from './transcriptSpeakers.js';
+export { phraseHeard, type HeardLine, type PhraseHeardOptions, type PhraseHeardResult } from './phraseHeard.js';
+export {
+  VoiceMetricsReporter,
+  type VoiceMetricEvent,
+  type VoiceMetricListener,
+} from './VoiceMetricsReporter.js';
+export {
+  createVoiceProvidersFromEnv,
+  createSttChainFromEnv,
+  NoVoiceProvidersAvailableError,
+  type VoiceProviderEnvConfig,
+  type VoiceProviderBundle,
+  type SttProviderEnvConfig,
+  type SttProviderBundle,
+  createSttChain,
+  sttEntryPricePerMinute,
+  parseSttEntry,
+  STT_CHAIN_VENDORS,
+  type SttChainEntryOptions,
+  type SttChainVendor,
+  type SttEntry,
+} from './env-constructor.js';
+export {
+  DEEPGRAM_PRE_RECORDED_PRICING,
+  DEEPGRAM_STREAMING_ADDONS,
+  DEEPGRAM_STREAMING_PRICING,
+  deepgramPreRecordedPricing,
+  deepgramStreamingPricing,
+} from './providers/deepgramPricing.js';
+
+// Price ordering over the hosted transcription entries a host offers, before a chain is built.
+export { selectLowestCostSttEntry, sttLanguageOptions } from './LowestCostStt.js';
+export type {
+  SttPriceRow,
+  SttCreditSnapshot,
+  LowestCostSttOptions,
+  LowestCostSttSelection,
+} from './LowestCostStt.js';
+
+// A host's refusal of a hosted transcription socket (`StreamingSTTConfig.connectionHooks`); never retried as an outage.
+export { SttConnectionAuthorizationError } from './SttConnectionAuthorizationError.js';
+
+// A Deepgram project's request costs for supplier-credit reconciliation; reads no balance and grants no credit.
+export { readDeepgramUsage, DeepgramUsageReadError } from './providers/DeepgramUsage.js';
+export type {
+  DeepgramUsageFailureCode,
+  DeepgramUsageContract,
+  DeepgramRequestCost,
+  DeepgramUsageEvidence,
+  DeepgramUsageReadOptions,
+  DeepgramUsageFetch,
+} from './providers/DeepgramUsage.js';

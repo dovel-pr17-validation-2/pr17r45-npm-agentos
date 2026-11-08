@@ -1,0 +1,184 @@
+/**
+ * Public API surface for AgentOS.
+ *
+ * High-level functions for text generation, agents, agencies, and media.
+ * Internal runtime (orchestrator, turn pipeline, handlers) is intentionally
+ * NOT exported here — import those directly when needed.
+ *
+ * @module agentos/api
+ */
+
+// --- Core entry points ---
+export { AgentOS, type AgentOSConfig } from './AgentOS.js';
+export type { AgentOSInput } from './types/AgentOSInput.js';
+export type { AgentOSResponse } from './types/AgentOSResponse.js';
+export type { AgentOSToolResultInput } from './types/AgentOSToolResultInput.js';
+export type { AgentOSPendingExternalToolRequest } from './types/AgentOSPendingExternalToolRequest.js';
+
+// --- High-level generation functions ---
+export {
+  generateText,
+  isRetryableError,
+  isContentPolicyRefusal,
+  buildFallbackChain,
+  buildPolicyAwareFallbackChain,
+  type GenerateTextOptions,
+  type GenerateTextResult,
+  type FallbackProviderEntry,
+  type HostLLMPolicy,
+  type Message,
+  type ToolCallRecord,
+  type TokenUsage,
+} from './generateText.js';
+export { normalizeHostLLMPolicy } from './runtime/hostPolicy.js';
+export { ContextWindowExceededError } from '../core/llm/providers/errors/ContextWindowExceededError.js';
+export { checkContextFit, type ContextFit, type ContextFitRequest } from './runtime/contextWindowFit.js';
+export { streamText } from './streamText.js';
+export { createCompletionGateway, toolFormatFor } from './runtime/completionGateway.js';
+export type {
+  CompletionAttempt,
+  CompletionGateway,
+  CompletionHop,
+  CompletionOutcome,
+  CompletionResolution,
+  CompletionRoute,
+  LateAttemptUsage,
+} from './runtime/completionGateway.js';
+export { GatewayProviderManager } from './runtime/gatewayProviderManager.js';
+export { generateObject } from './generateObject.js';
+export { streamObject } from './streamObject.js';
+export { embedText } from './embedText.js';
+export { SpendBudget, UnpricedModelError, asSpendBudget, costOfUsageUSD, estimateCallCostUSD } from './runtime/spendBudget.js';
+export type { SpendBudgetCall, SpendBudgetOptions, SpendBudgetSettlement, SpendLimitInfo, UsageForCost } from './runtime/spendBudget.js';
+export { estimateMaxCallCostUSD, maxInputTokens, modelPricing, registerModelPricing } from './runtime/modelPricing.js';
+export type { MaxCostRequest, ModelPrice, ModelPriceTable, ModelPriceTier } from './runtime/modelPricing.js';
+export { generateImage } from './generateImage.js';
+export { transferStyle } from './transferStyle.js';
+
+// --- LLM usage observer (global cost / telemetry hook) ---
+export {
+  setGlobalLlmObserver,
+  type LlmUsageAccountContext,
+  type LlmUsageAccountResolver,
+  type LlmUsageEvent,
+  type LlmUsageObserver,
+} from './observers.js';
+
+// --- Global default provider config ---
+export {
+  setDefaultProvider,
+  getDefaultProvider,
+  clearDefaultProvider,
+  type GlobalDefaultProvider,
+} from './runtime/global-default.js';
+
+// --- Agent & Agency ---
+export { agent } from './agent.js';
+export { agency } from './agency.js';
+
+// --- GMIs from agent options (`agent({ runtime: 'gmi' })`) ---
+export { gmi, createGmi, type GmiOptions, type GmiHandle } from './gmi.js';
+export {
+  resolveCognition,
+  type CognitionProfile,
+  type CognitionConfig,
+  type CognitionInputs,
+  type MetapromptPreset,
+  type ResolvedCognition,
+} from './runtime/gmiCognition.js';
+export { personaFromAgentOptions } from './runtime/gmiPersona.js';
+// Teams a gmi() agent launches from a turn (`agencies.launch`), and persistent gmi() agents seated as themselves.
+export { LAUNCH_AGENCY_TOOL_NAME } from './runtime/agencyLaunch/types.js';
+export type {
+  AgencyLaunchOptions,
+  LaunchAgencyArgs,
+  LaunchAgencyResult,
+  LaunchRefusal,
+  LaunchRefusalCode,
+  LaunchSeatRecord,
+  LaunchSeatSpec,
+  LaunchStatus,
+  LaunchUsage,
+} from './runtime/agencyLaunch/types.js';
+export { sessionSeat, type SeatHandle, type SessionSeatOptions } from './runtime/agencyLaunch/sessionSeat.js';
+export type { SeatMetadata } from './types.js';
+// The rest of the launch surface: the runtime's `agencies` option, the limits, the frame, the caller turn, a tool hook
+// and the registry record.
+export type {
+  AgencyLaunchFrame,
+  CallerTurnContext,
+  LaunchLimits,
+  LaunchRecordMetadata,
+  RuntimeAgencyLaunchOptions,
+  ToolCallHook,
+} from './runtime/agencyLaunch/index.js';
+export {
+  createAgentCognitiveMemory,
+  type AgentCognitiveMemory,
+  type AgentCognitiveMemoryOptions,
+} from './runtime/agentCognitiveMemory.js';
+export { souledAgent } from './souledAgent.js';
+export type { SouledAgentOptions, SouledAgent } from './souledAgent.js';
+export { exportAgent } from './exportAgent.js';
+
+// --- Model routing ---
+export type { IModelRouter, ModelRouteParams, ModelRouteResult } from '../core/llm/routing/IModelRouter.js';
+export { ModelRouter } from '../core/llm/routing/ModelRouter.js';
+export { PolicyAwareRouter, type PolicyOverrides } from '../core/llm/routing/PolicyAwareRouter.js';
+export {
+  createUncensoredModelCatalog,
+  MATURE_TEXT_RANKING,
+  PRIVATE_ADULT_TEXT_RANKING,
+  canonicalCapability,
+  catalogEntryHasCapability,
+  findCatalogTextModel,
+  type UncensoredModelCatalog,
+  type CatalogEntry,
+  type PolicyTier,
+  type ContentIntent,
+} from '../core/llm/routing/UncensoredModelCatalog.js';
+
+// --- Image routing ---
+export { PolicyAwareImageRouter, type ImageProviderPreference } from '../io/media/images/PolicyAwareImageRouter.js';
+
+// --- Generation hooks ---
+export type { GenerationHookContext, GenerationHookResult, ToolCallHookInfo } from './generateText.js';
+
+// --- Memory, PromptEngine, Skills (for agent() integration) ---
+export { AgentMemory } from '../cognition/memory/AgentMemory.js';
+export type { IPromptEngine } from '../core/llm/IPromptEngine.js';
+export type { SkillEntry } from '../cognition/skills/types.js';
+export { SkillRegistry } from '../cognition/skills/SkillRegistry.js';
+
+// --- Avatar types ---
+export type {
+  AvatarConfig,
+  AvatarRuntimeMode,
+  AvatarAnchorAssets,
+  AvatarStyleProjection,
+  AvatarDriftGuard,
+  AvatarBindingInputs,
+  AvatarRiveProfile,
+  AvatarSpriteProfile,
+  AvatarIdentityPackage,
+  AvatarIdentityDescriptor,
+  VerifyCitationsConfig,
+} from './types.js';
+
+// --- Errors ---
+export * from './errors.js';
+
+// A reply that must match a schema on the full runtime (ProcessingOptions.structuredReply)
+export {
+  resolveStructuredReply,
+  resolveStructuredReplySpec,
+  checkStructuredReply,
+  recheckStructuredReply,
+  structuredRepairMessage,
+  StructuredReplyConfigError,
+  type StructuredReplySpec,
+  type StructuredOutputMeta,
+  type StructuredReplyOutput,
+  type IStructuredSchemaRegistry,
+  type ResolvedStructuredReply,
+} from './runtime/structuredReply';

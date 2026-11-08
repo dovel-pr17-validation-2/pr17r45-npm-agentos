@@ -1,0 +1,99 @@
+/**
+ * @file global-default.ts
+ * Module-level default-provider registry.
+ *
+ * Lets applications configure a single default provider once at boot
+ * (or via the `AgentOSConfig.defaultProvider` field) and have every
+ * subsequent high-level call (`generateText`, `agent`, `agency`, etc.)
+ * inherit from it without inline `apiKey` / `provider` arguments and
+ * without environment variables.
+ *
+ * Resolution priority (highest first):
+ *   1. Inline `apiKey` / `provider` / `model` / `baseUrl` on the call
+ *   2. Global default set via `setDefaultProvider()`
+ *   3. Environment-variable auto-detect chain (OPENROUTER_API_KEY, OPENAI_API_KEY, …)
+ *   4. Error
+ *
+ * The registry is process-scoped: tests should call `clearDefaultProvider()`
+ * in `beforeEach` / `afterEach` to avoid cross-test leakage.
+ */
+
+/**
+ * Shape of the global default-provider config.
+ *
+ * All fields are optional. Setting just `provider` lets AgentOS pick
+ * the provider's default model for each task type; setting `apiKey` /
+ * `baseUrl` provides credentials without touching the environment.
+ */
+export interface GlobalDefaultProvider {
+  /** Provider identifier (e.g. `"openai"`, `"anthropic"`, `"openrouter"`, `"ollama"`). */
+  provider?: string;
+  /**
+   * Default text model for this provider (e.g. `"gpt-4o-mini"`), used by
+   * `generateText`, `streamText` and agents. Embedding and image calls use it
+   * too unless it is recognizably a chat model (GPT, Claude, Gemini, Llama,
+   * MiniMax and similar families) sent to the provider's own endpoint, in
+   * which case the provider's default model for the task applies. With a
+   * custom endpoint, and for `embedText` on Ollama, it is always used. The
+   * endpoint is the base URL the call is sent to: the call's own `baseUrl`,
+   * else `baseUrl` here, else the provider's base-URL env var, each read as
+   * `resolveBaseUrl` in `model.ts` reads it: an empty or whitespace-only one
+   * is unset and the next source applies, and with none the call goes to the
+   * provider's own endpoint. OpenAI's API root `https://api.openai.com/v1` and
+   * the regional roots OpenAI's data residency guide names
+   * (`https://us.api.openai.com/v1`, `https://eu.api.openai.com/v1` and the
+   * au, ca, jp, in, sg, kr, gb and ae ones), and MiniMax's API roots,
+   * `https://api.minimax.io/v1`, the China root `https://api.minimax.cn/v1`
+   * that MiniMax's China documentation names and the older China root
+   * `https://api.minimaxi.com/v1`, are the provider's own endpoint, not a
+   * custom one, whether the call, this default or the base-URL env var gives
+   * them, compared as fetch sends the URL: the letter case of the scheme and
+   * the host, a default port, surrounding whitespace and trailing slashes
+   * make no difference.
+   */
+  model?: string;
+  /** API key used when no inline override is supplied. */
+  apiKey?: string;
+  /**
+   * Base URL override (useful for proxies, local Ollama, etc.). An empty or
+   * whitespace-only value is unset: the provider's base-URL env var applies,
+   * and with none text and image calls go to the provider's own endpoint
+   * (Ollama and `stable-diffusion-local`, which have none, refuse them with
+   * no request).
+   */
+  baseUrl?: string;
+}
+
+let _globalDefault: GlobalDefaultProvider | undefined;
+
+/**
+ * Set the module-level default provider configuration.
+ *
+ * Call once at application boot. Pass `undefined` to clear.
+ *
+ * @example
+ * ```ts
+ * import { setDefaultProvider, generateText } from '@framers/agentos';
+ *
+ * setDefaultProvider({ provider: 'openai', apiKey: process.env.MY_OWN_KEY });
+ *
+ * // Every subsequent call inherits these defaults:
+ * const { text } = await generateText({ prompt: 'hello' });
+ * ```
+ */
+export function setDefaultProvider(config?: GlobalDefaultProvider): void {
+  _globalDefault = config;
+}
+
+/**
+ * Read the current module-level default provider configuration.
+ * Returns `undefined` when none has been set.
+ */
+export function getDefaultProvider(): GlobalDefaultProvider | undefined {
+  return _globalDefault;
+}
+
+/** Alias for `setDefaultProvider(undefined)` — clears the registry. */
+export function clearDefaultProvider(): void {
+  _globalDefault = undefined;
+}

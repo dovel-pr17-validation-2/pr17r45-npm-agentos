@@ -1,0 +1,364 @@
+import type { SpeechProviderCatalogEntry, SpeechProviderKind } from './types.js';
+
+export const SPEECH_PROVIDER_CATALOG: readonly SpeechProviderCatalogEntry[] = [
+  {
+    id: 'twilio',
+    kind: 'telephony',
+    label: 'Twilio',
+    envVars: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'],
+    local: false,
+    description: 'Telephony call control via Twilio programmable voice.',
+    extensionName: 'voice-twilio',
+    features: ['telephony', 'webhooks', 'media-streams'],
+  },
+  {
+    id: 'telnyx',
+    kind: 'telephony',
+    label: 'Telnyx',
+    envVars: ['TELNYX_API_KEY', 'TELNYX_CONNECTION_ID'],
+    local: false,
+    description: 'Telephony call control via Telnyx Call Control.',
+    extensionName: 'voice-telnyx',
+    features: ['telephony', 'sip', 'media-streams'],
+  },
+  {
+    id: 'plivo',
+    kind: 'telephony',
+    label: 'Plivo',
+    envVars: ['PLIVO_AUTH_ID', 'PLIVO_AUTH_TOKEN'],
+    local: false,
+    description: 'Telephony call control via the Plivo Voice API.',
+    extensionName: 'voice-plivo',
+    features: ['telephony', 'xml'],
+  },
+  {
+    id: 'openai-whisper',
+    kind: 'stt',
+    label: 'OpenAI Whisper',
+    envVars: ['OPENAI_API_KEY'],
+    local: false,
+    description:
+      'Hosted OpenAI speech-to-text for file and utterance transcription (gpt-transcribe; whisper-1 for timestamped formats).',
+    defaultModel: 'gpt-transcribe',
+    streaming: false,
+    features: ['cloud', 'timestamps', 'transcription'],
+  },
+  {
+    id: 'deepgram',
+    kind: 'stt',
+    label: 'Deepgram',
+    envVars: ['DEEPGRAM_API_KEY'],
+    local: false,
+    description: 'Streaming-first speech-to-text for live conversations.',
+    streaming: true,
+    features: ['cloud', 'streaming'],
+  },
+  {
+    id: 'deepgram-batch',
+    kind: 'stt',
+    label: 'Deepgram Batch',
+    envVars: ['DEEPGRAM_API_KEY'],
+    local: false,
+    streaming: false,
+    description: 'Batch speech-to-text via Deepgram REST API.',
+    defaultModel: 'nova-3',
+    features: ['cloud', 'diarization', 'timestamps'],
+  },
+  {
+    id: 'assemblyai',
+    kind: 'stt',
+    label: 'AssemblyAI',
+    envVars: ['ASSEMBLYAI_API_KEY'],
+    local: false,
+    description: 'Hosted speech-to-text with diarization and analytics.',
+    streaming: true,
+    features: ['cloud', 'streaming', 'diarization'],
+  },
+  {
+    id: 'google-cloud-stt', kind: 'stt', label: 'Google Cloud STT',
+    envVars: ['GOOGLE_STT_CREDENTIALS'], local: false,
+    description: 'Batch Google Cloud speech recognition through the installed provider.',
+    streaming: false, features: ['cloud', 'transcription'],
+  },
+  {
+    id: 'azure-speech-stt',
+    kind: 'stt',
+    label: 'Azure Speech STT',
+    envVars: ['AZURE_SPEECH_KEY', 'AZURE_SPEECH_REGION'],
+    local: false,
+    description: 'Azure speech recognition for batch and live transcription.',
+    streaming: false,
+    features: ['cloud', 'streaming'],
+  },
+  {
+    id: 'whisper-local',
+    kind: 'stt',
+    label: 'Whisper.cpp',
+    envVars: [],
+    local: true,
+    description: 'Local Whisper.cpp offline transcription.',
+    features: ['local', 'offline'],
+    available: false,
+  },
+  {
+    id: 'vosk', kind: 'stt', label: 'Vosk', envVars: [], local: true,
+    description: 'Batch local speech recognition through the installed Vosk provider.',
+    streaming: false, features: ['local', 'offline'],
+  },
+  {
+    id: 'nvidia-nemo',
+    kind: 'stt',
+    label: 'NVIDIA NeMo',
+    envVars: [],
+    local: true,
+    description: 'Local/offline ASR via NVIDIA NeMo.',
+    features: ['local', 'offline'],
+    available: false,
+  },
+  {
+    id: 'openai-tts',
+    kind: 'tts',
+    label: 'OpenAI TTS',
+    envVars: ['OPENAI_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Hosted speech synthesis via OpenAI speech models.',
+    // /v1/audio/speech accepts tts-1, tts-1-hd and gpt-4o-mini-tts, which OpenAI
+    // removes on 2027-01-06. Their named replacement, gpt-realtime-2.1-mini,
+    // runs only on the Realtime API, so the default stays on tts-1.
+    defaultModel: 'tts-1',
+    defaultVoice: 'nova',
+    features: ['cloud', 'tts'],
+  },
+  {
+    id: 'elevenlabs',
+    kind: 'tts',
+    label: 'ElevenLabs',
+    envVars: ['ELEVENLABS_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'High-quality neural TTS with voice cloning.',
+    extensionName: 'voice-synthesis',
+    defaultModel: 'eleven_multilingual_v2',
+    features: ['cloud', 'tts', 'voice-cloning'],
+  },
+  {
+    id: 'deepgram-aura',
+    kind: 'tts',
+    label: 'Deepgram Aura',
+    envVars: ['DEEPGRAM_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Low-latency neural TTS via Deepgram Aura-2 (REST + WebSocket).',
+    defaultModel: 'aura-2',
+    defaultVoice: 'aura-2-thalia-en',
+    features: ['cloud', 'tts', 'streaming', 'low-latency'],
+  },
+  {
+    id: 'minimax-tts',
+    kind: 'tts',
+    label: 'MiniMax TTS',
+    envVars: ['MINIMAX_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Speech synthesis via MiniMax HTTP, async, and WebSocket APIs.',
+    defaultModel: 'speech-2.8-hd',
+    features: ['cloud', 'tts', 'streaming', 'websocket', 'async'],
+  },
+  {
+    id: 'google-cloud-tts',
+    kind: 'tts',
+    label: 'Google Cloud TTS',
+    envVars: ['GOOGLE_TTS_CREDENTIALS'],
+    local: false,
+    description: 'Google Cloud neural text-to-speech.',
+    features: ['cloud', 'tts'],
+  },
+  {
+    id: 'amazon-polly',
+    kind: 'tts',
+    label: 'Amazon Polly',
+    envVars: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Amazon Polly neural text-to-speech.',
+    features: ['cloud', 'tts'],
+  },
+  {
+    id: 'azure-speech-tts',
+    kind: 'tts',
+    label: 'Azure Speech TTS',
+    envVars: ['AZURE_SPEECH_KEY', 'AZURE_SPEECH_REGION'],
+    local: false,
+    streaming: true,
+    description: 'Azure neural text-to-speech.',
+    features: ['cloud', 'tts'],
+  },
+  {
+    id: 'piper',
+    kind: 'tts',
+    label: 'Piper',
+    envVars: [],
+    local: true,
+    description: 'Offline local TTS via Piper.',
+    features: ['local', 'offline', 'tts'],
+  },
+  {
+    id: 'coqui',
+    kind: 'tts',
+    label: 'Coqui XTTS',
+    envVars: [],
+    local: true,
+    streaming: true,
+    description: 'Local XTTS / Coqui speech synthesis.',
+    features: ['local', 'tts', 'voice-cloning'],
+    available: false,
+  },
+  {
+    id: 'bark',
+    kind: 'tts',
+    label: 'Bark',
+    envVars: [],
+    local: true,
+    description: 'Local Bark expressive speech synthesis.',
+    features: ['local', 'tts'],
+    available: false,
+  },
+  {
+    id: 'styletts2',
+    kind: 'tts',
+    label: 'StyleTTS2',
+    envVars: [],
+    local: true,
+    description: 'Local StyleTTS2 expressive speech synthesis.',
+    features: ['local', 'tts'],
+    available: false,
+  },
+  {
+    id: 'agentos-adaptive-vad',
+    kind: 'vad',
+    label: 'AgentOS Adaptive VAD',
+    envVars: [],
+    local: true,
+    description: 'Built-in adaptive VAD backed by environmental calibration.',
+    features: ['local', 'vad', 'adaptive'],
+  },
+  {
+    id: 'porcupine',
+    kind: 'wake-word',
+    label: 'Porcupine',
+    envVars: ['PICOVOICE_ACCESS_KEY'],
+    local: true,
+    description: 'Wake-word detection via Picovoice Porcupine.',
+    features: ['local', 'wake-word'],
+  },
+  {
+    id: 'openwakeword',
+    kind: 'wake-word',
+    label: 'OpenWakeWord',
+    envVars: [],
+    local: true,
+    description: 'Wake-word detection via OpenWakeWord.',
+    features: ['local', 'wake-word'],
+  },
+  // ── Streaming Voice Pipeline providers ──────────────────────────────────
+  {
+    id: 'deepgram-streaming',
+    kind: 'stt',
+    label: 'Deepgram Streaming',
+    envVars: ['DEEPGRAM_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Real-time streaming STT via Deepgram WebSocket API with interim results and native diarization.',
+    extensionName: 'streaming-stt-deepgram',
+    features: ['streaming', 'interim-results', 'diarization', 'punctuation', 'endpointing'],
+  },
+  {
+    id: 'whisper-chunked',
+    kind: 'stt',
+    label: 'Whisper Chunked Streaming',
+    envVars: ['OPENAI_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Simulated streaming STT via sliding-window Whisper chunks with 1-2s latency.',
+    extensionName: 'streaming-stt-whisper',
+    features: ['streaming', 'interim-results'],
+  },
+  {
+    id: 'openai-realtime-transcription',
+    kind: 'stt',
+    label: 'OpenAI Realtime Transcription',
+    envVars: ['OPENAI_API_KEY'],
+    local: false,
+    streaming: true,
+    description:
+      'Real-time streaming STT over an OpenAI Realtime transcription session, with transcripts keyed by item id and a connection rollover for long sessions.',
+    defaultModel: 'gpt-4o-mini-transcribe',
+    features: ['streaming', 'interim-results', 'endpointing', 'item-ids', 'long-sessions'],
+  },
+  {
+    id: 'moonshine-browser',
+    kind: 'stt',
+    label: 'Moonshine (in the browser)',
+    envVars: [],
+    local: true,
+    streaming: true,
+    description:
+      "On-device streaming STT in the browser: Moonshine's streaming models through @moonshine-ai/moonshine-wasm on the user's own processor, so the audio stays on the device.",
+    features: ['local', 'offline', 'streaming', 'browser'],
+  },
+  {
+    id: 'openai-streaming-tts',
+    kind: 'tts',
+    label: 'OpenAI Streaming TTS',
+    envVars: ['OPENAI_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Streaming TTS via OpenAI API with adaptive sentence-boundary chunking.',
+    extensionName: 'streaming-tts-openai',
+    defaultVoice: 'nova',
+    features: ['streaming', 'sentence-chunking'],
+  },
+  {
+    id: 'elevenlabs-streaming-tts',
+    kind: 'tts',
+    label: 'ElevenLabs Streaming TTS',
+    envVars: ['ELEVENLABS_API_KEY'],
+    local: false,
+    streaming: true,
+    description: 'Streaming TTS via ElevenLabs WebSocket API with continuation hints.',
+    extensionName: 'streaming-tts-elevenlabs',
+    features: ['streaming', 'websocket', 'continuation-hints'],
+  },
+] as const;
+
+export function getSpeechProviderCatalog(
+  kind?: SpeechProviderKind
+): SpeechProviderCatalogEntry[] {
+  if (!kind) return [...SPEECH_PROVIDER_CATALOG];
+  return SPEECH_PROVIDER_CATALOG.filter((entry) => entry.kind === kind);
+}
+
+export function getSpeechProviderKinds(): SpeechProviderKind[] {
+  return ['telephony', 'stt', 'tts', 'vad', 'wake-word'];
+}
+
+export function findSpeechProviderCatalogEntry(
+  id: string
+): SpeechProviderCatalogEntry | undefined {
+  return SPEECH_PROVIDER_CATALOG.find((entry) => entry.id === id);
+}
+
+/**
+ * Whether an entry can be used with the given environment: an entry marked
+ * unavailable (`available: false`, which nothing implements) never is, as
+ * `SpeechProviderResolver` already treats it; a local entry needs no key; any
+ * other needs every one of its environment variables.
+ */
+export function isSpeechProviderConfigured(
+  entry: SpeechProviderCatalogEntry,
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  if (entry.available === false) return false;
+  return entry.local || entry.envVars.every((envVar) => Boolean(env[envVar]));
+}

@@ -1,0 +1,81 @@
+# Releasing @framers/agentos
+
+Releases are automated. A release runs once a day, at 10:17 UTC, when changes to release have merged to `master` since the last release; nobody publishes by hand.
+
+## The daily release
+
+1. A push to `master`, a merged pull request or a maintainer's commit, runs CI's quick checks ([`ci.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/ci.yml)'s "Quick checks" job: the build, lint, the type check and the tests the push affects) and publishes nothing.
+2. Every day at 10:17 UTC the release workflow ([`release.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/release.yml)) starts on `master`'s newest commit. GitHub may start a scheduled run late when Actions is busy ([schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)).
+3. Its first job, "Releasable changes", reads the commits since the last `v<version>` tag with git alone ([`release-gate.mjs`](https://github.com/framerslab/agentos/blob/master/.github/scripts/release-gate.mjs)). A commit counts when its type releases under the rules below (or it carries a breaking-change marker) and it changes a file the package ships or the build reads: `src/` outside the tests, `package.json`, `pnpm-lock.yaml`, `README.md`, the TypeScript configs and the build scripts. With none, the run ends there, green, having installed nothing; the job's log and summary name the reason either way.
+4. With one or more, the whole CI suite runs on that commit (`ci.yml` called with `release: true`), and it sends the coverage figure the README's coverage badge reads to Codecov. When the suite passes, the release job runs [semantic-release](https://semantic-release.gitbook.io/), which reads every commit since the last tag and decides the version with the rules below. When `master` has moved past the tested commit by then, semantic-release finds the branch behind the remote and publishes nothing; the next day's run releases the newer commit.
+5. On a release, semantic-release pushes the tag `v<version>` and commits nothing to `master`, whose branch rules refuse direct pushes. It then publishes `@framers/agentos` to npm, which runs `prepublishOnly` (`build:knowledge`, `build`, `verify:exports`) first, and creates a GitHub release with the generated notes and the test-count badge attached as `tests.json`. The badge file also ships in the package, and the README's badge reads it through unpkg (`@latest`), since shields.io refuses github.com addresses. The released version is the tag's, npm's and the GitHub release's; `package.json`'s `version` on `master` is not it (`npm view @framers/agentos version` reads it).
+
+## Releasing now
+
+Dispatch the release workflow on `master`:
+
+```bash
+gh workflow run release.yml --ref master
+gh workflow run release.yml --ref master -f force=true    # skip the check for releasing changes
+gh workflow run release.yml --ref master -f dry_run=true  # stop before the publish
+```
+
+or use **Run workflow** on the workflow's page in the Actions tab. A dispatched run on another branch fails at its first step. `force` runs the suite and semantic-release even when the check finds nothing to release; semantic-release still publishes nothing without a releasing commit. `dry_run` runs the check, the suite and the release job up to the publish, and skips semantic-release, so nothing is tagged, published or released. One release run goes at a time; a dispatched run waits for one in progress.
+
+## Version rules
+
+AgentOS is 0.x, so the rules in [`release.config.js`](https://github.com/framerslab/agentos/blob/master/release.config.js) are conservative:
+
+| Commit | Release | Example |
+|---|---|---|
+| `fix:`, `feat:`, `perf:`, `refactor:`, `revert:` | patch | 0.10.31 to 0.10.32 |
+| any type with `!`, or a `BREAKING CHANGE:` footer | minor | 0.10.31 to 0.11.0 |
+| `docs:`, `chore:`, `test:`, `ci:`, `build:`, `style:` | none | |
+
+A security fix that only updates a dependency is committed as `fix(deps): <summary>` so that it releases; `chore(deps)` and `build(deps)` commits release nothing.
+
+## Merging
+
+Maintainers squash-merge. semantic-release reads the squash commit's subject and body, so before confirming, check the merge box: the subject is the pull request title and the body is empty. For a change that breaks users, the title carries `!` and the merger adds a footer to the commit body in the merge box:
+
+```text
+BREAKING CHANGE: <what users must change>
+```
+
+That footer becomes the breaking-change note in the GitHub release.
+
+A breaking change needs a maintainer's approval before it merges. The `Breaking change gate` check ([`breaking-change-gate.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/breaking-change-gate.yml)) fails a pull request whose title, description or commit messages carry a breaking-change marker, until a maintainer adds the label `breaking-approved`. Prefer a change that keeps existing callers working: a new option with the old behaviour as its default, a widened type, a deprecation before a removal.
+
+## The keyed persona acceptance and the published-package check
+
+The `personas-semantic` label runs [`personas-semantic.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/personas-semantic.yml): the grounded-writing acceptance against real models (the writer `gpt-6.1-sol`, the judge `gpt-6-luna`), paid through the repository secret `OPENAI_API_KEY` and capped at 10 USD a run. Add the label once the branch is final: while it is on, any push, added label or branch update on the pull request restarts the run (its concurrency group cancels the unfinished first attempt; re-runs of one run share a group keyed by that run's id, a running re-run is cancelled by nothing, and a newer pending re-run replaces an older pending one, so re-running an older commit's run spends a run's budget of its own), so read the run and its `personas-semantic-<sha>` artifact (`summary.json` and `records.jsonl`) on the final head before marking the pull request ready. The job is not a required check; a maintainer reads it.
+
+After a release that changes the persona API, dispatch [`personas-published.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/personas-published.yml) with the published version and the merge commit. It refuses a version before 0.15.0 (the first minor after the 0.14 line), verifies the registry's tarball, imports the installed package in isolation and exercises both host locks, and its `persona-release-<version>` artifact is the pin a consumer records before changing its manifest.
+
+A title outside the Conventional Commits form matches none of the rows above, so the change would merge and release nothing with every check green. The `Pull request title` check ([`pr-title.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/pr-title.yml)) fails a pull request whose title is not a type from the table, an optional scope in parentheses, an optional `!`, a colon, a space and a subject, and reads the title again when it is edited. The release notes carry the title only: what callers of a change that does not break them see differently goes in the feature's documentation page and the pull request's Summary.
+
+## Documentation sites
+
+- The API reference at [framerslab.github.io/agentos](https://framerslab.github.io/agentos/) is built by [`docs.yml`](https://github.com/framerslab/agentos/blob/master/.github/workflows/docs.yml) and published from this repository's `agentos-live-docs` branch. It rebuilds when a push to `master` changes `src/`, `docs/`, `README.md`, `package.json`, `CHANGELOG.md`, `typedoc.json` or the workflow itself, and on a manual run; a manual run on another branch builds the reference without publishing it. Runs that publish build one at a time. A run queued during a build waits for it to finish, so a later run never cancels the build in progress. At most one run waits: a run that starts waiting cancels the one already waiting, which shows as cancelled without having built, and the last run to start waiting builds next.
+- The guides at [docs.agentos.sh](https://docs.agentos.sh) are built by the [agentos-live-docs](https://github.com/framerslab/agentos-live-docs) repository on its own pushes or a manual run.
+- A release rebuilds neither site. `docs.yml` also lists the `release` event, but semantic-release pushes its tag and creates the GitHub release with `GITHUB_TOKEN`, and GitHub starts no workflow from events that token creates.
+
+## Never
+
+- Edit `CHANGELOG.md` or the `version` field by hand, or read that field as the released version.
+- Push to `master` directly: its branch rules refuse it; every change merges through a pull request.
+- Add a workflow step that pushes a commit to `master`. Its rules refuse the push (GH006), so the step fails after everything before it has run. A step that changes the repository pushes a branch of its own and opens a pull request, or writes to another branch, as `docs.yml` publishes to `agentos-live-docs`. The `Test & Lint` job runs `.github/scripts/check-workflow-pushes.mjs`, which fails the pull request that adds such a push: a `git push` to `master` (named, or sent there by the `remote.<name>.push` setting of the remote it pushes to, else by `push.default`; a push that names no remote, as an operand or with `--repo`, may reach `origin` or any remote with refspecs, and one held in a variable any remote), or to the branch the run is on from a workflow that runs on `master` (a merged pull request's `closed` run is on the branch it went into), one of the push actions it knows (`peaceiris/actions-gh-pages`, `JamesIves/github-pages-deploy-action`, `ad-m/github-push-action`, `stefanzweifel/git-auto-commit-action`, `EndBug/add-and-commit`) pushing there (a deploy action whose repository input names another repository is left to that repository's rules), or a semantic-release run while `release.config.js` lists `@semantic-release/git`. It reads a command where the shell runs it, in a substitution, an `sh -c` string, an `eval` or text piped or fed to a shell; follows the checked-out branch of each checkout (the root's, and one `actions/checkout` makes at a `path`) for each git command in the checkout its directory is in: the step's `working-directory`, then the script's `cd` and `pushd` (a subshell, a substitution, a command of a pipeline and a background job, the whole and-or list an `&` ends, change directory for themselves alone, and a function's body where the function is called; past a pipeline whose last command changes directory, which `shopt -s lastpipe` runs in the script's own shell, the directory is one it cannot tell), `env -C` (the last one an `env` is given; a script piped or fed to a shell runs where that shell runs, in the directory its `env -C` names, with its `GIT_DIR`, after the substitutions in an unquoted heredoc's body, which run where the heredoc's command runs, before it), `git -C`, `--git-dir` and `GIT_DIR` (set before the command, or in the `env:` of its step, job or workflow; `env -i` and `env -u` remove it, and through `sudo` without `-E` the checkout is one it cannot tell), or a push action's directory input; a command whose directory it cannot tell is read in every checkout. It follows the branch through `&&`, `||`, `if`, `case`, loops and steps with an `if:` condition (any of which may not run) and into the local composite actions a job calls (`uses: ./<path>`, with the inputs its `with:` gives, else their defaults; an input in a step's `if:` is a string, so an input of `false` there still runs the step); reads `git push` options as git does (`--dry-run --no-dry-run` pushes, `--mir` is `--mirror`); and reads `git config` as git does: in the checkout it runs in, with `--global` and `--system` beneath every checkout's own, and `--unset` removing only the value its pattern matches in the key it names (`remote.origin.push` and `remote.backup.push` are two keys). A script a shell reads from a file, a variable or a download, a git setting made through `GIT_CONFIG_*` variables or a config file, a `GIT_DIR` a script sets, exports or unsets, a checkout `git clone` or `git worktree add` makes, and a push made by another action, are not read. It reads the YAML with [mikefarah's yq](https://github.com/mikefarah/yq) v4, which GitHub's Ubuntu runners carry; run it elsewhere with `yq` on the path, or `YQ` naming it: `node .github/scripts/check-workflow-pushes.mjs`.
+- Run `npm publish`.
+- Push a code change to `master` with `[skip ci]` in the message.
+
+There is no prerelease channel; every release comes from `master`.
+
+## Secrets
+
+The release publishes through npm trusted publishing. npm trusts this repository's `release.yml` to publish `@framers/agentos`, and the job's `id-token: write` permission lets `@semantic-release/npm` exchange the run's OIDC token with the registry. When the exchange succeeds, the plugin hands `npm publish` no token and npm makes the same exchange itself, which needs npm 11.5.1 or newer; Node 22 ships npm 10, so the job installs npm 11 first, the version `ci.yml`'s Test & Lint job also installs. A package published this way carries npm provenance. When the exchange fails, the plugin uses the `NPM_TOKEN` repository secret (an npm granular access token with read and write access to the `@framers` packages). The GitHub release uses the `GITHUB_TOKEN` that GitHub Actions provides.
+
+## Troubleshooting
+
+- **No release published:** the day's "Releasable changes" job found no commit since the last tag that both carries a releasing type and changes what the package ships (its log names the reason), or `master` moved past the tested commit before the publish (the next day's run releases it). Dispatch the workflow to release sooner.
+- **npm publish fails:** for example a 401 when the `NPM_TOKEN` secret has expired or lacks write access to `@framers`, `ENEEDAUTH` when the OIDC exchange succeeded but the npm that publishes is older than 11.5.1, or a failing `prepublishOnly` step. semantic-release pushes the `v<version>` tag before it publishes, so that version is tagged on GitHub and missing from npm, and it is not retried: the tag is the last release from then on. Fix the cause. The next release run with a releasing commit publishes the following version; that package contains the skipped version's changes, and its release notes list only the commits after the tag. A transparency-log conflict, below, is the one failure the workflow retries.
+- **npm publish fails with `TLOG_CREATE_ENTRY_ERROR` (409, an equivalent entry already exists in the transparency log):** npm records the package's provenance in Sigstore's transparency log before it uploads the package. When the log records the entry but its reply does not reach npm, npm's retry gets the 409 and npm stops ([npm/cli#10078](https://github.com/npm/cli/issues/10078); Release runs 41126134054 and 41131650556). The release step then runs [`drop-unpublished-release-tag.mjs`](https://github.com/framerslab/agentos/blob/master/.github/scripts/drop-unpublished-release-tag.mjs), which deletes the tag that attempt pushed when the tag points at the released commit and neither npm nor GitHub has a release of that version, and semantic-release runs once more, signing anew. When the second attempt fails the same way, its tag is deleted too and the job fails; the next day's release run, a dispatched run, or a re-run of the job while `master` has not moved, releases that version with every commit since the last release.
